@@ -911,6 +911,8 @@ pub struct ExperimentalConfig {
     /// source when prefix mode exits. macOS only; a no-op elsewhere and a
     /// best-effort no-op if the switch fails. Default: false.
     pub switch_ascii_input_source_in_prefix: bool,
+    /// Open eligible links from remote sessions on this device. Default: false.
+    pub open_remote_links_on_client: bool,
 }
 
 impl Default for KeysConfig {
@@ -1656,6 +1658,19 @@ pane_history = true
         let config: Config = toml::from_str(toml).unwrap();
 
         assert!(config.experimental.pane_history);
+    }
+
+    #[test]
+    fn open_remote_links_on_client_is_device_local_and_opt_in() {
+        assert!(!Config::default().experimental.open_remote_links_on_client);
+
+        let toml = r#"
+[experimental]
+open_remote_links_on_client = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+
+        assert!(config.experimental.open_remote_links_on_client);
     }
 
     #[test]

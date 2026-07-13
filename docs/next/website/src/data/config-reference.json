@@ -1060,6 +1060,12 @@
           "description": "Persist pane screen history to session-history.json."
         },
         {
+          "key": "experimental.open_remote_links_on_client",
+          "type": "boolean",
+          "default": "false",
+          "description": "Open eligible links from remote sessions on this device."
+        },
+        {
           "key": "experimental.reveal_hidden_cursor_for_cjk_ime",
           "type": "boolean",
           "default": "false",

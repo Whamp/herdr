@@ -19,6 +19,7 @@ pub(super) enum SettingsAction {
     SaveAgentBorderLabels(bool),
     SavePaneHistory(bool),
     SaveSwitchAsciiInputSourceInPrefix(bool),
+    ChangeRemoteLinkPreference(crate::remote_link_preference::RemoteLinkPreferenceAction),
     InstallRecommendedIntegrations,
 }
 
@@ -26,19 +27,28 @@ pub(super) enum SettingsAction {
 fn experiment_toggle_action(state: &AppState, idx: usize) -> Option<SettingsAction> {
     match ExperimentSetting::ALL.get(idx).copied()? {
         ExperimentSetting::PaneHistory => Some(SettingsAction::SavePaneHistory(
-            !ExperimentSetting::PaneHistory.enabled(state),
+            !state.pane_history_persistence_enabled(),
         )),
         ExperimentSetting::SwitchAsciiInputSourceInPrefix => {
             Some(SettingsAction::SaveSwitchAsciiInputSourceInPrefix(
-                !ExperimentSetting::SwitchAsciiInputSourceInPrefix.enabled(state),
+                !state.switch_ascii_input_source_in_prefix_enabled(),
+            ))
+        }
+        ExperimentSetting::OpenRemoteLinksOnClient => {
+            Some(SettingsAction::ChangeRemoteLinkPreference(
+                crate::remote_link_preference::RemoteLinkPreferenceAction::Toggle,
             ))
         }
     }
 }
 
 impl App {
-    pub(crate) fn handle_settings_key(&mut self, key: KeyEvent) {
+    pub(crate) fn handle_settings_key(
+        &mut self,
+        key: KeyEvent,
+    ) -> Option<crate::remote_link_preference::RemoteLinkPreferenceAction> {
         let previous_section = self.state.settings.section;
+        let mut remote_link_action = None;
         if let Some(action) = update_settings_state(&mut self.state, key) {
             match action {
                 SettingsAction::SaveTheme(name) => self.save_theme(&name),
@@ -53,6 +63,9 @@ impl App {
                 SettingsAction::SaveSwitchAsciiInputSourceInPrefix(enabled) => {
                     self.save_switch_ascii_input_source_in_prefix(enabled)
                 }
+                SettingsAction::ChangeRemoteLinkPreference(action) => {
+                    remote_link_action = Some(action)
+                }
                 SettingsAction::InstallRecommendedIntegrations => {
                     self.install_recommended_integrations()
                 }
@@ -63,6 +76,7 @@ impl App {
         {
             self.refresh_integration_recommendations();
         }
+        remote_link_action
     }
 }
 
@@ -488,9 +502,76 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+    use ratatui::{backend::TestBackend, Terminal};
 
     use super::super::{app_for_mouse_test, mouse, state_with_workspaces};
     use super::*;
+
+    struct TestConfig {
+        root: std::path::PathBuf,
+        path: std::path::PathBuf,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TestConfig {
+        fn new(name: &str, content: &str) -> Self {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after unix epoch")
+                .as_nanos();
+            let root =
+                std::env::temp_dir().join(format!("herdr-{name}-{}-{stamp}", std::process::id()));
+            let path = root.join("config.toml");
+            std::fs::create_dir_all(&root).expect("create test config directory");
+            std::fs::write(&path, content).expect("write test config");
+            let previous = std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
+            std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+            Self {
+                root,
+                path,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for TestConfig {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, previous);
+            } else {
+                std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn render_foreground_settings(
+        app: &mut App,
+        preference: &mut crate::remote_link_preference::RemoteLinkPreference,
+    ) -> String {
+        let area = Rect::new(0, 0, 80, 24);
+        crate::ui::compute_view_with_runtime_registry(&mut app.state, &app.terminal_runtimes, area);
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                crate::ui::render_with_runtime_registry_and_client_local_preference(
+                    &app.state,
+                    &app.terminal_runtimes,
+                    Some(preference.view()),
+                    frame,
+                )
+            })
+            .expect("render foreground settings");
+        preference.mark_presented();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
 
     #[test]
     fn settings_cancel_restores_previewed_theme_from_other_sections() {
@@ -579,6 +660,25 @@ mod tests {
             Some(SettingsAction::SaveSwitchAsciiInputSourceInPrefix(true))
         );
         assert_eq!(state.mode, Mode::Settings);
+    }
+
+    #[test]
+    fn settings_experiments_enter_and_space_request_device_remote_link_toggle() {
+        for code in [KeyCode::Enter, KeyCode::Char(' ')] {
+            let mut state = state_with_workspaces(&["test"]);
+            open_settings_at(&mut state, SettingsSection::Experiments);
+            state.settings.list.selected = 2;
+
+            let action =
+                update_settings_state(&mut state, KeyEvent::new(code, KeyModifiers::empty()));
+
+            assert_eq!(
+                action,
+                Some(SettingsAction::ChangeRemoteLinkPreference(
+                    crate::remote_link_preference::RemoteLinkPreferenceAction::Toggle,
+                ))
+            );
+        }
     }
 
     #[test]
@@ -688,6 +788,293 @@ mod tests {
             Some(SettingsAction::SaveSwitchAsciiInputSourceInPrefix(true))
         );
         assert_eq!(app.state.settings.list.selected, 1);
+    }
+
+    #[tokio::test]
+    async fn settings_keyboard_route_requests_device_remote_link_toggle() {
+        let mut app = app_for_mouse_test();
+        open_settings_at(&mut app.state, SettingsSection::Experiments);
+        app.state.settings.list.selected = 2;
+
+        let action = app
+            .handle_key_with_client_local_action(crate::input::TerminalKey::new(
+                KeyCode::Enter,
+                KeyModifiers::empty(),
+            ))
+            .await;
+
+        assert_eq!(
+            action,
+            Some(crate::remote_link_preference::RemoteLinkPreferenceAction::Toggle)
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_keyboard_input_surfaces_device_remote_link_action_to_foreground() {
+        let mut app = app_for_mouse_test();
+        open_settings_at(&mut app.state, SettingsSection::Experiments);
+        app.state.settings.list.selected = 2;
+
+        let (changed, action) = app
+            .handle_raw_input_event_with_client_local_action(crate::raw_input::RawInputEvent::Key(
+                crate::input::TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()),
+            ))
+            .await;
+
+        assert!(changed);
+        assert_eq!(
+            action,
+            Some(crate::remote_link_preference::RemoteLinkPreferenceAction::Toggle)
+        );
+    }
+
+    #[test]
+    fn explicit_app_reload_refreshes_separate_device_remote_link_preference() {
+        let _lock = crate::config::test_config_env_lock()
+            .lock()
+            .expect("config env lock");
+        let config = TestConfig::new(
+            "remote-link-app-reload",
+            "[experimental]\nopen_remote_links_on_client = false\n",
+        );
+        let mut app = app_for_mouse_test();
+        let mut preference = crate::remote_link_preference::RemoteLinkPreference::new(false);
+        std::fs::write(
+            &config.path,
+            "[experimental]\nopen_remote_links_on_client = true\n",
+        )
+        .expect("write external config edit");
+        assert!(!preference.view().confirmed());
+
+        assert_eq!(
+            app.reload_config().status,
+            crate::config::ConfigReloadStatus::Applied
+        );
+        assert!(app.take_config_reloaded_from_disk());
+        assert_eq!(preference.reload_from_disk(), Ok(true));
+        assert!(preference.view().confirmed());
+        assert!(preference.view().effective());
+    }
+
+    #[tokio::test]
+    async fn duplicate_production_keyboard_toggle_is_suppressed_until_settlement() {
+        let mut app = app_for_mouse_test();
+        open_settings_at(&mut app.state, SettingsSection::Experiments);
+        app.state.settings.list.selected = 2;
+        let mut preference = crate::remote_link_preference::RemoteLinkPreference::new(false);
+
+        let enter = app
+            .handle_key_with_client_local_action(crate::input::TerminalKey::new(
+                KeyCode::Enter,
+                KeyModifiers::empty(),
+            ))
+            .await
+            .expect("enter action");
+        let space = app
+            .handle_key_with_client_local_action(crate::input::TerminalKey::new(
+                KeyCode::Char(' '),
+                KeyModifiers::empty(),
+            ))
+            .await
+            .expect("space action");
+
+        assert_eq!(
+            preference.apply(enter),
+            crate::remote_link_preference::MutationDisposition::Started
+        );
+        assert_eq!(
+            preference.apply(space),
+            crate::remote_link_preference::MutationDisposition::Suppressed
+        );
+        assert!(!preference.view().confirmed());
+        assert!(preference.view().saving());
+    }
+
+    #[test]
+    fn keyboard_toggle_without_active_session_persists_and_reloads_after_pending_frame() {
+        let _lock = crate::config::test_config_env_lock()
+            .lock()
+            .expect("config env lock");
+        let config = TestConfig::new("remote-link-keyboard", "onboarding = false\n");
+        let mut app = app_for_mouse_test();
+        app.state.active = None;
+        open_settings_at(&mut app.state, SettingsSection::Experiments);
+        app.state.settings.list.selected = 2;
+        let mut preference = crate::remote_link_preference::RemoteLinkPreference::new(false);
+
+        let action = app
+            .handle_settings_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()))
+            .expect("remote-link action");
+        assert_eq!(
+            preference.apply(action),
+            crate::remote_link_preference::MutationDisposition::Started
+        );
+        let pending = render_foreground_settings(&mut app, &mut preference);
+        assert!(pending.contains("open remote links on this device [ ] saving…"));
+
+        assert_eq!(
+            preference.settle_presented(),
+            Some(crate::remote_link_preference::RemoteLinkPreferenceSettlement::Confirmed)
+        );
+        let confirmed = render_foreground_settings(&mut app, &mut preference);
+        assert!(confirmed.contains("open remote links on this device [✓]"));
+        assert!(!confirmed.contains("open remote links on this device [✓] saving…"));
+        assert!(preference.view().effective());
+        assert!(std::fs::read_to_string(&config.path)
+            .expect("read persisted config")
+            .contains("open_remote_links_on_client = true"));
+    }
+
+    #[test]
+    fn settings_mouse_click_from_another_row_requests_device_remote_link_toggle() {
+        let mut app = app_for_mouse_test();
+        open_settings_at(&mut app.state, SettingsSection::Experiments);
+        app.state.settings.list.selected = 0;
+
+        let area = app.state.settings_content_rect();
+        let action = app.handle_mouse_with_client_local_action(mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            area.x + 2,
+            area.y + 5,
+        ));
+
+        assert_eq!(
+            action,
+            Some(crate::remote_link_preference::RemoteLinkPreferenceAction::Toggle)
+        );
+        assert_eq!(app.state.settings.list.selected, 2);
+    }
+
+    #[test]
+    fn reload_failure_retains_prior_confirmed_and_effective_remote_link_value() {
+        let _lock = crate::config::test_config_env_lock()
+            .lock()
+            .expect("config env lock");
+        let _config = TestConfig::new(
+            "remote-link-reload-failure",
+            "[experimental]\npane_history = \"invalid\"\n",
+        );
+        let mut app = app_for_mouse_test();
+        open_settings_at(&mut app.state, SettingsSection::Experiments);
+        app.state.settings.list.selected = 2;
+        let mut preference = crate::remote_link_preference::RemoteLinkPreference::new(false);
+        preference.apply(crate::remote_link_preference::RemoteLinkPreferenceAction::Toggle);
+        let pending = render_foreground_settings(&mut app, &mut preference);
+        assert!(pending.contains("open remote links on this device [ ] saving…"));
+
+        assert_eq!(
+            preference.settle_presented(),
+            Some(
+                crate::remote_link_preference::RemoteLinkPreferenceSettlement::Failed(
+                    crate::remote_link_preference::RemoteLinkPreferenceFailureStage::Reload,
+                )
+            )
+        );
+        assert!(!preference.view().confirmed());
+        assert!(!preference.view().effective());
+        assert!(!preference.view().saving());
+        assert!(app.state.config_diagnostic.is_none());
+    }
+
+    #[test]
+    fn write_failure_retains_prior_confirmed_and_effective_remote_link_value() {
+        let _lock = crate::config::test_config_env_lock()
+            .lock()
+            .expect("config env lock");
+        let config = TestConfig::new(
+            "remote-link-write-failure",
+            "[experimental]\nopen_remote_links_on_client = true\n",
+        );
+        let mut app = app_for_mouse_test();
+        open_settings_at(&mut app.state, SettingsSection::Experiments);
+        app.state.settings.list.selected = 2;
+        let mut preference = crate::remote_link_preference::RemoteLinkPreference::new(true);
+        preference.apply(crate::remote_link_preference::RemoteLinkPreferenceAction::Toggle);
+        let pending = render_foreground_settings(&mut app, &mut preference);
+        assert!(pending.contains("open remote links on this device [✓] saving…"));
+        std::fs::remove_file(&config.path).expect("remove config file");
+        std::fs::create_dir(&config.path).expect("replace config file with directory");
+
+        assert_eq!(
+            preference.settle_presented(),
+            Some(
+                crate::remote_link_preference::RemoteLinkPreferenceSettlement::Failed(
+                    crate::remote_link_preference::RemoteLinkPreferenceFailureStage::Write,
+                )
+            )
+        );
+        assert!(preference.view().confirmed());
+        assert!(preference.view().effective());
+        assert!(!preference.view().saving());
+        assert!(app.state.config_diagnostic.is_none());
+    }
+
+    #[test]
+    fn escape_closes_settings_without_undoing_persisted_remote_link_value() {
+        let _lock = crate::config::test_config_env_lock()
+            .lock()
+            .expect("config env lock");
+        let config = TestConfig::new("remote-link-escape", "onboarding = false\n");
+        let mut app = app_for_mouse_test();
+        open_settings_at(&mut app.state, SettingsSection::Experiments);
+        app.state.settings.list.selected = 2;
+        let mut preference = crate::remote_link_preference::RemoteLinkPreference::new(false);
+
+        let action = app
+            .handle_settings_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .expect("remote-link action");
+        preference.apply(action);
+        let pending = render_foreground_settings(&mut app, &mut preference);
+        assert!(pending.contains("open remote links on this device [ ] saving…"));
+
+        assert_eq!(
+            app.handle_settings_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
+            None
+        );
+        assert_ne!(app.state.mode, Mode::Settings);
+        assert_eq!(
+            preference.settle_presented(),
+            Some(crate::remote_link_preference::RemoteLinkPreferenceSettlement::Confirmed)
+        );
+        assert!(preference.view().confirmed());
+        assert!(std::fs::read_to_string(&config.path)
+            .expect("read persisted config")
+            .contains("open_remote_links_on_client = true"));
+    }
+
+    #[test]
+    fn mouse_toggle_from_another_row_persists_and_reloads_after_pending_frame() {
+        let _lock = crate::config::test_config_env_lock()
+            .lock()
+            .expect("config env lock");
+        let config = TestConfig::new("remote-link-mouse", "onboarding = false\n");
+        let mut app = app_for_mouse_test();
+        open_settings_at(&mut app.state, SettingsSection::Experiments);
+        app.state.settings.list.selected = 0;
+        let mut preference = crate::remote_link_preference::RemoteLinkPreference::new(false);
+        let _ = render_foreground_settings(&mut app, &mut preference);
+        let area = app.state.settings_content_rect();
+
+        let action = app
+            .handle_mouse_with_client_local_action(mouse(
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                area.x + 2,
+                area.y + 5,
+            ))
+            .expect("remote-link action");
+        preference.apply(action);
+        let pending = render_foreground_settings(&mut app, &mut preference);
+        assert!(pending.contains("open remote links on this device [ ] saving…"));
+
+        assert_eq!(
+            preference.settle_presented(),
+            Some(crate::remote_link_preference::RemoteLinkPreferenceSettlement::Confirmed)
+        );
+        assert_eq!(app.state.settings.list.selected, 2);
+        assert!(preference.view().confirmed());
+        assert!(std::fs::read_to_string(&config.path)
+            .expect("read persisted config")
+            .contains("open_remote_links_on_client = true"));
     }
 
     #[test]

@@ -930,10 +930,15 @@ impl SettingsSection {
 pub(crate) enum ExperimentSetting {
     PaneHistory,
     SwitchAsciiInputSourceInPrefix,
+    OpenRemoteLinksOnClient,
 }
 
 impl ExperimentSetting {
-    pub(crate) const ALL: [Self; 2] = [Self::PaneHistory, Self::SwitchAsciiInputSourceInPrefix];
+    pub(crate) const ALL: [Self; 3] = [
+        Self::PaneHistory,
+        Self::SwitchAsciiInputSourceInPrefix,
+        Self::OpenRemoteLinksOnClient,
+    ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -941,15 +946,7 @@ impl ExperimentSetting {
             Self::SwitchAsciiInputSourceInPrefix => {
                 "switch to ascii input source in prefix (macOS)"
             }
-        }
-    }
-
-    pub(crate) fn enabled(self, state: &AppState) -> bool {
-        match self {
-            Self::PaneHistory => state.pane_history_persistence_enabled(),
-            Self::SwitchAsciiInputSourceInPrefix => {
-                state.switch_ascii_input_source_in_prefix_enabled()
-            }
+            Self::OpenRemoteLinksOnClient => "open remote links on this device",
         }
     }
 }

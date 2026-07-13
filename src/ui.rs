@@ -49,7 +49,7 @@ pub(crate) use self::scrollbar::{
     pane_scrollbar_rect, release_notes_scrollbar_rect, scrollbar_offset_from_drag_row,
     scrollbar_offset_from_row, scrollbar_thumb_grab_offset, should_show_scrollbar,
 };
-use self::settings::render_settings_overlay;
+use self::settings::render_settings_overlay_with_client_local_preference;
 use self::sidebar::{render_sidebar, render_sidebar_collapsed};
 use self::status::{
     copy_feedback_rect, render_config_diagnostic, render_copy_feedback, render_toast_notification,
@@ -404,6 +404,15 @@ pub fn render_with_runtime_registry(
     terminal_runtimes: &TerminalRuntimeRegistry,
     frame: &mut Frame,
 ) {
+    render_with_runtime_registry_and_client_local_preference(app, terminal_runtimes, None, frame);
+}
+
+pub fn render_with_runtime_registry_and_client_local_preference(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    remote_link_preference: Option<crate::remote_link_preference::RemoteLinkPreferenceView>,
+    frame: &mut Frame,
+) {
     let sidebar_area = app.view.sidebar_rect;
     let tab_bar_area = app.view.tab_bar_rect;
     let terminal_area = app.view.terminal_area;
@@ -440,7 +449,12 @@ pub fn render_with_runtime_registry(
         Mode::ContextMenu => {
             render_context_menu(app, frame);
         }
-        Mode::Settings => render_settings_overlay(app, frame, frame.area()),
+        Mode::Settings => render_settings_overlay_with_client_local_preference(
+            app,
+            remote_link_preference,
+            frame,
+            frame.area(),
+        ),
         Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
             render_rename_overlay(app, frame, frame.area())
         }
@@ -580,6 +594,39 @@ mod tests {
     use crate::{app::state::ViewLayout, layout::PaneInfo, workspace::Workspace};
     use ratatui::style::Color;
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn production_frame_renders_pending_device_remote_link_preference() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.mode = Mode::Settings;
+        app.settings.section = crate::app::state::SettingsSection::Experiments;
+        app.settings.list.selected = 2;
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        compute_view_with_runtime_registry(&mut app, &runtimes, Rect::new(0, 0, 80, 24));
+        let mut preference = crate::remote_link_preference::RemoteLinkPreference::new(false);
+        preference.apply(crate::remote_link_preference::RemoteLinkPreferenceAction::Toggle);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_with_runtime_registry_and_client_local_preference(
+                    &app,
+                    &runtimes,
+                    Some(preference.view()),
+                    frame,
+                )
+            })
+            .expect("production frame should render");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("open remote links on this device [ ] saving…"));
+    }
 
     #[test]
     fn copy_feedback_offset_only_increases_when_toast_rect_overlaps() {
