@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
-use std::io::Write;
-use std::os::fd::RawFd;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -9,8 +9,91 @@ use std::sync::OnceLock;
 
 use super::{
     read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
-    LimitedRead, Signal,
+    InheritedPeerIdentity, LimitedRead, Signal,
 };
+
+pub(crate) fn inherited_peer_identity_for_current_process() -> InheritedPeerIdentity {
+    InheritedPeerIdentity {
+        pid: std::process::id(),
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+    }
+}
+
+pub(crate) fn inherited_peer_identity_for_child(pid: u32) -> InheritedPeerIdentity {
+    InheritedPeerIdentity {
+        pid,
+        ..inherited_peer_identity_for_current_process()
+    }
+}
+
+pub(crate) fn inherited_peer_identity_for_parent() -> InheritedPeerIdentity {
+    InheritedPeerIdentity {
+        pid: unsafe { libc::getppid() as u32 },
+        ..inherited_peer_identity_for_current_process()
+    }
+}
+
+pub(crate) fn set_inherited_descriptor_cloexec(fd: RawFd, enabled: bool) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let flags = if enabled {
+        flags | libc::FD_CLOEXEC
+    } else {
+        flags & !libc::FD_CLOEXEC
+    };
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn inherited_descriptor_is_cloexec(fd: RawFd) -> io::Result<bool> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags & libc::FD_CLOEXEC != 0)
+}
+
+pub(crate) fn prepare_inherited_credential_receiver(
+    stream: &std::os::unix::net::UnixStream,
+) -> io::Result<()> {
+    verify_inherited_peer(stream, InheritedPeerIdentity::parent())
+        .or_else(|_| verify_inherited_peer(stream, inherited_peer_identity_for_current_process()))
+}
+
+pub(crate) fn read_authenticated_inherited_bytes(
+    stream: &std::os::unix::net::UnixStream,
+    expected: InheritedPeerIdentity,
+    bytes: &mut [u8],
+) -> io::Result<()> {
+    verify_inherited_peer(stream, expected)?;
+    let mut stream = stream;
+    stream.read_exact(bytes)
+}
+
+fn verify_inherited_peer(
+    stream: &std::os::unix::net::UnixStream,
+    expected: InheritedPeerIdentity,
+) -> io::Result<()> {
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if uid != expected.uid || gid != expected.gid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "inherited broker credentials rejected",
+        ));
+    }
+    Ok(())
+}
 
 const PROC_PGRP_ONLY: u32 = 2;
 const SERVER_NOFILE_LIMIT_TARGET: libc::rlim_t = 8192;

@@ -1,6 +1,8 @@
 #[cfg(unix)]
 mod unix;
 
+pub(crate) mod forwarding;
+
 #[cfg(unix)]
 pub(crate) use unix::*;
 

@@ -817,6 +817,8 @@ enum ClientLoopEvent {
 ///
 /// This is the entry point called from `main.rs` when running in client mode.
 pub fn run_client() -> io::Result<()> {
+    let _forwarding_capability = crate::platform::adopt_inherited_forwarding_capability(false)?;
+
     run_client_with_mode(
         requested_render_encoding(),
         None,

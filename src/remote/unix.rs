@@ -171,6 +171,8 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         .remote
         .manage_ssh_config;
     let remote_ssh = RemoteSsh::new(remote.target.clone(), manage_ssh_config);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let forwarding_authority = remote_ssh.forwarding_authority();
     let prepared_remote = prepare_remote_herdr(&remote_ssh, remote.live_handoff)?;
     ensure_remote_server_ready(
         &remote_ssh,
@@ -188,6 +190,15 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote_ssh.options(),
     )?;
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    return run_client_process(
+        &local_socket,
+        &reattach_command,
+        remote.keybindings,
+        forwarding_authority,
+    );
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     run_client_process(&local_socket, &reattach_command, remote.keybindings)
 }
 
@@ -481,6 +492,23 @@ impl RemoteSsh {
         self.managed_config.as_ref().map(|config| &config.options)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn forwarding_authority(&self) -> Option<crate::remote::forwarding::ControlAuthority> {
+        self.forwarding_authority_for_support(local_openssh_supports_forwarding())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn forwarding_authority_for_support(
+        &self,
+        supported: bool,
+    ) -> Option<crate::remote::forwarding::ControlAuthority> {
+        let options = supported.then(|| self.options()).flatten()?;
+        Some(crate::remote::forwarding::ControlAuthority::new(
+            self.target.clone(),
+            options.control_path.clone(),
+        ))
+    }
+
     fn command(&self) -> Command {
         let mut command = self.base_command();
         command.arg("-T").arg(&self.target);
@@ -644,7 +672,40 @@ fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshO
         .arg("-o")
         .arg("ControlMaster=auto")
         .arg("-o")
-        .arg("ControlPersist=yes");
+        .arg("ControlPersist=60");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn local_openssh_supports_forwarding() -> bool {
+    Command::new("ssh")
+        .arg("-V")
+        .output()
+        .ok()
+        .map(|output| {
+            let mut version = output.stderr;
+            version.extend_from_slice(&output.stdout);
+            openssh_version_supports_forwarding(&String::from_utf8_lossy(&version))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn openssh_version_supports_forwarding(version: &str) -> bool {
+    let Some(version) = version.strip_prefix("OpenSSH_") else {
+        return false;
+    };
+    let numeric = version
+        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .next()
+        .unwrap_or_default();
+    let mut parts = numeric.split('.');
+    let Some(major) = parts.next().and_then(|part| part.parse::<u32>().ok()) else {
+        return false;
+    };
+    let Some(minor) = parts.next().and_then(|part| part.parse::<u32>().ok()) else {
+        return false;
+    };
+    (major, minor) >= (6, 7)
 }
 
 impl InstallSource {
@@ -1920,13 +1981,14 @@ fn copy_flush<R: io::Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io::
     }
 }
 
-fn run_client_process(
+fn client_process_command(
     local_socket: &Path,
     reattach_command: &str,
     keybindings: RemoteKeybindings,
-) -> io::Result<()> {
+) -> io::Result<Command> {
     let exe = std::env::current_exe()?;
-    let status = Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .arg("client")
         .env(
             crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR,
@@ -1938,9 +2000,52 @@ fn run_client_process(
         .env_remove(crate::api::SOCKET_PATH_ENV_VAR)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()?;
+        .stderr(Stdio::inherit());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    command.env_remove(crate::remote::forwarding::INHERITED_BROKER_FD_ENV);
+    Ok(command)
+}
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_client_process(
+    local_socket: &Path,
+    reattach_command: &str,
+    keybindings: RemoteKeybindings,
+    forwarding_authority: Option<crate::remote::forwarding::ControlAuthority>,
+) -> io::Result<()> {
+    let mut command = client_process_command(local_socket, reattach_command, keybindings)?;
+    let pending_broker = forwarding_authority
+        .map(crate::remote::forwarding::PendingBroker::new)
+        .transpose()?;
+    if let Some(pending_broker) = &pending_broker {
+        pending_broker.configure_child_command(&mut command);
+    }
+    let mut child = command.spawn()?;
+    let _broker = match pending_broker {
+        Some(pending_broker) => match pending_broker.start(child.id()) {
+            Ok(broker) => Some(broker),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err);
+            }
+        },
+        None => None,
+    };
+    remote_client_status(child.wait()?)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn run_client_process(
+    local_socket: &Path,
+    reattach_command: &str,
+    keybindings: RemoteKeybindings,
+) -> io::Result<()> {
+    let status = client_process_command(local_socket, reattach_command, keybindings)?.status()?;
+    remote_client_status(status)
+}
+
+fn remote_client_status(status: std::process::ExitStatus) -> io::Result<()> {
     if status.success() {
         Ok(())
     } else {
@@ -2139,11 +2244,47 @@ mod tests {
                 "-o".to_string(),
                 "ControlMaster=auto".to_string(),
                 "-o".to_string(),
-                "ControlPersist=yes".to_string(),
+                "ControlPersist=60".to_string(),
                 "-T".to_string(),
                 "example".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn managed_forwarding_requires_openssh_6_7_or_newer() {
+        assert!(!openssh_version_supports_forwarding(
+            "OpenSSH_6.6p1, OpenSSL 1.0"
+        ));
+        assert!(openssh_version_supports_forwarding(
+            "OpenSSH_6.7p1, OpenSSL 1.0"
+        ));
+        assert!(openssh_version_supports_forwarding("OpenSSH_10.0p2"));
+        assert!(!openssh_version_supports_forwarding("Dropbear ssh"));
+    }
+
+    #[test]
+    fn unmanaged_ssh_has_no_forwarding_authority() {
+        let ssh = RemoteSsh {
+            target: "example.com".to_string(),
+            managed_config: None,
+        };
+
+        assert!(ssh.forwarding_authority_for_support(true).is_none());
+    }
+
+    #[test]
+    fn client_process_command_removes_unassigned_forwarding_capability() {
+        let command = client_process_command(
+            Path::new("/tmp/herdr-client.sock"),
+            "herdr --remote example",
+            RemoteKeybindings::Local,
+        )
+        .expect("client command");
+
+        assert!(command.get_envs().any(|(name, value)| {
+            name == std::ffi::OsStr::new("HERDR_FORWARDING_BROKER_FD") && value.is_none()
+        }));
     }
 
     #[test]

@@ -49,6 +49,50 @@ pub(crate) const fn capabilities() -> PlatformCapabilities {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InheritedPeerIdentity {
+    pub(crate) pid: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl InheritedPeerIdentity {
+    #[cfg(test)]
+    pub(crate) fn current_process() -> Self {
+        inherited_peer_identity_for_current_process()
+    }
+
+    pub(crate) fn child(pid: u32) -> Self {
+        inherited_peer_identity_for_child(pid)
+    }
+
+    pub(crate) fn parent() -> Self {
+        inherited_peer_identity_for_parent()
+    }
+}
+
+pub(crate) struct InheritedForwardingCapability {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    _client: Option<crate::remote::forwarding::ForwardingClient>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn adopt_inherited_forwarding_capability(
+    initial_policy: bool,
+) -> std::io::Result<InheritedForwardingCapability> {
+    crate::remote::forwarding::adopt_inherited_capability(initial_policy)
+        .map(|client| InheritedForwardingCapability { _client: client })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn adopt_inherited_forwarding_capability(
+    _initial_policy: bool,
+) -> std::io::Result<InheritedForwardingCapability> {
+    Ok(InheritedForwardingCapability {})
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn detach_server_daemon_command(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
 
