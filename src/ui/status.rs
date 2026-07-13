@@ -52,7 +52,7 @@ pub(crate) fn copy_feedback_rect(
 pub(crate) fn toast_notification_rect(
     area: Rect,
     toast: &ToastNotification,
-    offset_for_warning: bool,
+    offset_rows: u16,
     position: ToastHerdrPosition,
 ) -> Rect {
     let content_width = display_width_u16(&toast.title)
@@ -60,20 +60,19 @@ pub(crate) fn toast_notification_rect(
         .saturating_add(4);
     let width = content_width.saturating_add(2).min(area.width);
     let content_height = if toast.context.is_empty() { 1 } else { 2 };
-    let height = (content_height + 2).min(area.height);
+    let available_height = area.height.saturating_sub(offset_rows.min(area.height));
+    let height = (content_height + 2).min(available_height);
     let x = match position {
         ToastHerdrPosition::TopLeft | ToastHerdrPosition::BottomLeft => area.x,
         ToastHerdrPosition::TopRight | ToastHerdrPosition::BottomRight => {
             area.x + area.width.saturating_sub(width)
         }
     };
-    let warning_offset = u16::from(offset_for_warning);
+    let offset_rows = offset_rows.min(area.height);
     let y = match position {
-        ToastHerdrPosition::TopLeft | ToastHerdrPosition::TopRight => {
-            area.y + warning_offset.min(area.height)
-        }
+        ToastHerdrPosition::TopLeft | ToastHerdrPosition::TopRight => area.y + offset_rows,
         ToastHerdrPosition::BottomLeft | ToastHerdrPosition::BottomRight => {
-            area.y + area.height.saturating_sub(height + warning_offset)
+            area.y + area.height.saturating_sub(height + offset_rows)
         }
     };
     Rect::new(x, y, width, height)
@@ -81,10 +80,8 @@ pub(crate) fn toast_notification_rect(
 
 pub(super) fn render_toast_notification(
     frame: &mut Frame,
-    area: Rect,
     toast: &ToastNotification,
-    offset_for_warning: bool,
-    position: ToastHerdrPosition,
+    toast_area: Rect,
     p: &Palette,
 ) {
     let dot_color = match toast.kind {
@@ -92,7 +89,9 @@ pub(super) fn render_toast_notification(
         ToastKind::Finished => p.blue,
         ToastKind::UpdateInstalled => p.accent,
     };
-    let toast_area = toast_notification_rect(area, toast, offset_for_warning, position);
+    if toast_area.is_empty() {
+        return;
+    }
 
     frame.render_widget(Clear, toast_area);
     let block = Block::default()
@@ -130,13 +129,10 @@ pub(super) fn render_toast_notification(
 
 pub(super) fn render_copy_feedback(
     frame: &mut Frame,
-    area: Rect,
     feedback: &CopyFeedback,
-    offset_rows: u16,
-    position: ToastClipboardPosition,
+    feedback_area: Rect,
     p: &Palette,
 ) {
-    let feedback_area = copy_feedback_rect(area, feedback, offset_rows, position);
     if feedback_area.is_empty() {
         return;
     }
@@ -167,29 +163,24 @@ pub(super) fn render_copy_feedback(
     frame.render_widget(Paragraph::new(text), inner);
 }
 
-pub(super) fn render_config_diagnostic(frame: &mut Frame, area: Rect, message: &str, p: &Palette) {
+pub(super) fn render_config_diagnostic(
+    frame: &mut Frame,
+    message: &str,
+    rects: &[Rect],
+    p: &Palette,
+) {
     let style = Style::default()
         .fg(panel_contrast_fg(p))
         .bg(p.yellow)
         .add_modifier(Modifier::BOLD);
-
-    for (row, line) in message
+    for (line, rect) in message
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .take(area.height as usize)
-        .enumerate()
+        .zip(rects.iter().copied())
     {
         let text = format!(" {line} ");
-        let width = (text.len() as u16).min(area.width);
-        let notif_area = Rect::new(
-            area.x + area.width.saturating_sub(width),
-            area.y + row as u16,
-            width,
-            1,
-        );
-
-        frame.render_widget(Clear, notif_area);
-        frame.render_widget(Paragraph::new(Span::styled(text, style)), notif_area);
+        frame.render_widget(Clear, rect);
+        frame.render_widget(Paragraph::new(Span::styled(text, style)), rect);
     }
 }
 
@@ -264,21 +255,20 @@ mod tests {
         let area = Rect::new(10, 20, 100, 40);
         let toast = toast();
 
-        let top_left = toast_notification_rect(area, &toast, false, ToastHerdrPosition::TopLeft);
+        let top_left = toast_notification_rect(area, &toast, 0, ToastHerdrPosition::TopLeft);
         assert_eq!(top_left.x, area.x);
         assert_eq!(top_left.y, area.y);
 
-        let top_right = toast_notification_rect(area, &toast, false, ToastHerdrPosition::TopRight);
+        let top_right = toast_notification_rect(area, &toast, 0, ToastHerdrPosition::TopRight);
         assert_eq!(top_right.x + top_right.width, area.x + area.width);
         assert_eq!(top_right.y, area.y);
 
-        let bottom_left =
-            toast_notification_rect(area, &toast, false, ToastHerdrPosition::BottomLeft);
+        let bottom_left = toast_notification_rect(area, &toast, 0, ToastHerdrPosition::BottomLeft);
         assert_eq!(bottom_left.x, area.x);
         assert_eq!(bottom_left.y + bottom_left.height, area.y + area.height);
 
         let bottom_right =
-            toast_notification_rect(area, &toast, false, ToastHerdrPosition::BottomRight);
+            toast_notification_rect(area, &toast, 0, ToastHerdrPosition::BottomRight);
         assert_eq!(bottom_right.x + bottom_right.width, area.x + area.width);
         assert_eq!(bottom_right.y + bottom_right.height, area.y + area.height);
     }
@@ -294,7 +284,7 @@ mod tests {
             target: None,
         };
 
-        let rect = toast_notification_rect(area, &toast, false, ToastHerdrPosition::TopRight);
+        let rect = toast_notification_rect(area, &toast, 0, ToastHerdrPosition::TopRight);
 
         let expected_content_width =
             display_width_u16(&toast.title).max(display_width_u16(&toast.context)) + 6;

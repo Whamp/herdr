@@ -51,6 +51,62 @@ impl ExternalOpenTerminalOutcome {
             Self::CommittedOutcomeUnknown => "committed_outcome_unknown",
         }
     }
+
+    pub(crate) const fn notice_message(self) -> Option<&'static str> {
+        use crate::protocol::ExternalOpenPreparationFailure as Failure;
+
+        match self {
+            Self::OpenedDirectly
+            | Self::OpenedThroughForward(_)
+            | Self::CancelledBeforeCommit
+            | Self::ClientDisconnectedBeforeCommit => None,
+            Self::PreparationFailed(Failure::UnsupportedScheme) => {
+                Some("Couldn’t open link · link type isn’t supported")
+            }
+            Self::PreparationFailed(Failure::AuthorityUserinfoForbidden) => {
+                Some("Couldn’t open link · links with credentials aren’t allowed")
+            }
+            Self::PreparationFailed(Failure::InvalidPort | Failure::InvalidAbsoluteUrl) => {
+                Some("Couldn’t open link · link is invalid")
+            }
+            Self::PreparationFailed(
+                Failure::UnsupportedLoopbackForm | Failure::LoopbackUnsupportedOnPlatform,
+            ) => Some("Couldn’t open link · link uses an unsupported local address"),
+            Self::PreparationFailed(Failure::ManagedSshRequired) => {
+                Some("Couldn’t open link · managed SSH is required")
+            }
+            Self::PreparationFailed(Failure::ForwardingUnavailable) => {
+                Some("Couldn’t open link · local forwarding is unavailable")
+            }
+            Self::PreparationFailed(
+                Failure::TooManyOpensInProgress
+                | Failure::TooManyForwardRequests
+                | Failure::TooManyMappingWaiters,
+            ) => Some("Couldn’t open link · too many links are opening"),
+            Self::PreparationFailed(Failure::ForwardCapacityExhausted) => {
+                Some("Couldn’t open link · local forwarding limit reached")
+            }
+            Self::PreparationFailed(
+                Failure::ForwardBindExhausted
+                | Failure::AtomicForwardCreationFailed
+                | Failure::ForwardCommandRejected,
+            ) => Some("Couldn’t open link · local forwarding failed"),
+            Self::PreparationFailed(Failure::ForwardCommandTimedOut) => {
+                Some("Couldn’t open link · local forwarding timed out")
+            }
+            Self::PlatformOpenRejected => {
+                Some("Couldn’t open link · device rejected the open request")
+            }
+            Self::ClientDeliveryFailed => Some("Couldn’t open link · client connection failed"),
+            Self::InvalidClientResult => Some("Couldn’t open link · client response was invalid"),
+            Self::TimedOutBeforeCommit => {
+                Some("Couldn’t open link · request timed out before opening")
+            }
+            Self::CommittedOutcomeUnknown => {
+                Some("Couldn’t confirm link opening · device may still have opened it")
+            }
+        }
+    }
 }
 
 const fn canonical_preparation_failure(
@@ -533,6 +589,118 @@ mod tests {
             outcomes.map(|(outcome, _)| outcome.canonical_outcome()),
             outcomes.map(|(_, canonical)| canonical),
         );
+    }
+
+    #[test]
+    fn terminal_outcomes_translate_exhaustively_to_url_free_notice_copy() {
+        use crate::protocol::ExternalOpenPreparationFailure as Failure;
+
+        let cases = [
+            (ExternalOpenTerminalOutcome::OpenedDirectly, None),
+            (
+                ExternalOpenTerminalOutcome::OpenedThroughForward(
+                    crate::protocol::ExternalOpenPortStatus::SamePort,
+                ),
+                None,
+            ),
+            (
+                ExternalOpenTerminalOutcome::PreparationFailed(Failure::UnsupportedScheme),
+                Some("Couldn’t open link · link type isn’t supported"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::PreparationFailed(Failure::AuthorityUserinfoForbidden),
+                Some("Couldn’t open link · links with credentials aren’t allowed"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::PreparationFailed(Failure::InvalidPort),
+                Some("Couldn’t open link · link is invalid"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::PreparationFailed(Failure::InvalidAbsoluteUrl),
+                Some("Couldn’t open link · link is invalid"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::PreparationFailed(Failure::UnsupportedLoopbackForm),
+                Some("Couldn’t open link · link uses an unsupported local address"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::PreparationFailed(
+                    Failure::LoopbackUnsupportedOnPlatform,
+                ),
+                Some("Couldn’t open link · link uses an unsupported local address"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::PreparationFailed(Failure::ManagedSshRequired),
+                Some("Couldn’t open link · managed SSH is required"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::PreparationFailed(Failure::ForwardingUnavailable),
+                Some("Couldn’t open link · local forwarding is unavailable"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::PreparationFailed(Failure::TooManyOpensInProgress),
+                Some("Couldn’t open link · too many links are opening"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::PreparationFailed(Failure::TooManyForwardRequests),
+                Some("Couldn’t open link · too many links are opening"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::PreparationFailed(Failure::TooManyMappingWaiters),
+                Some("Couldn’t open link · too many links are opening"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::PreparationFailed(Failure::ForwardCapacityExhausted),
+                Some("Couldn’t open link · local forwarding limit reached"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::PreparationFailed(Failure::ForwardBindExhausted),
+                Some("Couldn’t open link · local forwarding failed"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::PreparationFailed(
+                    Failure::AtomicForwardCreationFailed,
+                ),
+                Some("Couldn’t open link · local forwarding failed"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::PreparationFailed(Failure::ForwardCommandRejected),
+                Some("Couldn’t open link · local forwarding failed"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::PreparationFailed(Failure::ForwardCommandTimedOut),
+                Some("Couldn’t open link · local forwarding timed out"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::PlatformOpenRejected,
+                Some("Couldn’t open link · device rejected the open request"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::ClientDeliveryFailed,
+                Some("Couldn’t open link · client connection failed"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::InvalidClientResult,
+                Some("Couldn’t open link · client response was invalid"),
+            ),
+            (
+                ExternalOpenTerminalOutcome::TimedOutBeforeCommit,
+                Some("Couldn’t open link · request timed out before opening"),
+            ),
+            (ExternalOpenTerminalOutcome::CancelledBeforeCommit, None),
+            (
+                ExternalOpenTerminalOutcome::ClientDisconnectedBeforeCommit,
+                None,
+            ),
+            (
+                ExternalOpenTerminalOutcome::CommittedOutcomeUnknown,
+                Some("Couldn’t confirm link opening · device may still have opened it"),
+            ),
+        ];
+
+        for (outcome, expected) in cases {
+            assert_eq!(outcome.notice_message(), expected, "{outcome:?}");
+        }
     }
 
     #[test]

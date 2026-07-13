@@ -66,6 +66,93 @@ impl ClientWriter {
             },
         }
     }
+
+    pub(crate) fn send_barrier_for_test(&self, data: Vec<u8>) -> Result<(), Vec<u8>> {
+        match &self.control.target {
+            ClientControlTarget::Queue(queue) => queue.send_barrier_if_empty(data),
+            ClientControlTarget::Channel(_) => Err(data),
+        }
+    }
+
+    pub(crate) fn block_next_render_write_for_test(&self) -> Option<ClientRenderWriteBlock> {
+        match &self.render.target {
+            ClientRenderTarget::Queue(queue) => Some(queue.block_next_render_write_for_test()),
+            ClientRenderTarget::Channel(_) => None,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TestRenderWriteGateState {
+    entered: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TestRenderWriteGate {
+    state: Mutex<TestRenderWriteGateState>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+impl TestRenderWriteGate {
+    fn wait_before_write(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.entered = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ClientRenderWriteBlock {
+    gate: Arc<TestRenderWriteGate>,
+}
+
+#[cfg(test)]
+impl ClientRenderWriteBlock {
+    pub(crate) fn wait_until_blocked(&self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !state.entered {
+            state = self
+                .gate
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    pub(crate) fn release(self) {
+        drop(self);
+    }
+}
+
+#[cfg(test)]
+impl Drop for ClientRenderWriteBlock {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.released = true;
+        self.gate.changed.notify_all();
+    }
 }
 
 #[derive(Debug)]
@@ -181,8 +268,24 @@ impl ClientRenderWriter {
     }
 
     pub(crate) fn try_send(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
+        self.try_send_inner(data, None)
+    }
+
+    pub(crate) fn try_send_with_write_notification(
+        &self,
+        data: Vec<u8>,
+        acknowledgement: crate::server::client_projection::ClientFrameAcknowledgement,
+    ) -> Result<(), TrySendError<Vec<u8>>> {
+        self.try_send_inner(data, Some(acknowledgement))
+    }
+
+    fn try_send_inner(
+        &self,
+        data: Vec<u8>,
+        acknowledgement: Option<crate::server::client_projection::ClientFrameAcknowledgement>,
+    ) -> Result<(), TrySendError<Vec<u8>>> {
         match &self.target {
-            ClientRenderTarget::Queue(queue) => queue.try_send_render(data),
+            ClientRenderTarget::Queue(queue) => queue.try_send_render(data, acknowledgement),
             #[cfg(test)]
             ClientRenderTarget::Channel(sender) => sender.try_send(data),
         }
@@ -198,15 +301,23 @@ struct ClientWriterQueue {
 #[derive(Debug, Default)]
 struct ClientWriterQueueState {
     control: VecDeque<Vec<u8>>,
-    render: Option<Vec<u8>>,
+    render: Option<QueuedRender>,
     senders: usize,
     writer_alive: bool,
+    #[cfg(test)]
+    next_render_write_gate: Option<Arc<TestRenderWriteGate>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct QueuedRender {
+    data: Vec<u8>,
+    acknowledgement: Option<crate::server::client_projection::ClientFrameAcknowledgement>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum ClientWriteItem {
     Control(Vec<u8>),
-    Render(Vec<u8>),
+    Render(QueuedRender),
 }
 
 impl ClientWriterQueue {
@@ -241,7 +352,41 @@ impl ClientWriterQueue {
         Ok(())
     }
 
-    fn try_send_render(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
+    #[cfg(test)]
+    fn send_barrier_if_empty(&self, data: Vec<u8>) -> Result<(), Vec<u8>> {
+        let mut state = self.lock_state();
+        if !state.writer_alive || !state.control.is_empty() || state.render.is_some() {
+            return Err(data);
+        }
+        state.control.push_back(data);
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn block_next_render_write_for_test(&self) -> ClientRenderWriteBlock {
+        let gate = Arc::new(TestRenderWriteGate::default());
+        let mut state = self.lock_state();
+        assert!(
+            state.next_render_write_gate.replace(gate.clone()).is_none(),
+            "only one render write may be blocked at a time"
+        );
+        ClientRenderWriteBlock { gate }
+    }
+
+    #[cfg(test)]
+    fn wait_before_render_write_for_test(&self) {
+        let gate = self.lock_state().next_render_write_gate.take();
+        if let Some(gate) = gate {
+            gate.wait_before_write();
+        }
+    }
+
+    fn try_send_render(
+        &self,
+        data: Vec<u8>,
+        acknowledgement: Option<crate::server::client_projection::ClientFrameAcknowledgement>,
+    ) -> Result<(), TrySendError<Vec<u8>>> {
         let mut state = self.lock_state();
         if !state.writer_alive {
             return Err(TrySendError::Disconnected(data));
@@ -249,7 +394,10 @@ impl ClientWriterQueue {
         if state.render.is_some() {
             return Err(TrySendError::Full(data));
         }
-        state.render = Some(data);
+        state.render = Some(QueuedRender {
+            data,
+            acknowledgement,
+        });
         self.ready.notify_one();
         Ok(())
     }
@@ -260,9 +408,9 @@ impl ClientWriterQueue {
             if let Some(data) = state.control.pop_front() {
                 return Some(ClientWriteItem::Control(data));
             }
-            if let Some(data) = state.render.take() {
+            if let Some(render) = state.render.take() {
                 self.ready.notify_one();
-                return Some(ClientWriteItem::Render(data));
+                return Some(ClientWriteItem::Render(render));
             }
             if state.senders == 0 {
                 return None;
@@ -314,6 +462,20 @@ pub(crate) enum ServerEvent {
     ExternalOpenPolicyUpdate {
         client_id: u64,
         policy: crate::protocol::ExternalOpenPolicy,
+    },
+    /// A full app client reported a source-bound device-local policy mutation result.
+    ExternalOpenPolicyMutationResult {
+        client_id: u64,
+        request_id: u64,
+        requested_policy: crate::protocol::ExternalOpenPolicy,
+        persisted_policy: Option<crate::protocol::ExternalOpenPolicy>,
+        effective_policy: crate::protocol::ExternalOpenPolicy,
+        failure_stage: Option<crate::protocol::ExternalOpenPolicyMutationFailureStage>,
+    },
+    /// A full app client failed to reload its device-local policy explicitly.
+    ExternalOpenPolicyReloadFailed {
+        client_id: u64,
+        effective_policy: crate::protocol::ExternalOpenPolicy,
     },
     /// A full app client completed external-open preparation.
     ExternalOpenReady {
@@ -377,6 +539,11 @@ pub(crate) enum ServerEvent {
     ClientDisconnected { client_id: u64 },
     /// A client writer drained its render slot and can accept another render.
     ClientWriterDrained { client_id: u64 },
+    /// One exact queued client frame was written successfully to its socket.
+    ClientFrameWritten {
+        client_id: u64,
+        acknowledgement: crate::server::client_projection::ClientFrameAcknowledgement,
+    },
     /// A client writer could not deliver queued bytes to its socket.
     ClientWriterFailed { client_id: u64 },
     /// Ctrl+C or external shutdown signal received.
@@ -656,12 +823,20 @@ fn client_writer_loop(
                     break;
                 }
             }
-            ClientWriteItem::Render(data) => {
+            ClientWriteItem::Render(render) => {
                 let _ =
                     server_event_tx.blocking_send(ServerEvent::ClientWriterDrained { client_id });
-                if !write_framed_bytes(&mut stream, &data) {
+                #[cfg(test)]
+                writer_queue.wait_before_render_write_for_test();
+                if !write_framed_bytes(&mut stream, &render.data) {
                     write_failed = true;
                     break;
+                }
+                if let Some(acknowledgement) = render.acknowledgement {
+                    let _ = server_event_tx.blocking_send(ServerEvent::ClientFrameWritten {
+                        client_id,
+                        acknowledgement,
+                    });
                 }
             }
         }
@@ -841,6 +1016,26 @@ fn client_read_loop(
                     result,
                 }
             }
+            ClientMessage::ExternalOpenPolicyMutationResult {
+                request_id,
+                requested_policy,
+                persisted_policy,
+                effective_policy,
+                failure_stage,
+            } => ServerEvent::ExternalOpenPolicyMutationResult {
+                client_id,
+                request_id,
+                requested_policy,
+                persisted_policy,
+                effective_policy,
+                failure_stage,
+            },
+            ClientMessage::ExternalOpenPolicyReloadFailed { effective_policy } => {
+                ServerEvent::ExternalOpenPolicyReloadFailed {
+                    client_id,
+                    effective_policy,
+                }
+            }
             ClientMessage::Hello { .. } => {
                 // Duplicate Hello — ignore.
                 continue;
@@ -913,6 +1108,15 @@ mod tests {
         bytes
     }
 
+    fn test_frame_acknowledgement() -> crate::server::client_projection::ClientFrameAcknowledgement
+    {
+        let mut projections = crate::server::client_projection::ClientProjections::default();
+        assert!(projections.connect(1, crate::protocol::ExternalOpenPolicy::Disabled));
+        projections
+            .prepare_frame_acknowledgement(1, Default::default())
+            .expect("frame acknowledgement")
+    }
+
     #[test]
     fn client_writer_queue_keeps_render_slot_bounded() {
         let (writer, _queue) = test_queue_writer();
@@ -934,11 +1138,15 @@ mod tests {
     fn client_writer_prioritizes_control_and_reports_render_drain() {
         let (mut client_stream, server_stream, _path) = local_stream_pair("client-writer-priority");
         let (writer, queue) = test_queue_writer();
+        let acknowledgement = test_frame_acknowledgement();
         writer
             .render
-            .try_send(frame_server_message(&ServerMessage::WindowTitle {
-                title: Some("render".into()),
-            }))
+            .try_send_with_write_notification(
+                frame_server_message(&ServerMessage::WindowTitle {
+                    title: Some("render".into()),
+                }),
+                acknowledgement.clone(),
+            )
             .expect("queue render");
         writer
             .control
@@ -964,6 +1172,19 @@ mod tests {
         {
             ServerEvent::ClientWriterDrained { client_id } => assert_eq!(client_id, 9),
             other => panic!("expected writer drained event, got {other:?}"),
+        }
+        match server_event_rx
+            .blocking_recv()
+            .expect("frame written event")
+        {
+            ServerEvent::ClientFrameWritten {
+                client_id,
+                acknowledgement: written,
+            } => {
+                assert_eq!(client_id, 9);
+                assert_eq!(written, acknowledgement);
+            }
+            other => panic!("expected frame written event, got {other:?}"),
         }
 
         drop(writer);
@@ -1056,6 +1277,40 @@ mod tests {
             writer.render.try_send(vec![b'z']),
             Err(TrySendError::Disconnected(_))
         ));
+    }
+
+    #[test]
+    fn failed_render_write_emits_no_frame_acknowledgement() {
+        let (client_stream, server_stream, _path) =
+            local_stream_pair("client-render-ack-socket-failure");
+        drop(client_stream);
+        let (writer, queue) = test_queue_writer();
+        let acknowledgement = test_frame_acknowledgement();
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let handle = std::thread::spawn(move || {
+            client_writer_loop(server_stream, 14, queue, server_event_tx);
+        });
+
+        writer
+            .render
+            .try_send_with_write_notification(vec![b'x'; 1024 * 1024], acknowledgement)
+            .expect("render is accepted before the writer observes socket failure");
+        handle.join().expect("writer exits after render failure");
+
+        let mut drained = false;
+        let mut failed = false;
+        while let Some(event) = server_event_rx.blocking_recv() {
+            match event {
+                ServerEvent::ClientWriterDrained { client_id: 14 } => drained = true,
+                ServerEvent::ClientWriterFailed { client_id: 14 } => failed = true,
+                ServerEvent::ClientFrameWritten { .. } => {
+                    panic!("failed socket write must not acknowledge its frame")
+                }
+                other => panic!("unexpected writer event: {other:?}"),
+            }
+        }
+        assert!(drained);
+        assert!(failed);
     }
 
     #[test]
@@ -1411,6 +1666,73 @@ new_tab = "ctrl+notakey"
                 assert_eq!(actual, events);
             }
             other => panic!("expected ClientInputEvents, got {other:?}"),
+        }
+
+        drop(client_stream);
+        should_quit.store(true, Ordering::Release);
+        handle
+            .join()
+            .expect("read thread join")
+            .expect("read thread result");
+    }
+
+    #[test]
+    fn client_socket_forwards_complete_policy_mutation_result_with_source_identity() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-policy-mutation-result");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let read_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+        });
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::ExternalOpenPolicyMutationResult {
+                request_id: 41,
+                requested_policy: crate::protocol::ExternalOpenPolicy::Enabled,
+                persisted_policy: Some(crate::protocol::ExternalOpenPolicy::Enabled),
+                effective_policy: crate::protocol::ExternalOpenPolicy::Disabled,
+                failure_stage: Some(
+                    crate::protocol::ExternalOpenPolicyMutationFailureStage::Reload,
+                ),
+            },
+        )
+        .expect("write policy mutation result");
+
+        match server_event_rx
+            .blocking_recv()
+            .expect("policy mutation result event")
+        {
+            ServerEvent::ExternalOpenPolicyMutationResult {
+                client_id,
+                request_id,
+                requested_policy,
+                persisted_policy,
+                effective_policy,
+                failure_stage,
+            } => {
+                assert_eq!(client_id, 7);
+                assert_eq!(request_id, 41);
+                assert_eq!(
+                    requested_policy,
+                    crate::protocol::ExternalOpenPolicy::Enabled
+                );
+                assert_eq!(
+                    persisted_policy,
+                    Some(crate::protocol::ExternalOpenPolicy::Enabled)
+                );
+                assert_eq!(
+                    effective_policy,
+                    crate::protocol::ExternalOpenPolicy::Disabled
+                );
+                assert_eq!(
+                    failure_stage,
+                    Some(crate::protocol::ExternalOpenPolicyMutationFailureStage::Reload)
+                );
+            }
+            other => panic!("expected policy mutation result, got {other:?}"),
         }
 
         drop(client_stream);

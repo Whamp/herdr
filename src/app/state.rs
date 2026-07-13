@@ -727,6 +727,13 @@ pub enum ViewLayout {
     Mobile,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AmbientNotificationLayout {
+    pub(crate) config_diagnostic_rects: Vec<Rect>,
+    pub(crate) toast_rect: Rect,
+    pub(crate) copy_feedback_rect: Rect,
+}
+
 pub struct ViewState {
     pub layout: ViewLayout,
     pub sidebar_rect: Rect,
@@ -739,9 +746,15 @@ pub struct ViewState {
     pub terminal_area: Rect,
     pub mobile_header_rect: Rect,
     pub mobile_menu_hit_area: Rect,
-    pub toast_hit_area: Rect,
     pub pane_infos: Vec<PaneInfo>,
     pub split_borders: Vec<SplitBorder>,
+    pub(crate) notifications: AmbientNotificationLayout,
+}
+
+impl ViewState {
+    pub(crate) fn toast_hit_area(&self) -> Rect {
+        self.notifications.toast_rect
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1731,9 +1744,9 @@ impl AppState {
                 terminal_area: Rect::default(),
                 mobile_header_rect: Rect::default(),
                 mobile_menu_hit_area: Rect::default(),
-                toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
+                notifications: AmbientNotificationLayout::default(),
             },
             drag: None,
             workspace_press: None,

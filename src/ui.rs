@@ -89,11 +89,68 @@ pub(crate) use self::{
     tabs::compute_tab_bar_view,
     widgets::{centered_popup_rect, modal_stack_areas},
 };
-use crate::app::state::ViewLayout;
+use crate::app::state::{AmbientNotificationLayout, ViewLayout};
 use crate::app::{AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
 
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NotificationLayout {
+    config_diagnostic_rects: Vec<Rect>,
+    client_notice_rects: Vec<Rect>,
+    toast_rect: Rect,
+    copy_feedback_rect: Rect,
+}
+
+impl NotificationLayout {
+    fn ambient(&self) -> AmbientNotificationLayout {
+        AmbientNotificationLayout {
+            config_diagnostic_rects: self.config_diagnostic_rects.clone(),
+            toast_rect: self.toast_rect,
+            copy_feedback_rect: self.copy_feedback_rect,
+        }
+    }
+}
+
+/// Immutable presentation data for one exact full-app connection frame.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ClientRenderContext {
+    client_notice: Option<String>,
+    notifications: NotificationLayout,
+}
+
+impl ClientRenderContext {
+    pub(crate) fn compute(app: &AppState, client_notice: Option<&str>, frame_area: Rect) -> Self {
+        Self {
+            client_notice: client_notice.map(str::to_owned),
+            notifications: compute_notification_layout(
+                app,
+                client_notice,
+                frame_area,
+                app.view.terminal_area,
+                app.view.layout,
+            ),
+        }
+    }
+
+    fn from_ambient(app: &AppState) -> Self {
+        let notifications = &app.view.notifications;
+        Self {
+            client_notice: None,
+            notifications: NotificationLayout {
+                config_diagnostic_rects: notifications.config_diagnostic_rects.clone(),
+                client_notice_rects: Vec::new(),
+                toast_rect: notifications.toast_rect,
+                copy_feedback_rect: notifications.copy_feedback_rect,
+            },
+        }
+    }
+
+    pub(crate) fn toast_hit_area(&self) -> Rect {
+        self.notifications.toast_rect
+    }
+}
 
 // Braille spinner frames — smooth rotation
 const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -202,6 +259,151 @@ fn desktop_tab_bar_and_terminal_area(
     }
 }
 
+fn diagnostic_rects(message: &str, area: Rect) -> Vec<Rect> {
+    message
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(area.height as usize)
+        .enumerate()
+        .map(|(row, line)| {
+            let width = (line.len() as u16).saturating_add(2).min(area.width);
+            Rect::new(
+                area.x + area.width.saturating_sub(width),
+                area.y + row as u16,
+                width,
+                1,
+            )
+        })
+        .collect()
+}
+
+fn compute_notification_layout(
+    app: &AppState,
+    client_notice: Option<&str>,
+    frame_area: Rect,
+    terminal_area: Rect,
+    layout: ViewLayout,
+) -> NotificationLayout {
+    let diagnostic_area = if layout == ViewLayout::Mobile {
+        terminal_area
+    } else {
+        frame_area
+    };
+    let config_diagnostic_rects = app
+        .config_diagnostic
+        .as_deref()
+        .map(|message| diagnostic_rects(message, diagnostic_area))
+        .unwrap_or_default();
+
+    let config_rows = config_diagnostic_rects.len() as u16;
+    let client_area = Rect::new(
+        diagnostic_area.x,
+        diagnostic_area.y.saturating_add(config_rows),
+        diagnostic_area.width,
+        diagnostic_area.height.saturating_sub(config_rows),
+    );
+    let client_notice_rects = client_notice
+        .map(|message| diagnostic_rects(message, client_area))
+        .unwrap_or_default();
+    let top_occupied_rows = config_diagnostic_rects
+        .iter()
+        .chain(&client_notice_rects)
+        .map(|rect| {
+            rect.y
+                .saturating_add(rect.height)
+                .saturating_sub(frame_area.y)
+        })
+        .max()
+        .unwrap_or(0);
+
+    let top_occupied_y = frame_area.y.saturating_add(top_occupied_rows);
+    let (toast_rect, toast_is_top) = app
+        .toast
+        .as_ref()
+        .map(|toast| {
+            if layout == ViewLayout::Mobile {
+                let available = Rect::new(
+                    frame_area.x,
+                    top_occupied_y,
+                    frame_area.width,
+                    frame_area
+                        .y
+                        .saturating_add(frame_area.height)
+                        .saturating_sub(top_occupied_y),
+                );
+                (mobile_toast_banner_rect(available, 0), false)
+            } else {
+                let position = toast.position.unwrap_or(app.toast_config.herdr.position);
+                let toast_is_top = matches!(
+                    position,
+                    crate::config::ToastHerdrPosition::TopLeft
+                        | crate::config::ToastHerdrPosition::TopRight
+                );
+                let toast_area = if toast_is_top {
+                    frame_area
+                } else {
+                    Rect::new(
+                        frame_area.x,
+                        top_occupied_y,
+                        frame_area.width,
+                        frame_area
+                            .y
+                            .saturating_add(frame_area.height)
+                            .saturating_sub(top_occupied_y),
+                    )
+                };
+                let offset = if toast_is_top { top_occupied_rows } else { 0 };
+                (
+                    toast_notification_rect(toast_area, toast, offset, position),
+                    toast_is_top,
+                )
+            }
+        })
+        .unwrap_or((Rect::default(), false));
+
+    let feedback_base_area = if layout == ViewLayout::Mobile {
+        frame_area
+    } else {
+        terminal_area
+    };
+    let mut feedback_top = top_occupied_y.max(feedback_base_area.y);
+    let mut feedback_bottom = feedback_base_area
+        .y
+        .saturating_add(feedback_base_area.height);
+    if !toast_rect.is_empty() {
+        if toast_is_top {
+            feedback_top = feedback_top.max(toast_rect.y.saturating_add(toast_rect.height));
+        } else {
+            feedback_bottom = feedback_bottom.min(toast_rect.y);
+        }
+    }
+    let feedback_area = Rect::new(
+        feedback_base_area.x,
+        feedback_top,
+        feedback_base_area.width,
+        feedback_bottom.saturating_sub(feedback_top),
+    );
+    let copy_feedback_rect = app
+        .copy_feedback
+        .as_ref()
+        .map(|feedback| {
+            copy_feedback_rect(
+                feedback_area,
+                feedback,
+                0,
+                app.toast_config.clipboard.position,
+            )
+        })
+        .unwrap_or_default();
+
+    NotificationLayout {
+        config_diagnostic_rects,
+        client_notice_rects,
+        toast_rect,
+        copy_feedback_rect,
+    }
+}
+
 fn compute_view_internal(
     app: &mut AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -289,18 +491,8 @@ fn compute_view_internal(
         resize_background_tab_panes_for_desktop(app, terminal_runtimes, main_area, cell_size);
     }
 
-    let toast_hit_area = app
-        .toast
-        .as_ref()
-        .map(|toast| {
-            toast_notification_rect(
-                area,
-                toast,
-                app.config_diagnostic.is_some(),
-                toast.position.unwrap_or(app.toast_config.herdr.position),
-            )
-        })
-        .unwrap_or_default();
+    let notifications =
+        compute_notification_layout(app, None, area, terminal_area, ViewLayout::Desktop).ambient();
 
     app.view = crate::app::ViewState {
         layout: ViewLayout::Desktop,
@@ -314,9 +506,9 @@ fn compute_view_internal(
         terminal_area,
         mobile_header_rect: Rect::default(),
         mobile_menu_hit_area: Rect::default(),
-        toast_hit_area,
         pane_infos,
         split_borders,
+        notifications,
     };
     app.sync_copy_mode_search_geometry();
 }
@@ -367,11 +559,8 @@ fn compute_mobile_view(
     }
     let header_hits = compute_mobile_header_hit_areas(app, header_rect);
 
-    let toast_hit_area = app
-        .toast
-        .as_ref()
-        .map(|_| mobile_toast_banner_rect(area, app.config_diagnostic.is_some()))
-        .unwrap_or_default();
+    let notifications =
+        compute_notification_layout(app, None, area, terminal_area, ViewLayout::Mobile).ambient();
 
     app.view = crate::app::ViewState {
         layout: ViewLayout::Mobile,
@@ -385,9 +574,9 @@ fn compute_mobile_view(
         terminal_area,
         mobile_header_rect: header_rect,
         mobile_menu_hit_area: header_hits.menu,
-        toast_hit_area,
         pane_infos,
         split_borders,
+        notifications,
     };
     app.sync_copy_mode_search_geometry();
 }
@@ -413,6 +602,23 @@ pub fn render_with_runtime_registry_and_client_local_preference(
     remote_link_preference: Option<crate::remote_link_preference::RemoteLinkPreferenceView>,
     frame: &mut Frame,
 ) {
+    let render_context = ClientRenderContext::from_ambient(app);
+    render_with_runtime_registry_and_client_local_projection(
+        app,
+        terminal_runtimes,
+        remote_link_preference,
+        &render_context,
+        frame,
+    );
+}
+
+pub fn render_with_runtime_registry_and_client_local_projection(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    remote_link_preference: Option<crate::remote_link_preference::RemoteLinkPreferenceView>,
+    render_context: &ClientRenderContext,
+    frame: &mut Frame,
+) {
     let sidebar_area = app.view.sidebar_rect;
     let tab_bar_area = app.view.tab_bar_rect;
     let terminal_area = app.view.terminal_area;
@@ -432,7 +638,7 @@ pub fn render_with_runtime_registry_and_client_local_preference(
     render_panes(app, terminal_runtimes, frame, terminal_area);
 
     // Ambient notifications sit above panes, but below interactive overlays.
-    render_notifications(app, frame, terminal_area);
+    render_ambient_notifications(app, render_context, frame);
 
     match app.mode {
         Mode::Onboarding => render_onboarding_overlay(app, frame, frame.area()),
@@ -468,93 +674,50 @@ pub fn render_with_runtime_registry_and_client_local_preference(
         Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
         Mode::Terminal => {}
     }
-}
 
-fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) {
-    let has_config_diagnostic = app.config_diagnostic.is_some();
-    if let Some(message) = &app.config_diagnostic {
-        let diagnostic_area = if app.view.layout == ViewLayout::Mobile {
-            terminal_area
-        } else {
-            frame.area()
-        };
-        render_config_diagnostic(frame, diagnostic_area, message, &app.palette);
-    }
-    let mut copy_feedback_offset = u16::from(has_config_diagnostic);
-    let mut toast_rect = None;
-    if let Some(toast) = &app.toast {
-        if app.view.layout == ViewLayout::Mobile {
-            render_mobile_toast_banner(
-                frame,
-                frame.area(),
-                toast,
-                has_config_diagnostic,
-                &app.palette,
-            );
-        } else {
-            render_toast_notification(
-                frame,
-                frame.area(),
-                toast,
-                has_config_diagnostic,
-                toast.position.unwrap_or(app.toast_config.herdr.position),
-                &app.palette,
-            );
-            toast_rect = Some(toast_notification_rect(
-                frame.area(),
-                toast,
-                has_config_diagnostic,
-                toast.position.unwrap_or(app.toast_config.herdr.position),
-            ));
-        }
-        if app.view.layout == ViewLayout::Mobile {
-            toast_rect = Some(mobile_toast_banner_rect(
-                frame.area(),
-                has_config_diagnostic,
-            ));
-        }
-    }
-    if let Some(feedback) = &app.copy_feedback {
-        let area = if app.view.layout == ViewLayout::Mobile {
-            frame.area()
-        } else {
-            terminal_area
-        };
-        if let Some(toast_rect) = toast_rect {
-            copy_feedback_offset = copy_feedback_offset_for_toast(
-                area,
-                feedback,
-                copy_feedback_offset,
-                app.toast_config.clipboard.position,
-                toast_rect,
-            );
-        }
-        render_copy_feedback(
+    // Client-local diagnostics must remain visible while an overlay is open.
+    if let Some(message) = render_context.client_notice.as_deref() {
+        render_config_diagnostic(
             frame,
-            area,
-            feedback,
-            copy_feedback_offset,
-            app.toast_config.clipboard.position,
+            message,
+            &render_context.notifications.client_notice_rects,
             &app.palette,
         );
     }
 }
 
-fn copy_feedback_offset_for_toast(
-    area: Rect,
-    feedback: &crate::app::state::CopyFeedback,
-    base_offset: u16,
-    position: crate::config::ToastClipboardPosition,
-    toast_rect: Rect,
-) -> u16 {
-    let feedback_rect = copy_feedback_rect(area, feedback, base_offset, position);
-    if rects_overlap(feedback_rect, toast_rect) {
-        base_offset.saturating_add(toast_rect.height)
-    } else {
-        base_offset
+fn render_ambient_notifications(
+    app: &AppState,
+    render_context: &ClientRenderContext,
+    frame: &mut Frame,
+) {
+    let notifications = &render_context.notifications;
+    if let Some(message) = &app.config_diagnostic {
+        render_config_diagnostic(
+            frame,
+            message,
+            &notifications.config_diagnostic_rects,
+            &app.palette,
+        );
+    }
+    if let Some(toast) = &app.toast {
+        if app.view.layout == ViewLayout::Mobile {
+            render_mobile_toast_banner(frame, toast, notifications.toast_rect, &app.palette);
+        } else {
+            render_toast_notification(frame, toast, notifications.toast_rect, &app.palette);
+        }
+    }
+    if let Some(feedback) = &app.copy_feedback {
+        render_copy_feedback(
+            frame,
+            feedback,
+            notifications.copy_feedback_rect,
+            &app.palette,
+        );
     }
 }
 
+#[cfg(test)]
 fn rects_overlap(a: Rect, b: Rect) -> bool {
     a.x < b.x.saturating_add(b.width)
         && b.x < a.x.saturating_add(a.width)
@@ -628,48 +791,418 @@ mod tests {
         assert!(rendered.contains("open remote links on this device [ ] saving…"));
     }
 
-    #[test]
-    fn copy_feedback_offset_only_increases_when_toast_rect_overlaps() {
-        let area = Rect::new(0, 0, 80, 24);
-        let feedback = crate::app::state::CopyFeedback {
-            message: "copied to clipboard".into(),
-        };
-        let toast = crate::app::state::ToastNotification {
+    fn render_notification_fixture(
+        config_diagnostic: Option<&str>,
+        client_notice: Option<&str>,
+        toast: Option<crate::app::state::ToastNotification>,
+        area: Rect,
+    ) -> ratatui::buffer::Buffer {
+        let mut app = crate::app::state::AppState::test_new();
+        app.config_diagnostic = config_diagnostic.map(str::to_owned);
+        app.toast = toast;
+        app.toast_config.herdr.position = crate::config::ToastHerdrPosition::TopLeft;
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        compute_view_with_runtime_registry(&mut app, &runtimes, area);
+        let render_context = ClientRenderContext::compute(&app, client_notice, area);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height))
+            .expect("notification test terminal");
+        terminal
+            .draw(|frame| {
+                render_with_runtime_registry_and_client_local_projection(
+                    &app,
+                    &runtimes,
+                    None,
+                    &render_context,
+                    frame,
+                );
+            })
+            .expect("notification fixture should render");
+        terminal.backend().buffer().clone()
+    }
+
+    fn notification_toast() -> crate::app::state::ToastNotification {
+        crate::app::state::ToastNotification {
             kind: crate::app::state::ToastKind::Finished,
-            title: "pi finished".into(),
-            context: "workspace · 1".into(),
-            position: None,
+            title: "toast title".into(),
+            context: "toast context".into(),
+            position: Some(crate::config::ToastHerdrPosition::TopLeft),
             target: None,
-        };
+        }
+    }
 
-        let bottom_right_toast = toast_notification_rect(
+    #[test]
+    fn mobile_production_frame_keeps_top_copy_feedback_below_client_notice() {
+        let area = Rect::new(0, 0, 44, 7);
+        let mut app = crate::app::state::AppState::test_new();
+        app.mode = Mode::Terminal;
+        app.copy_feedback = Some(crate::app::state::CopyFeedback {
+            message: "copied".into(),
+        });
+        app.toast_config.clipboard.position = crate::config::ToastClipboardPosition::TopCenter;
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let client_notice = "client-local notice";
+        compute_view_with_runtime_registry(&mut app, &runtimes, area);
+
+        let render_context = ClientRenderContext::compute(&app, Some(client_notice), area);
+        let notice_rect = render_context.notifications.client_notice_rects[0];
+        let feedback_rect = render_context.notifications.copy_feedback_rect;
+        assert!(!rects_overlap(notice_rect, feedback_rect));
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height))
+            .expect("mobile notification test terminal");
+        terminal
+            .draw(|frame| {
+                render_with_runtime_registry_and_client_local_projection(
+                    &app,
+                    &runtimes,
+                    None,
+                    &render_context,
+                    frame,
+                );
+            })
+            .expect("mobile production frame should render");
+        let buffer = terminal.backend().buffer();
+
+        let notice_row = buffer_row_text(buffer, area, notice_rect.y);
+        assert!(
+            notice_row.contains(client_notice),
+            "notice={notice_rect:?} feedback={feedback_rect:?} notice row: {notice_row:?}"
+        );
+        assert!(
+            (feedback_rect.y..feedback_rect.y.saturating_add(feedback_rect.height))
+                .any(|row| buffer_row_text(buffer, area, row).contains("copied"))
+        );
+    }
+
+    #[test]
+    fn mobile_notification_geometry_is_disjoint_for_every_banner_combination() {
+        use crate::config::ToastClipboardPosition;
+
+        let copy_positions = [
+            ToastClipboardPosition::TopLeft,
+            ToastClipboardPosition::TopCenter,
+            ToastClipboardPosition::TopRight,
+            ToastClipboardPosition::BottomLeft,
+            ToastClipboardPosition::BottomCenter,
+            ToastClipboardPosition::BottomRight,
+        ];
+        let areas = [Rect::new(0, 0, 44, 7), Rect::new(0, 0, 20, 4)];
+
+        for area in areas {
+            for has_config in [false, true] {
+                for has_notice in [false, true] {
+                    for has_toast in [false, true] {
+                        for has_copy in [false, true] {
+                            for copy_position in copy_positions {
+                                let mut app = crate::app::state::AppState::test_new();
+                                app.mode = Mode::Terminal;
+                                app.config_diagnostic =
+                                    has_config.then(|| "config first\nconfig second".to_owned());
+                                app.toast = has_toast.then(notification_toast);
+                                app.copy_feedback =
+                                    has_copy.then(|| crate::app::state::CopyFeedback {
+                                        message: "copied".into(),
+                                    });
+                                app.toast_config.clipboard.position = copy_position;
+                                let client_notice = has_notice.then_some("client notice");
+                                let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+                                compute_view_with_runtime_registry(&mut app, &runtimes, area);
+
+                                let render_context =
+                                    ClientRenderContext::compute(&app, client_notice, area);
+                                let layout = &render_context.notifications;
+                                assert_eq!(render_context.toast_hit_area(), layout.toast_rect);
+                                let rects = layout
+                                    .config_diagnostic_rects
+                                    .iter()
+                                    .chain(&layout.client_notice_rects)
+                                    .chain(std::iter::once(&layout.toast_rect))
+                                    .chain(std::iter::once(&layout.copy_feedback_rect))
+                                    .copied()
+                                    .filter(|rect| !rect.is_empty())
+                                    .collect::<Vec<_>>();
+                                for rect in &rects {
+                                    assert!(
+                                        rect.x.saturating_add(rect.width)
+                                            <= area.x.saturating_add(area.width)
+                                            && rect.y.saturating_add(rect.height)
+                                                <= area.y.saturating_add(area.height),
+                                        "out-of-frame {rect:?} for area={area:?}, config={has_config}, notice={has_notice}, toast={has_toast}, copy={has_copy}, position={copy_position:?}"
+                                    );
+                                }
+                                for (index, rect) in rects.iter().enumerate() {
+                                    for other in &rects[index + 1..] {
+                                        assert!(
+                                            !rects_overlap(*rect, *other),
+                                            "overlap {rect:?} and {other:?} for area={area:?}, config={has_config}, notice={has_notice}, toast={has_toast}, copy={has_copy}, position={copy_position:?}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn computed_notification_layout_owns_every_banner_combination() {
+        struct Case {
+            area: Rect,
+            config: Option<&'static str>,
+            notice: Option<&'static str>,
+            toast: bool,
+            expected_config_rows: &'static [u16],
+            expected_notice_rows: &'static [u16],
+            expected_toast: Rect,
+        }
+
+        let cases = [
+            Case {
+                area: Rect::new(0, 0, 80, 8),
+                config: Some("config"),
+                notice: None,
+                toast: false,
+                expected_config_rows: &[0],
+                expected_notice_rows: &[],
+                expected_toast: Rect::default(),
+            },
+            Case {
+                area: Rect::new(0, 0, 80, 8),
+                config: None,
+                notice: Some("notice"),
+                toast: false,
+                expected_config_rows: &[],
+                expected_notice_rows: &[0],
+                expected_toast: Rect::default(),
+            },
+            Case {
+                area: Rect::new(0, 0, 80, 8),
+                config: None,
+                notice: None,
+                toast: true,
+                expected_config_rows: &[],
+                expected_notice_rows: &[],
+                expected_toast: Rect::new(0, 0, 19, 4),
+            },
+            Case {
+                area: Rect::new(0, 0, 80, 8),
+                config: Some("config"),
+                notice: Some("notice"),
+                toast: false,
+                expected_config_rows: &[0],
+                expected_notice_rows: &[1],
+                expected_toast: Rect::default(),
+            },
+            Case {
+                area: Rect::new(0, 0, 80, 8),
+                config: Some("config"),
+                notice: None,
+                toast: true,
+                expected_config_rows: &[0],
+                expected_notice_rows: &[],
+                expected_toast: Rect::new(0, 1, 19, 4),
+            },
+            Case {
+                area: Rect::new(0, 0, 80, 8),
+                config: None,
+                notice: Some("notice"),
+                toast: true,
+                expected_config_rows: &[],
+                expected_notice_rows: &[0],
+                expected_toast: Rect::new(0, 1, 19, 4),
+            },
+            Case {
+                area: Rect::new(0, 0, 65, 7),
+                config: Some("first\nsecond"),
+                notice: Some("notice"),
+                toast: true,
+                expected_config_rows: &[0, 1],
+                expected_notice_rows: &[2],
+                expected_toast: Rect::new(0, 3, 19, 4),
+            },
+            Case {
+                area: Rect::new(0, 0, 44, 7),
+                config: Some("config"),
+                notice: None,
+                toast: false,
+                expected_config_rows: &[2],
+                expected_notice_rows: &[],
+                expected_toast: Rect::default(),
+            },
+            Case {
+                area: Rect::new(0, 0, 44, 7),
+                config: None,
+                notice: Some("notice"),
+                toast: false,
+                expected_config_rows: &[],
+                expected_notice_rows: &[2],
+                expected_toast: Rect::default(),
+            },
+            Case {
+                area: Rect::new(0, 0, 44, 7),
+                config: None,
+                notice: None,
+                toast: true,
+                expected_config_rows: &[],
+                expected_notice_rows: &[],
+                expected_toast: Rect::new(0, 6, 44, 1),
+            },
+            Case {
+                area: Rect::new(0, 0, 44, 7),
+                config: Some("config"),
+                notice: Some("notice"),
+                toast: false,
+                expected_config_rows: &[2],
+                expected_notice_rows: &[3],
+                expected_toast: Rect::default(),
+            },
+            Case {
+                area: Rect::new(0, 0, 44, 7),
+                config: Some("config"),
+                notice: None,
+                toast: true,
+                expected_config_rows: &[2],
+                expected_notice_rows: &[],
+                expected_toast: Rect::new(0, 6, 44, 1),
+            },
+            Case {
+                area: Rect::new(0, 0, 44, 7),
+                config: None,
+                notice: Some("notice"),
+                toast: true,
+                expected_config_rows: &[],
+                expected_notice_rows: &[2],
+                expected_toast: Rect::new(0, 6, 44, 1),
+            },
+            Case {
+                area: Rect::new(0, 0, 44, 7),
+                config: Some("first\nsecond"),
+                notice: Some("notice"),
+                toast: true,
+                expected_config_rows: &[2, 3],
+                expected_notice_rows: &[4],
+                expected_toast: Rect::new(0, 6, 44, 1),
+            },
+        ];
+
+        for case in cases {
+            let mut app = crate::app::state::AppState::test_new();
+            app.config_diagnostic = case.config.map(str::to_owned);
+            app.toast = case.toast.then(notification_toast);
+            app.toast_config.herdr.position = crate::config::ToastHerdrPosition::TopLeft;
+            let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+            compute_view_with_runtime_registry(&mut app, &runtimes, case.area);
+
+            let render_context = ClientRenderContext::compute(&app, case.notice, case.area);
+            let layout = &render_context.notifications;
+            assert_eq!(
+                layout
+                    .config_diagnostic_rects
+                    .iter()
+                    .map(|rect| rect.y)
+                    .collect::<Vec<_>>(),
+                case.expected_config_rows
+            );
+            assert_eq!(
+                layout
+                    .client_notice_rects
+                    .iter()
+                    .map(|rect| rect.y)
+                    .collect::<Vec<_>>(),
+                case.expected_notice_rows
+            );
+            assert_eq!(layout.toast_rect, case.expected_toast);
+            assert_eq!(render_context.toast_hit_area(), case.expected_toast);
+        }
+    }
+
+    #[test]
+    fn computed_toast_positions_avoid_all_banner_rows() {
+        use crate::config::ToastHerdrPosition;
+
+        for (position, expected) in [
+            (ToastHerdrPosition::TopLeft, Rect::new(0, 3, 19, 4)),
+            (ToastHerdrPosition::TopRight, Rect::new(46, 3, 19, 4)),
+            (ToastHerdrPosition::BottomLeft, Rect::new(0, 3, 19, 4)),
+            (ToastHerdrPosition::BottomRight, Rect::new(46, 3, 19, 4)),
+        ] {
+            let mut app = crate::app::state::AppState::test_new();
+            app.config_diagnostic = Some("first\nsecond".into());
+            app.toast = Some(notification_toast());
+            app.toast_config.herdr.position = position;
+            if let Some(toast) = app.toast.as_mut() {
+                toast.position = None;
+            }
+            let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+            compute_view_with_runtime_registry(&mut app, &runtimes, Rect::new(0, 0, 65, 7));
+
+            let render_context =
+                ClientRenderContext::compute(&app, Some("notice"), Rect::new(0, 0, 65, 7));
+            assert_eq!(render_context.toast_hit_area(), expected, "{position:?}");
+        }
+    }
+
+    #[test]
+    fn shared_diagnostic_and_client_notice_occupy_distinct_rows() {
+        let area = Rect::new(0, 0, 80, 8);
+        let buffer = render_notification_fixture(
+            Some("shared diagnostic first\nshared diagnostic second"),
+            Some("client-local notice"),
+            None,
             area,
-            &toast,
-            false,
-            crate::config::ToastHerdrPosition::BottomRight,
-        );
-        assert_eq!(
-            copy_feedback_offset_for_toast(
-                area,
-                &feedback,
-                0,
-                crate::config::ToastClipboardPosition::TopCenter,
-                bottom_right_toast,
-            ),
-            0
         );
 
-        let bottom_center_toast = Rect::new(28, 21, 24, 3);
-        assert_eq!(
-            copy_feedback_offset_for_toast(
-                area,
-                &feedback,
-                0,
-                crate::config::ToastClipboardPosition::BottomCenter,
-                bottom_center_toast,
-            ),
-            bottom_center_toast.height
+        assert!(buffer_row_text(&buffer, area, 0).contains("shared diagnostic first"));
+        assert!(buffer_row_text(&buffer, area, 1).contains("shared diagnostic second"));
+        assert!(buffer_row_text(&buffer, area, 2).contains("client-local notice"));
+    }
+
+    #[test]
+    fn shared_diagnostic_and_top_toast_occupy_distinct_rows() {
+        let area = Rect::new(0, 0, 80, 8);
+        let buffer = render_notification_fixture(
+            Some("shared diagnostic first\nshared diagnostic second"),
+            None,
+            Some(notification_toast()),
+            area,
         );
+
+        assert!(buffer_row_text(&buffer, area, 0).contains("shared diagnostic first"));
+        assert!(buffer_row_text(&buffer, area, 1).contains("shared diagnostic second"));
+        assert!(buffer_row_text(&buffer, area, 3).contains("toast title"));
+    }
+
+    #[test]
+    fn client_notice_and_top_toast_occupy_distinct_rows() {
+        let area = Rect::new(0, 0, 80, 8);
+        let buffer = render_notification_fixture(
+            None,
+            Some("client-local notice"),
+            Some(notification_toast()),
+            area,
+        );
+
+        assert!(buffer_row_text(&buffer, area, 0).contains("client-local notice"));
+        assert!(buffer_row_text(&buffer, area, 2).contains("toast title"));
+    }
+
+    #[test]
+    fn shared_diagnostic_client_notice_and_top_toast_fit_narrow_short_geometry() {
+        let area = Rect::new(0, 0, 65, 7);
+        let buffer = render_notification_fixture(
+            Some("shared first\nshared second"),
+            Some("local notice"),
+            Some(notification_toast()),
+            area,
+        );
+
+        assert!(buffer_row_text(&buffer, area, 0).contains("shared first"));
+        assert!(buffer_row_text(&buffer, area, 1).contains("shared second"));
+        assert!(buffer_row_text(&buffer, area, 2).contains("local notice"));
+        assert!(buffer_row_text(&buffer, area, 4).contains("toast title"));
+        assert!(buffer_row_text(&buffer, area, 5).contains("toast context"));
     }
 
     #[tokio::test]
@@ -772,8 +1305,8 @@ mod tests {
 
         assert_eq!(app.view.layout, ViewLayout::Desktop);
         assert!(app.view.terminal_area.x > 0);
-        assert_eq!(app.view.toast_hit_area.x, 0);
-        assert_eq!(app.view.toast_hit_area.y, 0);
+        assert_eq!(app.view.toast_hit_area().x, 0);
+        assert_eq!(app.view.toast_hit_area().y, 0);
     }
 
     #[test]
@@ -795,8 +1328,8 @@ mod tests {
 
         compute_view(&mut app, Rect::new(0, 0, 100, 20));
 
-        assert_eq!(app.view.toast_hit_area.x, 0);
-        assert_eq!(app.view.toast_hit_area.y, 1);
+        assert_eq!(app.view.toast_hit_area().x, 0);
+        assert_eq!(app.view.toast_hit_area().y, 1);
     }
 
     #[test]

@@ -572,9 +572,9 @@ impl App {
                 terminal_area: Rect::default(),
                 mobile_header_rect: Rect::default(),
                 mobile_menu_hit_area: Rect::default(),
-                toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
+                notifications: state::AmbientNotificationLayout::default(),
             },
             drag: None,
             workspace_press: None,
@@ -1600,7 +1600,36 @@ impl App {
         events: Vec<crate::raw_input::RawInputEvent>,
         apply_host_terminal_theme: bool,
     ) -> Vec<HostAction> {
+        self.route_client_events_with_client_local_actions(events, apply_host_terminal_theme)
+            .0
+    }
+
+    pub(crate) fn route_client_events_with_client_local_actions(
+        &mut self,
+        events: Vec<crate::raw_input::RawInputEvent>,
+        apply_host_terminal_theme: bool,
+    ) -> (
+        Vec<HostAction>,
+        Vec<crate::remote_link_preference::RemoteLinkPreferenceAction>,
+    ) {
+        self.route_client_events_with_client_local_actions_and_render_context(
+            events,
+            apply_host_terminal_theme,
+            None,
+        )
+    }
+
+    pub(crate) fn route_client_events_with_client_local_actions_and_render_context(
+        &mut self,
+        events: Vec<crate::raw_input::RawInputEvent>,
+        apply_host_terminal_theme: bool,
+        render_context: Option<&crate::ui::ClientRenderContext>,
+    ) -> (
+        Vec<HostAction>,
+        Vec<crate::remote_link_preference::RemoteLinkPreferenceAction>,
+    ) {
         let mut host_actions = Vec::new();
+        let mut client_local_actions = Vec::new();
         for event in events {
             let previous_mode = self.state.mode;
             match event {
@@ -1613,7 +1642,9 @@ impl App {
                                 self.handle_terminal_key_headless(key);
                             } else {
                                 self.suppressed_repeat_keys.insert(key_id);
-                                self.handle_non_terminal_key_headless(key);
+                                if let Some(action) = self.handle_non_terminal_key_headless(key) {
+                                    client_local_actions.push(action);
+                                }
                             }
                         }
                         crossterm::event::KeyEventKind::Repeat => {
@@ -1632,8 +1663,16 @@ impl App {
                 }
                 crate::raw_input::RawInputEvent::Mouse(mouse) => {
                     if self.state.mouse_capture {
-                        if let Some(action) = self.handle_mouse_event_headless(mouse) {
+                        let (host_action, client_local_action) = self
+                            .handle_mouse_with_host_client_local_actions_and_render_context(
+                                mouse,
+                                render_context,
+                            );
+                        if let Some(action) = host_action {
                             host_actions.push(action);
+                        }
+                        if let Some(action) = client_local_action {
+                            client_local_actions.push(action);
                         }
                     } else {
                         self.state
@@ -1685,22 +1724,26 @@ impl App {
             }
             self.sync_prefix_input_source(previous_mode);
         }
-        host_actions
+        (host_actions, client_local_actions)
     }
 
     /// Handles a key event in non-terminal mode for the headless server.
     ///
     /// Uses the standalone handler functions that work on `&mut AppState`
     /// since the server doesn't have the async context of the monolithic App.
-    fn handle_non_terminal_key_headless(&mut self, key: crate::input::TerminalKey) {
+    fn handle_non_terminal_key_headless(
+        &mut self,
+        key: crate::input::TerminalKey,
+    ) -> Option<crate::remote_link_preference::RemoteLinkPreferenceAction> {
         let key_event = key.as_key_event();
+        let mut client_local_action = None;
         if input::modal_paste_target_active(&self.state)
             && input::is_modal_paste_shortcut(&key_event)
         {
             if let Some(text) = crate::platform::read_clipboard_text() {
                 self.paste_into_active_text_input(&text);
             }
-            return;
+            return None;
         }
 
         match self.state.mode {
@@ -1750,7 +1793,7 @@ impl App {
                 self.handle_product_announcement_key(key_event);
             }
             Mode::Settings => {
-                self.handle_settings_key(key_event);
+                client_local_action = self.handle_settings_key(key_event);
             }
             Mode::Navigator => {
                 input::handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event);
@@ -1759,18 +1802,7 @@ impl App {
                 // Should not be called in terminal mode.
             }
         }
-    }
-
-    /// Handles a mouse event for the headless server.
-    ///
-    /// Delegates to the same mouse handling logic used in the monolithic
-    /// mode (hit-testing against the rendered UI), which works because
-    /// the server's AppState maintains view geometry from virtual rendering.
-    fn handle_mouse_event_headless(
-        &mut self,
-        mouse: crossterm::event::MouseEvent,
-    ) -> Option<HostAction> {
-        self.handle_mouse(mouse)
+        client_local_action
     }
 }
 

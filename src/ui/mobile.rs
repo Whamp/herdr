@@ -215,26 +215,22 @@ pub(crate) fn render_mobile_header(
     render_switch_button(app, frame, switch);
 }
 
-pub(crate) fn mobile_toast_banner_rect(area: Rect, offset_for_warning: bool) -> Rect {
-    if area.width == 0 || area.height == 0 {
+pub(crate) fn mobile_toast_banner_rect(area: Rect, offset_rows: u16) -> Rect {
+    if area.width == 0 || area.height <= offset_rows {
         return Rect::default();
     }
 
-    let y = area.y
-        + area
-            .height
-            .saturating_sub(1 + if offset_for_warning { 1 } else { 0 });
+    let y = area.y + area.height.saturating_sub(1 + offset_rows);
     Rect::new(area.x, y, area.width, 1)
 }
 
 pub(crate) fn render_mobile_toast_banner(
     frame: &mut Frame,
-    area: Rect,
     toast: &ToastNotification,
-    offset_for_warning: bool,
+    banner: Rect,
     p: &Palette,
 ) {
-    if area.width == 0 || area.height == 0 {
+    if banner.is_empty() {
         return;
     }
 
@@ -243,7 +239,6 @@ pub(crate) fn render_mobile_toast_banner(
         ToastKind::Finished => p.blue,
         ToastKind::UpdateInstalled => p.accent,
     };
-    let banner = mobile_toast_banner_rect(area, offset_for_warning);
     let bg = p.surface0;
 
     frame.render_widget(Clear, banner);

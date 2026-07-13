@@ -68,6 +68,13 @@ pub enum ExternalOpenPolicy {
     Enabled,
 }
 
+/// Closed stage at which a device-local policy mutation failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExternalOpenPolicyMutationFailureStage {
+    Write,
+    Reload,
+}
+
 /// Coarse forwarding metadata that never discloses either port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExternalOpenPortStatus {
@@ -468,6 +475,20 @@ pub enum ClientMessage {
         request_id: u64,
         result: ExternalOpenResult,
     },
+
+    /// Report the exact outcome of a source-bound device-local policy mutation.
+    ExternalOpenPolicyMutationResult {
+        request_id: u64,
+        requested_policy: ExternalOpenPolicy,
+        persisted_policy: Option<ExternalOpenPolicy>,
+        effective_policy: ExternalOpenPolicy,
+        failure_stage: Option<ExternalOpenPolicyMutationFailureStage>,
+    },
+
+    /// Report that an explicit local client-config reload could not refresh this policy.
+    ExternalOpenPolicyReloadFailed {
+        effective_policy: ExternalOpenPolicy,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -746,6 +767,12 @@ pub enum ServerMessage {
 
     /// Cancel an uncommitted request best-effort.
     ExternalOpenCancel { request_id: u64 },
+
+    /// Ask the source full app connection to persist and reload its local policy.
+    ExternalOpenPolicyMutationRequest {
+        request_id: u64,
+        requested_policy: ExternalOpenPolicy,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1230,6 +1257,72 @@ mod tests {
             assert_eq!(consumed, encoded.len());
             assert_eq!(decoded, message);
         }
+    }
+
+    #[test]
+    fn external_open_policy_mutation_messages_roundtrip_with_stable_order() {
+        fn roundtrip_client(message: ClientMessage, expected_tag: u8) {
+            let encoded =
+                bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
+            assert_eq!(encoded.first().copied(), Some(expected_tag));
+            let (decoded, consumed): (ClientMessage, usize) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(decoded, message);
+        }
+
+        fn roundtrip_server(message: ServerMessage, expected_tag: u8) {
+            let encoded =
+                bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
+            assert_eq!(encoded.first().copied(), Some(expected_tag));
+            let (decoded, consumed): (ServerMessage, usize) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(decoded, message);
+        }
+
+        roundtrip_server(
+            ServerMessage::ExternalOpenPolicyMutationRequest {
+                request_id: 7,
+                requested_policy: ExternalOpenPolicy::Enabled,
+            },
+            14,
+        );
+        roundtrip_client(
+            ClientMessage::ExternalOpenPolicyReloadFailed {
+                effective_policy: ExternalOpenPolicy::Disabled,
+            },
+            15,
+        );
+        for (failure_stage, persisted_policy) in [
+            (None, Some(ExternalOpenPolicy::Enabled)),
+            (Some(ExternalOpenPolicyMutationFailureStage::Write), None),
+            (
+                Some(ExternalOpenPolicyMutationFailureStage::Reload),
+                Some(ExternalOpenPolicy::Enabled),
+            ),
+        ] {
+            roundtrip_client(
+                ClientMessage::ExternalOpenPolicyMutationResult {
+                    request_id: 7,
+                    requested_policy: ExternalOpenPolicy::Enabled,
+                    persisted_policy,
+                    effective_policy: ExternalOpenPolicy::Disabled,
+                    failure_stage,
+                },
+                14,
+            );
+        }
+
+        fn tag<T: Serialize>(value: &T) -> u8 {
+            *bincode::serde::encode_to_vec(value, bincode::config::standard())
+                .unwrap()
+                .first()
+                .expect("encoded enum should include tag")
+        }
+        assert_eq!(tag(&ExternalOpenPolicyMutationFailureStage::Write), 0);
+        assert_eq!(tag(&ExternalOpenPolicyMutationFailureStage::Reload), 1);
+        assert_eq!(PROTOCOL_VERSION, 17);
     }
 
     #[test]

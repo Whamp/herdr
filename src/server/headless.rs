@@ -201,6 +201,7 @@ pub struct HeadlessServer {
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
+    client_projections: crate::server::client_projection::ClientProjections,
     external_open_requests: crate::server::external_open::ExternalOpenRequests,
     external_open_clock: crate::server::monotonic_clock::MonotonicClock,
     #[cfg(unix)]
@@ -400,6 +401,7 @@ impl HeadlessServer {
             client_socket_path: client_path,
             client_socket_identity,
             clients: HashMap::new(),
+            client_projections: crate::server::client_projection::ClientProjections::default(),
             external_open_requests: crate::server::external_open::ExternalOpenRequests::default(),
             external_open_clock: crate::server::monotonic_clock::MonotonicClock::default(),
             #[cfg(unix)]
@@ -563,6 +565,7 @@ impl HeadlessServer {
                     self.has_app_client(),
                 ),
                 self.external_open_requests.next_deadline(),
+                self.next_client_notice_deadline(),
             ]
             .into_iter()
             .flatten()
@@ -1262,6 +1265,7 @@ impl HeadlessServer {
             );
         }
         self.send_client_graphics_cleanup(client_id);
+        self.client_projections.disconnect(client_id);
         let removed = self.clients.remove(&client_id);
         if let Some(removed) = removed {
             crate::server::clipboard_image::remove_files(removed.staged_clipboard_files);
@@ -2400,6 +2404,7 @@ impl HeadlessServer {
             terminal_id: terminal_id.clone(),
         };
         client.pending_terminal_attach = false;
+        self.client_projections.disconnect(client_id);
         client.render_state.reset_baseline();
         client.last_activity = stamp;
         let was_foreground = self.foreground_client_id == Some(client_id);
@@ -2434,6 +2439,27 @@ impl HeadlessServer {
         client_id: u64,
         events: Vec<crate::raw_input::RawInputEvent>,
     ) -> bool {
+        let dismiss_notice = matches!(
+            events.as_slice(),
+            [crate::raw_input::RawInputEvent::Key(key)]
+                if key.code == crossterm::event::KeyCode::Esc
+                    && key.kind == crossterm::event::KeyEventKind::Press
+        );
+        if dismiss_notice
+            && self
+                .client_projections
+                .apply(
+                    client_id,
+                    crate::server::client_projection::ClientProjectionAction::DismissNotice,
+                )
+                .changed()
+        {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.request_semantic_redraw_after_input();
+            }
+            return true;
+        }
+
         let host_surface_redraw = crate::raw_input::events_require_host_surface_redraw(
             &events,
             self.app.state.redraw_on_focus_gained,
@@ -2461,9 +2487,40 @@ impl HeadlessServer {
             self.resize_shared_runtime_to_effective_size_before_input();
         }
         let theme_changed = self.update_client_host_theme_from_events(client_id, &events);
-        let host_actions = self
+        if let Some(((cols, rows), cell_size)) = self
+            .clients
+            .get(&client_id)
+            .filter(|client| client.is_full_app_client())
+            .map(|client| (client.terminal_size, client.cell_size))
+        {
+            let area = Rect::new(0, 0, cols, rows);
+            if self.foreground_client_id == Some(client_id) {
+                crate::ui::compute_view_with_cell_size(
+                    &mut self.app.state,
+                    &self.app.terminal_runtimes,
+                    area,
+                    cell_size,
+                );
+            } else {
+                crate::ui::compute_view_without_resizing_panes(
+                    &mut self.app.state,
+                    &self.app.terminal_runtimes,
+                    area,
+                );
+            }
+        }
+        let render_context = self
+            .client_projections
+            .displayed_render_context(client_id)
+            .cloned();
+        let (host_actions, client_local_actions) = self
             .app
-            .route_client_events(events, self.foreground_client_id == Some(client_id));
+            .route_client_events_with_client_local_actions_and_render_context(
+                events,
+                self.foreground_client_id == Some(client_id),
+                render_context.as_ref(),
+            );
+        self.handle_client_local_actions(client_id, client_local_actions);
         let accepted_at = self.external_open_clock.now();
         self.handle_host_actions(client_id, host_actions, accepted_at);
         if self.app.take_config_reloaded_from_disk() {
@@ -2494,6 +2551,31 @@ impl HeadlessServer {
         }
     }
 
+    fn handle_client_local_actions(
+        &mut self,
+        client_id: u64,
+        actions: Vec<crate::remote_link_preference::RemoteLinkPreferenceAction>,
+    ) {
+        for action in actions {
+            let started = match action {
+                crate::remote_link_preference::RemoteLinkPreferenceAction::Toggle => self
+                    .clients
+                    .get(&client_id)
+                    .is_some_and(ClientConnection::is_full_app_client)
+                    && self
+                        .client_projections
+                        .apply(
+                            client_id,
+                            crate::server::client_projection::ClientProjectionAction::TogglePolicy,
+                        )
+                        .changed(),
+            };
+            if !started {
+                debug!(client_id, "duplicate client-local policy toggle suppressed");
+            }
+        }
+    }
+
     fn handle_host_actions(
         &mut self,
         client_id: u64,
@@ -2503,12 +2585,11 @@ impl HeadlessServer {
         for action in actions {
             match action {
                 crate::app::HostAction::OpenExternalUrl { url } => {
-                    let policy = self.clients.get(&client_id).and_then(|client| {
-                        client
-                            .is_full_app_client()
-                            .then_some(client.external_open_policy)
-                            .flatten()
-                    });
+                    let policy = self
+                        .clients
+                        .get(&client_id)
+                        .filter(|client| client.is_full_app_client())
+                        .and_then(|_| self.client_projections.confirmed_policy(client_id));
                     match policy {
                         Some(crate::protocol::ExternalOpenPolicy::Disabled) => {
                             if crate::platform::open_url(&url).is_err() {
@@ -2560,41 +2641,68 @@ impl HeadlessServer {
     fn report_external_open_transition(
         &mut self,
         transition: crate::server::external_open::ExternalOpenTransition,
-    ) {
-        if let crate::server::external_open::ExternalOpenTransition::Closed(closed) = transition {
-            let now = self.external_open_clock.now();
-            info!(
-                request_id = closed.request_id,
-                lifecycle_phase = "terminal",
-                outcome = closed.outcome.canonical_outcome(),
-                elapsed_ms = closed.elapsed_ms(now),
-                commit_state = closed.commit_state(),
-                forward_status = closed.forward_status(),
-                "external-open request settled"
-            );
-        }
+    ) -> bool {
+        let crate::server::external_open::ExternalOpenTransition::Closed(closed) = transition
+        else {
+            return false;
+        };
+        let now = self.external_open_clock.now();
+        info!(
+            request_id = closed.request_id,
+            lifecycle_phase = "terminal",
+            outcome = closed.outcome.canonical_outcome(),
+            elapsed_ms = closed.elapsed_ms(now),
+            commit_state = closed.commit_state(),
+            forward_status = closed.forward_status(),
+            "external-open request settled"
+        );
+
+        let Some(message) = closed.outcome.notice_message() else {
+            return false;
+        };
+        self.clients
+            .get(&closed.client_id)
+            .filter(|client| client.is_full_app_client())
+            .is_some()
+            && self
+                .client_projections
+                .apply(
+                    closed.client_id,
+                    crate::server::client_projection::ClientProjectionAction::ShowNotice {
+                        message,
+                        now,
+                    },
+                )
+                .changed()
     }
 
     fn update_external_open_policy(
         &mut self,
         client_id: u64,
         policy: crate::protocol::ExternalOpenPolicy,
-    ) {
-        let Some(client) = self.clients.get_mut(&client_id) else {
-            return;
-        };
-        if !client.is_full_app_client() {
+    ) -> bool {
+        if !self
+            .clients
+            .get(&client_id)
+            .is_some_and(ClientConnection::is_full_app_client)
+        {
             debug!("ignored external-open policy from non-app client");
-            return;
+            return false;
         }
-        client.external_open_policy = Some(policy);
+        let changed = self
+            .client_projections
+            .apply(
+                client_id,
+                crate::server::client_projection::ClientProjectionAction::ConfirmPolicy(policy),
+            )
+            .changed();
         info!(
             lifecycle_phase = "policy_change",
             outcome = "applied",
             "external-open policy updated"
         );
         if policy != crate::protocol::ExternalOpenPolicy::Disabled {
-            return;
+            return changed;
         }
 
         let closed = self
@@ -2611,6 +2719,7 @@ impl HeadlessServer {
                 crate::server::external_open::ExternalOpenTransition::Closed(closed),
             );
         }
+        changed
     }
 
     fn handle_external_open_ready(
@@ -2619,7 +2728,7 @@ impl HeadlessServer {
         request_id: u64,
         target: crate::protocol::ExternalOpenTarget,
         now: Instant,
-    ) {
+    ) -> bool {
         let commit = Self::frame_server_message(&ServerMessage::ExternalOpenCommit { request_id });
         let writer = self.clients.get(&client_id).and_then(|client| {
             client
@@ -2656,10 +2765,11 @@ impl HeadlessServer {
         if timed_out_before_commit {
             self.send_to_client(client_id, ServerMessage::ExternalOpenCancel { request_id });
         }
-        self.report_external_open_transition(transition);
+        let changed = self.report_external_open_transition(transition);
         if delivery_failed {
             self.remove_client_and_resize_if_needed(client_id);
         }
+        changed && !delivery_failed
     }
 
     fn handle_server_event(&mut self, ev: ServerEvent) -> bool {
@@ -2719,11 +2829,13 @@ impl HeadlessServer {
                         last_activity,
                         render_encoding,
                         direct_attach_requested,
-                        external_open_policy,
                         Some(writer),
                     ),
                 );
                 if !direct_attach_requested {
+                    if let Some(policy) = external_open_policy {
+                        self.client_projections.connect(client_id, policy);
+                    }
                     self.foreground_client_id = Some(client_id);
                 }
                 if first_app_client {
@@ -2825,8 +2937,61 @@ impl HeadlessServer {
                 self.handle_client_input_events(client_id, events)
             }
             ServerEvent::ExternalOpenPolicyUpdate { client_id, policy } => {
-                self.update_external_open_policy(client_id, policy);
-                false
+                self.update_external_open_policy(client_id, policy)
+            }
+            ServerEvent::ExternalOpenPolicyMutationResult {
+                client_id,
+                request_id,
+                requested_policy,
+                persisted_policy,
+                effective_policy,
+                failure_stage,
+            } => {
+                let now = self.external_open_clock.now();
+                if !self
+                    .clients
+                    .get(&client_id)
+                    .is_some_and(ClientConnection::is_full_app_client)
+                {
+                    return false;
+                }
+                let effect = self.client_projections.apply(
+                    client_id,
+                    crate::server::client_projection::ClientProjectionAction::SettlePolicy {
+                        result: crate::server::client_projection::PolicyMutationResult {
+                            request_id,
+                            requested_policy,
+                            persisted_policy,
+                            effective_policy,
+                            failure_stage,
+                        },
+                        now,
+                    },
+                );
+                if let Some(policy) = effect.confirmed_policy() {
+                    self.update_external_open_policy(client_id, policy);
+                }
+                effect.changed()
+            }
+            ServerEvent::ExternalOpenPolicyReloadFailed {
+                client_id,
+                effective_policy,
+            } => {
+                let now = self.external_open_clock.now();
+                self.clients
+                    .get(&client_id)
+                    .filter(|client| client.is_full_app_client())
+                    .is_some()
+                    && self
+                        .client_projections
+                        .apply(
+                            client_id,
+                            crate::server::client_projection::ClientProjectionAction::ReportReloadFailure {
+                                effective_policy,
+                                now,
+                            },
+                        )
+                        .changed()
             }
             ServerEvent::ExternalOpenReady {
                 client_id,
@@ -2834,8 +2999,7 @@ impl HeadlessServer {
                 target,
             } => {
                 let now = self.external_open_clock.now();
-                self.handle_external_open_ready(client_id, request_id, target, now);
-                false
+                self.handle_external_open_ready(client_id, request_id, target, now)
             }
             ServerEvent::ExternalOpenPreparationFailed {
                 client_id,
@@ -2846,8 +3010,7 @@ impl HeadlessServer {
                 let transition = self
                     .external_open_requests
                     .preparation_failed(client_id, request_id, reason, now);
-                self.report_external_open_transition(transition);
-                false
+                self.report_external_open_transition(transition)
             }
             ServerEvent::ExternalOpenResult {
                 client_id,
@@ -2858,8 +3021,7 @@ impl HeadlessServer {
                 let transition = self
                     .external_open_requests
                     .result(client_id, request_id, result, now);
-                self.report_external_open_transition(transition);
-                false
+                self.report_external_open_transition(transition)
             }
             ServerEvent::ClientClipboardImage {
                 client_id,
@@ -2969,6 +3131,30 @@ impl HeadlessServer {
                 } else {
                     false
                 }
+            }
+            ServerEvent::ClientFrameWritten {
+                client_id,
+                acknowledgement,
+            } => {
+                let request = self
+                    .client_projections
+                    .apply(
+                        client_id,
+                        crate::server::client_projection::ClientProjectionAction::FrameWritten {
+                            acknowledgement,
+                        },
+                    )
+                    .mutation_request();
+                if let Some(request) = request {
+                    self.send_to_client(
+                        client_id,
+                        ServerMessage::ExternalOpenPolicyMutationRequest {
+                            request_id: request.request_id,
+                            requested_policy: request.requested_policy,
+                        },
+                    );
+                }
+                false
             }
             ServerEvent::ClientWriterFailed { client_id } => {
                 info!(client_id, "client writer failed");
@@ -3386,6 +3572,9 @@ impl HeadlessServer {
         let Some(client) = self.clients.get(client_id) else {
             retained_fallback!("client_missing");
         };
+        if !self.client_projections.retained_render_eligible(*client_id) {
+            retained_fallback!("client_notice_visible");
+        }
         if client.render_pending {
             retained_fallback!("render_pending");
         }
@@ -3492,6 +3681,11 @@ impl HeadlessServer {
         frame: FrameData,
         broken_clients: &mut Vec<u64>,
     ) -> bool {
+        let render_context = self
+            .client_projections
+            .displayed_render_context(client_id)
+            .cloned()
+            .unwrap_or_default();
         let Some(client) = self.clients.get_mut(&client_id) else {
             crate::render_prof::event("retained_send_fallback.client_missing");
             return false;
@@ -3501,7 +3695,7 @@ impl HeadlessServer {
             return false;
         };
         let prepare_started = crate::render_prof::timer();
-        let Some(prepared) = client.render_state.prepare_frame(frame) else {
+        let Some(prepared) = client.render_state.prepare_frame(frame, render_context) else {
             client.render_pending = false;
             crate::render_prof::event("retained_send.skip_identical");
             crate::render_prof::duration_since("retained_send.prepare_frame", prepare_started);
@@ -3533,11 +3727,28 @@ impl HeadlessServer {
         };
         crate::render_prof::counter("retained_send.bytes", serialized.len() as u64);
 
+        let acknowledgement = self
+            .client_projections
+            .prepare_frame_acknowledgement(client_id, prepared.render_context().clone());
         let send_started = crate::render_prof::timer();
-        match writer.render.try_send(serialized) {
+        let send_result = match acknowledgement.as_ref() {
+            Some(acknowledgement) => writer
+                .render
+                .try_send_with_write_notification(serialized, acknowledgement.clone()),
+            None => writer.render.try_send(serialized),
+        };
+        match send_result {
             Ok(()) => {
                 client.render_pending = false;
                 client.render_state.commit_sent_frame(prepared);
+                if let Some(acknowledgement) = acknowledgement {
+                    self.client_projections.apply(
+                        client_id,
+                        crate::server::client_projection::ClientProjectionAction::FrameQueued {
+                            acknowledgement,
+                        },
+                    );
+                }
                 crate::render_prof::event("retained_send.sent");
                 crate::render_prof::duration_since("retained_send.try_send", send_started);
                 true
@@ -3593,27 +3804,29 @@ impl HeadlessServer {
         for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
             let area = Rect::new(0, 0, cols, rows);
             let is_app_client = matches!(mode, ClientConnectionMode::App);
-            let mut frame = match mode {
+            let client_projection = self.client_projections.render(client_id);
+            let projection_view = client_projection.map(|projection| projection.view());
+            let remote_link_preference =
+                projection_view.map(|projection| projection.remote_link_preference());
+            let client_notice = projection_view.and_then(|projection| projection.notice());
+            let (mut frame, render_context) = match mode {
                 ClientConnectionMode::App => {
                     let render_started = crate::render_prof::timer();
-                    let (buffer, cursor) =
+                    let effective_cell_size =
                         if self.app.state.kitty_graphics_enabled && cell_size.is_known() {
-                            crate::server::render_stream::render_virtual_with_runtime_registry(
-                                &mut self.app.state,
-                                &self.app.terminal_runtimes,
-                                area,
-                                is_foreground,
-                                cell_size,
-                            )
+                            cell_size
                         } else {
-                            crate::server::render_stream::render_virtual_with_runtime_registry(
-                                &mut self.app.state,
-                                &self.app.terminal_runtimes,
-                                area,
-                                is_foreground,
-                                crate::kitty_graphics::HostCellSize::default(),
-                            )
+                            crate::kitty_graphics::HostCellSize::default()
                         };
+                    let (buffer, cursor, render_context) = crate::server::render_stream::render_virtual_with_runtime_registry_and_client_local_preference(
+                        &mut self.app.state,
+                        &self.app.terminal_runtimes,
+                        remote_link_preference,
+                        client_notice,
+                        area,
+                        is_foreground,
+                        effective_cell_size,
+                    );
                     crate::render_prof::duration_since(
                         "full_render.render_virtual",
                         render_started,
@@ -3634,7 +3847,7 @@ impl HeadlessServer {
                         &hyperlinks,
                     );
                     crate::render_prof::duration_since("full_render.frame_build", frame_started);
-                    frame
+                    (frame, render_context)
                 }
                 ClientConnectionMode::TerminalAttach { terminal_id }
                 | ClientConnectionMode::TerminalObserve { terminal_id } => {
@@ -3670,7 +3883,7 @@ impl HeadlessServer {
                         &hyperlinks,
                     );
                     crate::render_prof::duration_since("full_render.frame_build", frame_started);
-                    frame
+                    (frame, crate::ui::ClientRenderContext::default())
                 }
             };
 
@@ -3721,7 +3934,8 @@ impl HeadlessServer {
             };
             let has_graphics = !frame.graphics.is_empty();
             let prepare_started = crate::render_prof::timer();
-            let Some(mut prepared) = client.render_state.prepare_frame(frame) else {
+            let Some(mut prepared) = client.render_state.prepare_frame(frame, render_context)
+            else {
                 client.render_pending = false;
                 crate::render_prof::event("full_render.skip_identical");
                 crate::render_prof::duration_since("full_render.prepare_frame", prepare_started);
@@ -3743,7 +3957,9 @@ impl HeadlessServer {
                         client_id,
                         claimed, max, "dropping graphics from oversized frame for client"
                     );
-                    let Some(mut text_only_frame) = prepared.into_frame() else {
+                    let Some((mut text_only_frame, text_only_render_context)) =
+                        prepared.into_frame_and_render_context()
+                    else {
                         crate::render_prof::event("full_render.serialize_error");
                         crate::render_prof::duration_since(
                             "full_render.serialize",
@@ -3752,8 +3968,9 @@ impl HeadlessServer {
                         continue;
                     };
                     text_only_frame.graphics.clear();
-                    let Some(text_only_prepared) =
-                        client.render_state.prepare_frame(text_only_frame)
+                    let Some(text_only_prepared) = client
+                        .render_state
+                        .prepare_frame(text_only_frame, text_only_render_context)
                     else {
                         client.render_pending = false;
                         crate::render_prof::event("full_render.skip_identical_text_only");
@@ -3800,8 +4017,20 @@ impl HeadlessServer {
             };
             crate::render_prof::counter("full_render.bytes", serialized.len() as u64);
 
+            let acknowledgement = is_app_client
+                .then(|| {
+                    self.client_projections
+                        .prepare_frame_acknowledgement(client_id, prepared.render_context().clone())
+                })
+                .flatten();
             let send_started = crate::render_prof::timer();
-            match writer.render.try_send(serialized) {
+            let send_result = match acknowledgement.as_ref() {
+                Some(acknowledgement) => writer
+                    .render
+                    .try_send_with_write_notification(serialized, acknowledgement.clone()),
+                None => writer.render.try_send(serialized),
+            };
+            match send_result {
                 Ok(()) => {
                     client.render_pending = false;
                     if commit_graphics_cache {
@@ -3809,6 +4038,14 @@ impl HeadlessServer {
                         client.graphics_surface_reset_pending = false;
                     }
                     client.render_state.commit_sent_frame(prepared);
+                    if let Some(acknowledgement) = acknowledgement {
+                        self.client_projections.apply(
+                            client_id,
+                            crate::server::client_projection::ClientProjectionAction::FrameQueued {
+                                acknowledgement,
+                            },
+                        );
+                    }
                     crate::render_prof::event("full_render.sent");
                     crate::render_prof::duration_since("full_render.try_send", send_started);
                 }
@@ -3835,13 +4072,26 @@ impl HeadlessServer {
                 self.remove_client_and_resize_if_needed(client_id);
             }
         }
-
         let (cols, rows) = self.effective_size;
         if !deferred_frame {
             self.app.full_redraw_pending = false;
         }
         crate::render_prof::duration_since("full_render.total", full_started);
         debug!(cols, rows, foreground_client_id = ?self.foreground_client_id, "rendered virtual frame(s)");
+    }
+
+    fn next_client_notice_deadline(&self) -> Option<Instant> {
+        self.client_projections.next_deadline()
+    }
+
+    fn expire_client_notices(&mut self, now: Instant) -> bool {
+        let expired = self.client_projections.expire_due(now);
+        for client_id in &expired {
+            if let Some(client) = self.clients.get_mut(client_id) {
+                client.request_full_redraw();
+            }
+        }
+        !expired.is_empty()
     }
 
     /// Handle scheduled tasks for the headless server.
@@ -3864,10 +4114,11 @@ impl HeadlessServer {
                     },
                 );
             }
-            self.report_external_open_transition(
+            changed |= self.report_external_open_transition(
                 crate::server::external_open::ExternalOpenTransition::Closed(closed),
             );
         }
+        changed |= self.expire_client_notices(external_open_now);
 
         self.app.sync_headless_animation_timer(now);
 
@@ -4460,6 +4711,7 @@ mod tests {
             client_socket_path: socket_path,
             client_socket_identity,
             clients: HashMap::new(),
+            client_projections: crate::server::client_projection::ClientProjections::default(),
             external_open_requests: crate::server::external_open::ExternalOpenRequests::default(),
             external_open_clock: crate::server::monotonic_clock::MonotonicClock::default(),
             #[cfg(unix)]
@@ -4482,6 +4734,94 @@ mod tests {
             server_event_rx,
             server_event_tx,
         }
+    }
+
+    fn connect_client_projection(
+        server: &mut HeadlessServer,
+        client_id: u64,
+        policy: crate::protocol::ExternalOpenPolicy,
+    ) {
+        assert!(server.client_projections.connect(client_id, policy));
+    }
+
+    fn client_projection_notice(server: &HeadlessServer, client_id: u64) -> Option<&'static str> {
+        server
+            .client_projections
+            .render(client_id)
+            .and_then(|projection| projection.view().notice())
+    }
+
+    fn begin_presented_policy_mutation(
+        server: &mut HeadlessServer,
+        client_id: u64,
+    ) -> crate::server::client_projection::PolicyMutationRequest {
+        assert!(server
+            .client_projections
+            .apply(
+                client_id,
+                crate::server::client_projection::ClientProjectionAction::TogglePolicy,
+            )
+            .changed());
+        let request = server
+            .client_projections
+            .render(client_id)
+            .and_then(|projection| projection.write_acknowledgement())
+            .expect("policy mutation acknowledgement");
+        let acknowledgement = server
+            .client_projections
+            .prepare_frame_acknowledgement(client_id, Default::default())
+            .expect("frame acknowledgement");
+        assert!(server
+            .client_projections
+            .apply(
+                client_id,
+                crate::server::client_projection::ClientProjectionAction::FrameQueued {
+                    acknowledgement: acknowledgement.clone(),
+                },
+            )
+            .changed());
+        assert_eq!(
+            server
+                .client_projections
+                .apply(
+                    client_id,
+                    crate::server::client_projection::ClientProjectionAction::FrameWritten {
+                        acknowledgement,
+                    },
+                )
+                .mutation_request(),
+            Some(request)
+        );
+        request
+    }
+
+    fn acknowledge_next_client_frame(server: &mut HeadlessServer, client_id: u64) -> bool {
+        let acknowledgement = server
+            .client_projections
+            .first_queued_frame_acknowledgement(client_id)
+            .expect("queued frame acknowledgement");
+        server.handle_server_event(ServerEvent::ClientFrameWritten {
+            client_id,
+            acknowledgement,
+        })
+    }
+
+    fn show_client_notice(
+        server: &mut HeadlessServer,
+        client_id: u64,
+        message: &'static str,
+        now: Instant,
+    ) {
+        assert!(server
+            .client_projections
+            .apply(
+                client_id,
+                crate::server::client_projection::ClientProjectionAction::ShowNotice {
+                    message,
+                    now,
+                },
+            )
+            .changed());
     }
 
     fn shutdown_test_runtimes(server: &mut HeadlessServer) {
@@ -4709,6 +5049,97 @@ mod tests {
         shutdown_test_runtimes(&mut server);
     }
 
+    #[cfg(unix)]
+    fn connect_socket_app_client(
+        server: &mut HeadlessServer,
+        policy: crate::protocol::ExternalOpenPolicy,
+    ) -> (u64, crate::ipc::LocalStream) {
+        let client_id = server.next_client_id;
+        let mut stream = crate::ipc::connect_local_stream(&server.client_socket_path)
+            .expect("connect test app client");
+        crate::protocol::write_message(
+            &mut stream,
+            &crate::protocol::ClientMessage::Hello {
+                version: crate::protocol::PROTOCOL_VERSION,
+                cols: 80,
+                rows: 24,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                requested_encoding: RenderEncoding::SemanticFrame,
+                keybindings: crate::protocol::ClientKeybindings::Server,
+                launch_mode: crate::protocol::ClientLaunchMode::App,
+                external_open_policy: Some(policy),
+            },
+        )
+        .expect("write test app hello");
+        server
+            .accept_client_connections()
+            .expect("accept test app client");
+        assert!(matches!(
+            crate::protocol::read_message::<_, ServerMessage>(&mut stream, MAX_FRAME_SIZE)
+                .expect("read test app welcome"),
+            ServerMessage::Welcome { error: None, .. }
+        ));
+        let connected = server
+            .server_event_rx
+            .blocking_recv()
+            .expect("client connected event");
+        assert!(matches!(
+            &connected,
+            ServerEvent::ClientConnected {
+                client_id: connected_id,
+                ..
+            } if *connected_id == client_id
+        ));
+        assert!(server.handle_server_event(connected));
+        (client_id, stream)
+    }
+
+    #[cfg(unix)]
+    fn wait_for_client_frame_writes(server: &mut HeadlessServer, client_ids: &[u64]) {
+        let mut pending: std::collections::BTreeSet<u64> = client_ids.iter().copied().collect();
+        while !pending.is_empty() {
+            let event = server
+                .server_event_rx
+                .blocking_recv()
+                .expect("client frame write event");
+            if let ServerEvent::ClientFrameWritten { client_id, .. } = &event {
+                pending.remove(client_id);
+            }
+            server.handle_server_event(event);
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_client_writer_reaches_barrier_without_prior_message(
+        server: &HeadlessServer,
+        client_id: u64,
+        stream: &mut crate::ipc::LocalStream,
+    ) {
+        use interprocess::local_socket::traits::Stream as _;
+
+        let barrier = HeadlessServer::frame_server_message(&ServerMessage::ReloadClientConfig)
+            .expect("serialize writer barrier");
+        server.clients[&client_id]
+            .writer
+            .as_ref()
+            .expect("client writer")
+            .send_barrier_for_test(barrier)
+            .expect("writer queues must be empty before the barrier");
+        stream
+            .set_recv_timeout(Some(Duration::from_secs(1)))
+            .expect("set writer barrier timeout");
+        assert_eq!(
+            crate::protocol::read_message::<_, ServerMessage>(stream, MAX_FRAME_SIZE)
+                .expect("writer barrier"),
+            ServerMessage::ReloadClientConfig,
+            "client received a frame or event before the writer barrier"
+        );
+        stream
+            .set_recv_timeout(None)
+            .expect("clear writer barrier timeout");
+    }
+
     fn test_client_writer() -> (
         ClientWriter,
         std::sync::mpsc::Receiver<Vec<u8>>,
@@ -4721,6 +5152,796 @@ mod tests {
             control_rx,
             render_rx,
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_app_sockets_render_source_local_disagreement_and_saving_after_focus_change() {
+        let mut server = test_headless_server();
+        let (source_id, mut source) =
+            connect_socket_app_client(&mut server, crate::protocol::ExternalOpenPolicy::Disabled);
+        let (other_id, mut other) =
+            connect_socket_app_client(&mut server, crate::protocol::ExternalOpenPolicy::Enabled);
+        server.app.state.mode = crate::app::Mode::Settings;
+        server.app.state.settings.section = crate::app::state::SettingsSection::Experiments;
+        server.app.state.settings.list.selected = 2;
+
+        crate::protocol::write_message(
+            &mut source,
+            &crate::protocol::ClientMessage::InputEvents {
+                events: vec![crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char(' '),
+                    modifiers: 0,
+                    kind: crate::protocol::ClientKeyKind::Press,
+                }],
+            },
+        )
+        .expect("write source toggle");
+        let input = server
+            .server_event_rx
+            .blocking_recv()
+            .expect("source input event");
+        assert!(matches!(
+            &input,
+            ServerEvent::ClientInputEvents { client_id, .. } if *client_id == source_id
+        ));
+        assert!(server.handle_server_event(input));
+        server.promote_client_to_foreground(other_id);
+        server.render_and_stream();
+
+        let source_frame =
+            match crate::protocol::read_message::<_, ServerMessage>(&mut source, MAX_FRAME_SIZE)
+                .expect("source saving frame")
+            {
+                ServerMessage::Frame(frame) => frame,
+                message => panic!("expected source frame, got {message:?}"),
+            };
+        let other_frame =
+            match crate::protocol::read_message::<_, ServerMessage>(&mut other, MAX_FRAME_SIZE)
+                .expect("other confirmed frame")
+            {
+                ServerMessage::Frame(frame) => frame,
+                message => panic!("expected other frame, got {message:?}"),
+            };
+        assert!(frame_text(&source_frame).contains("open remote links on this device [ ] saving…"));
+        assert!(frame_text(&other_frame).contains("open remote links on this device [✓]"));
+
+        let mut source_frame_written = false;
+        while !source_frame_written {
+            let event = server
+                .server_event_rx
+                .blocking_recv()
+                .expect("writer lifecycle event");
+            source_frame_written = matches!(
+                &event,
+                ServerEvent::ClientFrameWritten { client_id, .. } if *client_id == source_id
+            );
+            server.handle_server_event(event);
+        }
+        let request_id =
+            match crate::protocol::read_message::<_, ServerMessage>(&mut source, MAX_FRAME_SIZE)
+                .expect("source mutation request")
+            {
+                ServerMessage::ExternalOpenPolicyMutationRequest {
+                    request_id,
+                    requested_policy: crate::protocol::ExternalOpenPolicy::Enabled,
+                } => request_id,
+                message => panic!("expected source mutation request, got {message:?}"),
+            };
+
+        crate::protocol::write_message(
+            &mut source,
+            &crate::protocol::ClientMessage::ExternalOpenPolicyMutationResult {
+                request_id,
+                requested_policy: crate::protocol::ExternalOpenPolicy::Enabled,
+                persisted_policy: None,
+                effective_policy: crate::protocol::ExternalOpenPolicy::Disabled,
+                failure_stage: Some(crate::protocol::ExternalOpenPolicyMutationFailureStage::Write),
+            },
+        )
+        .expect("write source mutation failure");
+        loop {
+            let event = server
+                .server_event_rx
+                .blocking_recv()
+                .expect("source mutation result event");
+            let mutation_result = matches!(
+                &event,
+                ServerEvent::ExternalOpenPolicyMutationResult { client_id, .. }
+                    if *client_id == source_id
+            );
+            let changed = server.handle_server_event(event);
+            if mutation_result {
+                assert!(changed);
+                break;
+            }
+        }
+        server.render_and_stream();
+        let failed_source_frame =
+            match crate::protocol::read_message::<_, ServerMessage>(&mut source, MAX_FRAME_SIZE)
+                .expect("source failure frame")
+            {
+                ServerMessage::Frame(frame) => frame,
+                message => panic!("expected source failure frame, got {message:?}"),
+            };
+        let save_notice = "Couldn’t save remote link setting · previous value kept";
+        assert_eq!(
+            frame_text(&failed_source_frame)
+                .matches(save_notice)
+                .count(),
+            1
+        );
+        assert_client_writer_reaches_barrier_without_prior_message(&server, other_id, &mut other);
+
+        crate::protocol::write_message(
+            &mut source,
+            &crate::protocol::ClientMessage::ExternalOpenPolicyReloadFailed {
+                effective_policy: crate::protocol::ExternalOpenPolicy::Disabled,
+            },
+        )
+        .expect("write source reload failure");
+        loop {
+            let event = server
+                .server_event_rx
+                .blocking_recv()
+                .expect("source reload failure event");
+            let reload_failure = matches!(
+                &event,
+                ServerEvent::ExternalOpenPolicyReloadFailed { client_id, .. }
+                    if *client_id == source_id
+            );
+            server.handle_server_event(event);
+            if reload_failure {
+                break;
+            }
+        }
+        server.render_and_stream();
+        let replacement_frame =
+            match crate::protocol::read_message::<_, ServerMessage>(&mut source, MAX_FRAME_SIZE)
+                .expect("source replacement notice frame")
+            {
+                ServerMessage::Frame(frame) => frame,
+                message => panic!("expected source replacement frame, got {message:?}"),
+            };
+        let replacement = frame_text(&replacement_frame);
+        assert!(replacement.contains("Couldn’t reload remote link setting · previous value kept"));
+        assert!(!replacement.contains(save_notice));
+
+        crate::protocol::write_message(
+            &mut source,
+            &crate::protocol::ClientMessage::InputEvents {
+                events: vec![crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Esc,
+                    modifiers: 0,
+                    kind: crate::protocol::ClientKeyKind::Press,
+                }],
+            },
+        )
+        .expect("write notice dismissal");
+        loop {
+            let event = server
+                .server_event_rx
+                .blocking_recv()
+                .expect("source dismissal event");
+            let dismissal = matches!(
+                &event,
+                ServerEvent::ClientInputEvents { client_id, .. } if *client_id == source_id
+            );
+            server.handle_server_event(event);
+            if dismissal {
+                break;
+            }
+        }
+        server.render_and_stream();
+        let dismissed_frame =
+            match crate::protocol::read_message::<_, ServerMessage>(&mut source, MAX_FRAME_SIZE)
+                .expect("source dismissed frame")
+            {
+                ServerMessage::Frame(frame) => frame,
+                message => panic!("expected source dismissed frame, got {message:?}"),
+            };
+        assert!(!frame_text(&dismissed_frame).contains("remote link setting"));
+
+        drop(source);
+        loop {
+            let event = server
+                .server_event_rx
+                .blocking_recv()
+                .expect("source disconnect event");
+            let disconnected = matches!(
+                &event,
+                ServerEvent::ClientDisconnected { client_id } if *client_id == source_id
+            );
+            server.handle_server_event(event);
+            if disconnected {
+                break;
+            }
+        }
+        assert!(!server.clients.contains_key(&source_id));
+        assert_client_writer_reaches_barrier_without_prior_message(&server, other_id, &mut other);
+
+        drop(other);
+        server.remove_all_clients();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preparation_failure_notice_renders_only_on_initiating_socket_after_focus_change() {
+        let mut server = test_headless_server();
+        let (source_id, mut source) =
+            connect_socket_app_client(&mut server, crate::protocol::ExternalOpenPolicy::Enabled);
+        let (other_id, mut other) =
+            connect_socket_app_client(&mut server, crate::protocol::ExternalOpenPolicy::Enabled);
+        server.render_and_stream();
+        assert!(matches!(
+            crate::protocol::read_message::<_, ServerMessage>(&mut source, MAX_FRAME_SIZE)
+                .expect("source baseline frame"),
+            ServerMessage::Frame(_)
+        ));
+        assert!(matches!(
+            crate::protocol::read_message::<_, ServerMessage>(&mut other, MAX_FRAME_SIZE)
+                .expect("other baseline frame"),
+            ServerMessage::Frame(_)
+        ));
+
+        let private_url = "https://private.example:4317/path?token=secret#fragment";
+        server.handle_host_actions(
+            source_id,
+            vec![crate::app::HostAction::OpenExternalUrl {
+                url: private_url.to_owned(),
+            }],
+            Instant::now(),
+        );
+        let request_id =
+            match crate::protocol::read_message::<_, ServerMessage>(&mut source, MAX_FRAME_SIZE)
+                .expect("source prepare")
+            {
+                ServerMessage::ExternalOpenPrepare { request_id, url } => {
+                    assert_eq!(url, private_url);
+                    request_id
+                }
+                other => panic!("expected source prepare, got {other:?}"),
+            };
+        server.promote_client_to_foreground(other_id);
+
+        crate::protocol::write_message(
+            &mut source,
+            &crate::protocol::ClientMessage::ExternalOpenPreparationFailed {
+                request_id,
+                reason: crate::protocol::ExternalOpenPreparationFailure::UnsupportedScheme,
+            },
+        )
+        .expect("write preparation failure");
+        loop {
+            let event = server
+                .server_event_rx
+                .blocking_recv()
+                .expect("preparation failure event");
+            let terminal = matches!(
+                &event,
+                ServerEvent::ExternalOpenPreparationFailed {
+                    client_id,
+                    request_id: event_request_id,
+                    ..
+                } if *client_id == source_id && *event_request_id == request_id
+            );
+            let changed = server.handle_server_event(event);
+            if terminal {
+                assert!(changed);
+                break;
+            }
+        }
+
+        server.render_and_stream();
+        let source_frame =
+            match crate::protocol::read_message::<_, ServerMessage>(&mut source, MAX_FRAME_SIZE)
+                .expect("source failure frame")
+            {
+                ServerMessage::Frame(frame) => frame,
+                message => panic!("expected source frame, got {message:?}"),
+            };
+        let text = frame_text(&source_frame);
+        assert_eq!(
+            text.matches("Couldn’t open link · link type isn’t supported")
+                .count(),
+            1
+        );
+        assert!(!text.contains(private_url));
+        assert!(!text.contains("private.example"));
+        assert!(!text.contains("4317"));
+        assert!(!text.contains("token=secret"));
+        assert_client_writer_reaches_barrier_without_prior_message(&server, other_id, &mut other);
+
+        drop(source);
+        drop(other);
+        server.remove_all_clients();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_external_open_categories_obey_source_local_notice_lifecycle() {
+        use crate::protocol::ExternalOpenPreparationFailure as Failure;
+        use crate::server::external_open::{ExternalOpenTerminalOutcome, ExternalOpenTransition};
+
+        fn assert_source_notice(
+            server: &mut HeadlessServer,
+            source_id: u64,
+            source: &mut crate::ipc::LocalStream,
+            other: &mut crate::ipc::LocalStream,
+            expected: &str,
+        ) {
+            server.render_and_stream();
+            let frame =
+                match crate::protocol::read_message::<_, ServerMessage>(source, MAX_FRAME_SIZE)
+                    .expect("initiating client notice frame")
+                {
+                    ServerMessage::Frame(frame) => frame,
+                    message => panic!("expected initiating frame, got {message:?}"),
+                };
+            wait_for_client_frame_writes(server, &[source_id]);
+            let text = frame_text(&frame);
+            assert_eq!(text.matches(expected).count(), 1, "{text}");
+            for secret in [
+                "https://private.example:4317/path?token=secret#fragment",
+                "private.example",
+                "4317",
+                "token=secret",
+                "client-identity-7",
+                "raw platform error",
+            ] {
+                assert!(!text.contains(secret), "notice leaked {secret:?}: {text}");
+            }
+            let other_id = server
+                .foreground_client_id
+                .expect("other client remains foreground");
+            assert_client_writer_reaches_barrier_without_prior_message(server, other_id, other);
+        }
+
+        fn clear_source_notice(
+            server: &mut HeadlessServer,
+            source_id: u64,
+            source: &mut crate::ipc::LocalStream,
+            other: &mut crate::ipc::LocalStream,
+        ) {
+            assert!(server
+                .client_projections
+                .apply(
+                    source_id,
+                    crate::server::client_projection::ClientProjectionAction::DismissNotice,
+                )
+                .changed());
+            server.render_and_stream();
+            assert!(matches!(
+                crate::protocol::read_message::<_, ServerMessage>(source, MAX_FRAME_SIZE)
+                    .expect("notice-cleared source frame"),
+                ServerMessage::Frame(_)
+            ));
+            wait_for_client_frame_writes(server, &[source_id]);
+            let other_id = server
+                .foreground_client_id
+                .expect("other client remains foreground");
+            assert_client_writer_reaches_barrier_without_prior_message(server, other_id, other);
+        }
+
+        let mut server = test_headless_server();
+        let (source_id, mut source) =
+            connect_socket_app_client(&mut server, crate::protocol::ExternalOpenPolicy::Enabled);
+        let (other_id, mut other) =
+            connect_socket_app_client(&mut server, crate::protocol::ExternalOpenPolicy::Enabled);
+        server.render_and_stream();
+        assert!(matches!(
+            crate::protocol::read_message::<_, ServerMessage>(&mut source, MAX_FRAME_SIZE)
+                .expect("source baseline"),
+            ServerMessage::Frame(_)
+        ));
+        assert!(matches!(
+            crate::protocol::read_message::<_, ServerMessage>(&mut other, MAX_FRAME_SIZE)
+                .expect("other baseline"),
+            ServerMessage::Frame(_)
+        ));
+        wait_for_client_frame_writes(&mut server, &[source_id, other_id]);
+        server.promote_client_to_foreground(other_id);
+
+        let preparation_cases = [
+            (
+                Failure::UnsupportedScheme,
+                "Couldn’t open link · link type isn’t supported",
+            ),
+            (
+                Failure::AuthorityUserinfoForbidden,
+                "Couldn’t open link · links with credentials aren’t allowed",
+            ),
+            (Failure::InvalidPort, "Couldn’t open link · link is invalid"),
+            (
+                Failure::InvalidAbsoluteUrl,
+                "Couldn’t open link · link is invalid",
+            ),
+            (
+                Failure::UnsupportedLoopbackForm,
+                "Couldn’t open link · link uses an unsupported local address",
+            ),
+            (
+                Failure::LoopbackUnsupportedOnPlatform,
+                "Couldn’t open link · link uses an unsupported local address",
+            ),
+            (
+                Failure::ManagedSshRequired,
+                "Couldn’t open link · managed SSH is required",
+            ),
+            (
+                Failure::ForwardingUnavailable,
+                "Couldn’t open link · local forwarding is unavailable",
+            ),
+            (
+                Failure::TooManyOpensInProgress,
+                "Couldn’t open link · too many links are opening",
+            ),
+            (
+                Failure::TooManyForwardRequests,
+                "Couldn’t open link · too many links are opening",
+            ),
+            (
+                Failure::TooManyMappingWaiters,
+                "Couldn’t open link · too many links are opening",
+            ),
+            (
+                Failure::ForwardCapacityExhausted,
+                "Couldn’t open link · local forwarding limit reached",
+            ),
+            (
+                Failure::ForwardBindExhausted,
+                "Couldn’t open link · local forwarding failed",
+            ),
+            (
+                Failure::AtomicForwardCreationFailed,
+                "Couldn’t open link · local forwarding failed",
+            ),
+            (
+                Failure::ForwardCommandRejected,
+                "Couldn’t open link · local forwarding failed",
+            ),
+            (
+                Failure::ForwardCommandTimedOut,
+                "Couldn’t open link · local forwarding timed out",
+            ),
+        ];
+        for (reason, expected) in preparation_cases {
+            let accepted_at = Instant::now();
+            let dispatch = server
+                .external_open_requests
+                .start(source_id, accepted_at)
+                .expect("preparation case request");
+            let transition = server.external_open_requests.preparation_failed(
+                source_id,
+                dispatch.request_id(),
+                reason,
+                accepted_at + Duration::from_millis(1),
+            );
+            assert!(server.report_external_open_transition(transition));
+            assert_eq!(server.foreground_client_id, Some(other_id));
+            assert_source_notice(&mut server, source_id, &mut source, &mut other, expected);
+            clear_source_notice(&mut server, source_id, &mut source, &mut other);
+        }
+
+        let accepted_at = Instant::now();
+        let delivery = server
+            .external_open_requests
+            .start(source_id, accepted_at)
+            .expect("delivery request");
+        let transition = server
+            .external_open_requests
+            .delivery_failed(source_id, delivery.request_id());
+        assert!(server.report_external_open_transition(transition));
+        assert_source_notice(
+            &mut server,
+            source_id,
+            &mut source,
+            &mut other,
+            "Couldn’t open link · client connection failed",
+        );
+        clear_source_notice(&mut server, source_id, &mut source, &mut other);
+
+        for (result, expected) in [
+            (
+                crate::protocol::ExternalOpenResult::PlatformOpenRejected,
+                "Couldn’t open link · device rejected the open request",
+            ),
+            (
+                crate::protocol::ExternalOpenResult::OpenedThroughForward {
+                    port_status: crate::protocol::ExternalOpenPortStatus::SamePort,
+                },
+                "Couldn’t open link · client response was invalid",
+            ),
+        ] {
+            let accepted_at = Instant::now();
+            let dispatch = server
+                .external_open_requests
+                .start(source_id, accepted_at)
+                .expect("committed result request");
+            assert_eq!(
+                server.external_open_requests.ready(
+                    source_id,
+                    dispatch.request_id(),
+                    crate::protocol::ExternalOpenTarget::Direct,
+                    accepted_at + Duration::from_millis(1),
+                    |_| true,
+                ),
+                ExternalOpenTransition::Committed
+            );
+            let transition = server.external_open_requests.result(
+                source_id,
+                dispatch.request_id(),
+                result,
+                accepted_at + Duration::from_millis(2),
+            );
+            assert!(server.report_external_open_transition(transition));
+            assert_source_notice(&mut server, source_id, &mut source, &mut other, expected);
+            clear_source_notice(&mut server, source_id, &mut source, &mut other);
+        }
+
+        let accepted_at = Instant::now();
+        let invalid_before_commit = server
+            .external_open_requests
+            .start(source_id, accepted_at)
+            .expect("invalid pre-commit result request");
+        let transition = server.external_open_requests.result(
+            source_id,
+            invalid_before_commit.request_id(),
+            crate::protocol::ExternalOpenResult::OpenedDirectly,
+            accepted_at + Duration::from_millis(1),
+        );
+        assert!(server.report_external_open_transition(transition));
+        assert_source_notice(
+            &mut server,
+            source_id,
+            &mut source,
+            &mut other,
+            "Couldn’t open link · client response was invalid",
+        );
+        clear_source_notice(&mut server, source_id, &mut source, &mut other);
+
+        let accepted_at = Instant::now();
+        let timed_out = server
+            .external_open_requests
+            .start(source_id, accepted_at)
+            .expect("pre-commit timeout request");
+        let closed = server
+            .external_open_requests
+            .expire_due(timed_out.deadline())
+            .pop()
+            .expect("pre-commit timeout");
+        assert!(server.report_external_open_transition(ExternalOpenTransition::Closed(closed)));
+        assert_source_notice(
+            &mut server,
+            source_id,
+            &mut source,
+            &mut other,
+            "Couldn’t open link · request timed out before opening",
+        );
+        clear_source_notice(&mut server, source_id, &mut source, &mut other);
+
+        let accepted_at = Instant::now();
+        let committed_unknown = server
+            .external_open_requests
+            .start(source_id, accepted_at)
+            .expect("committed unknown request");
+        assert_eq!(
+            server.external_open_requests.ready(
+                source_id,
+                committed_unknown.request_id(),
+                crate::protocol::ExternalOpenTarget::Direct,
+                accepted_at + Duration::from_millis(1),
+                |_| true,
+            ),
+            ExternalOpenTransition::Committed
+        );
+        let closed = server
+            .external_open_requests
+            .expire_due(committed_unknown.deadline())
+            .pop()
+            .expect("committed unknown timeout");
+        assert!(server.report_external_open_transition(ExternalOpenTransition::Closed(closed)));
+        assert_source_notice(
+            &mut server,
+            source_id,
+            &mut source,
+            &mut other,
+            "Couldn’t confirm link opening · device may still have opened it",
+        );
+
+        let deadline = server
+            .next_client_notice_deadline()
+            .expect("external-open notice deadline");
+        assert!(!server.expire_client_notices(deadline - Duration::from_nanos(1)));
+        assert!(server.expire_client_notices(deadline));
+        server.render_and_stream();
+        assert!(matches!(
+            crate::protocol::read_message::<_, ServerMessage>(&mut source, MAX_FRAME_SIZE)
+                .expect("expired external-open notice frame"),
+            ServerMessage::Frame(_)
+        ));
+        wait_for_client_frame_writes(&mut server, &[source_id]);
+        assert_client_writer_reaches_barrier_without_prior_message(&server, other_id, &mut other);
+
+        let first = server
+            .external_open_requests
+            .start(source_id, Instant::now())
+            .expect("replacement first");
+        let first_transition = server.external_open_requests.preparation_failed(
+            source_id,
+            first.request_id(),
+            Failure::UnsupportedScheme,
+            Instant::now(),
+        );
+        assert!(server.report_external_open_transition(first_transition));
+        let second = server
+            .external_open_requests
+            .start(source_id, Instant::now())
+            .expect("replacement second");
+        let second_transition = server.external_open_requests.preparation_failed(
+            source_id,
+            second.request_id(),
+            Failure::ForwardingUnavailable,
+            Instant::now(),
+        );
+        assert!(server.report_external_open_transition(second_transition));
+        assert_eq!(
+            client_projection_notice(&server, source_id),
+            Some("Couldn’t open link · local forwarding is unavailable")
+        );
+        assert_source_notice(
+            &mut server,
+            source_id,
+            &mut source,
+            &mut other,
+            "Couldn’t open link · local forwarding is unavailable",
+        );
+
+        crate::protocol::write_message(
+            &mut source,
+            &crate::protocol::ClientMessage::InputEvents {
+                events: vec![crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Esc,
+                    modifiers: 0,
+                    kind: crate::protocol::ClientKeyKind::Press,
+                }],
+            },
+        )
+        .expect("dismiss external-open notice");
+        loop {
+            let event = server
+                .server_event_rx
+                .blocking_recv()
+                .expect("dismissal input event");
+            let dismissal = matches!(
+                &event,
+                ServerEvent::ClientInputEvents { client_id, .. } if *client_id == source_id
+            );
+            let changed = server.handle_server_event(event);
+            if dismissal {
+                assert!(changed);
+                break;
+            }
+        }
+        server.render_and_stream();
+        let dismissed =
+            match crate::protocol::read_message::<_, ServerMessage>(&mut source, MAX_FRAME_SIZE)
+                .expect("dismissed external-open notice frame")
+            {
+                ServerMessage::Frame(frame) => frame,
+                message => panic!("expected dismissed source frame, got {message:?}"),
+            };
+        assert!(!frame_text(&dismissed).contains("Couldn’t open link"));
+        assert_client_writer_reaches_barrier_without_prior_message(&server, other_id, &mut other);
+
+        for (target, result) in [
+            (
+                crate::protocol::ExternalOpenTarget::Direct,
+                crate::protocol::ExternalOpenResult::OpenedDirectly,
+            ),
+            (
+                crate::protocol::ExternalOpenTarget::Forwarded {
+                    port_status: crate::protocol::ExternalOpenPortStatus::SamePort,
+                },
+                crate::protocol::ExternalOpenResult::OpenedThroughForward {
+                    port_status: crate::protocol::ExternalOpenPortStatus::SamePort,
+                },
+            ),
+            (
+                crate::protocol::ExternalOpenTarget::Forwarded {
+                    port_status: crate::protocol::ExternalOpenPortStatus::RemappedPort,
+                },
+                crate::protocol::ExternalOpenResult::OpenedThroughForward {
+                    port_status: crate::protocol::ExternalOpenPortStatus::RemappedPort,
+                },
+            ),
+        ] {
+            let accepted_at = Instant::now();
+            let dispatch = server
+                .external_open_requests
+                .start(source_id, accepted_at)
+                .expect("successful request");
+            assert_eq!(
+                server.external_open_requests.ready(
+                    source_id,
+                    dispatch.request_id(),
+                    target,
+                    accepted_at + Duration::from_millis(1),
+                    |_| true,
+                ),
+                ExternalOpenTransition::Committed
+            );
+            let transition = server.external_open_requests.result(
+                source_id,
+                dispatch.request_id(),
+                result,
+                accepted_at + Duration::from_millis(2),
+            );
+            assert!(!server.report_external_open_transition(transition));
+        }
+        server.render_and_stream();
+        assert_client_writer_reaches_barrier_without_prior_message(&server, source_id, &mut source);
+        assert_client_writer_reaches_barrier_without_prior_message(&server, other_id, &mut other);
+
+        let cancelled = server
+            .external_open_requests
+            .start(source_id, Instant::now())
+            .expect("cancelled request");
+        let closed = server
+            .external_open_requests
+            .cancel_preparing_for_client(source_id)
+            .into_iter()
+            .find(|closed| closed.request_id == cancelled.request_id())
+            .expect("cancelled terminal outcome");
+        assert_eq!(
+            closed.outcome,
+            ExternalOpenTerminalOutcome::CancelledBeforeCommit
+        );
+        assert!(!server.report_external_open_transition(ExternalOpenTransition::Closed(closed)));
+        server.render_and_stream();
+        assert_client_writer_reaches_barrier_without_prior_message(&server, source_id, &mut source);
+        assert_client_writer_reaches_barrier_without_prior_message(&server, other_id, &mut other);
+
+        let preparing = server
+            .external_open_requests
+            .start(source_id, Instant::now())
+            .expect("disconnect preparing request");
+        let committed = server
+            .external_open_requests
+            .start(source_id, Instant::now())
+            .expect("disconnect committed request");
+        assert_eq!(
+            server.external_open_requests.ready(
+                source_id,
+                committed.request_id(),
+                crate::protocol::ExternalOpenTarget::Direct,
+                Instant::now(),
+                |_| true,
+            ),
+            ExternalOpenTransition::Committed
+        );
+        drop(source);
+        loop {
+            let event = server
+                .server_event_rx
+                .blocking_recv()
+                .expect("source disconnect event");
+            let disconnected = matches!(
+                &event,
+                ServerEvent::ClientDisconnected { client_id } if *client_id == source_id
+            );
+            server.handle_server_event(event);
+            if disconnected {
+                break;
+            }
+        }
+        assert!(!server.clients.contains_key(&source_id));
+        assert!(server.external_open_requests.next_deadline().is_none());
+        assert_ne!(preparing.request_id(), committed.request_id());
+        assert_client_writer_reaches_barrier_without_prior_message(&server, other_id, &mut other);
+
+        drop(other);
+        server.remove_all_clients();
     }
 
     #[test]
@@ -4740,7 +5961,7 @@ mod tests {
                 crate::protocol::ExternalOpenPolicy::Enabled,
             ),
         ] {
-            let mut client = ClientConnection::new(
+            let client = ClientConnection::new(
                 (80, 24),
                 crate::kitty_graphics::HostCellSize::default(),
                 crate::terminal_theme::TerminalTheme::default(),
@@ -4749,8 +5970,8 @@ mod tests {
                 RenderEncoding::SemanticFrame,
                 Some(writer),
             );
-            client.external_open_policy = Some(policy);
             server.clients.insert(client_id, client);
+            connect_client_projection(&mut server, client_id, policy);
         }
         server.foreground_client_id = Some(2);
 
@@ -4787,8 +6008,16 @@ mod tests {
         );
         assert!(other_rx.try_recv().is_err());
 
-        server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 1 });
+        server.handle_server_event(ServerEvent::ExternalOpenResult {
+            client_id: 1,
+            request_id,
+            result: crate::protocol::ExternalOpenResult::OpenedDirectly,
+        });
         assert_eq!(server.external_open_requests.next_deadline(), None);
+        assert_eq!(client_projection_notice(&server, 1), None);
+        assert!(other_rx.try_recv().is_err());
+
+        server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 1 });
         server.handle_server_event(ServerEvent::ExternalOpenResult {
             client_id: 1,
             request_id,
@@ -4798,10 +6027,467 @@ mod tests {
     }
 
     #[test]
+    fn policy_mutation_and_render_projection_stay_with_source_across_focus_change() {
+        let mut server = test_headless_server();
+        server.app.state.mode = crate::app::Mode::Settings;
+        server.app.state.settings.section = crate::app::state::SettingsSection::Experiments;
+        server.app.state.settings.list.selected = 2;
+
+        let (source_writer, source_control_rx, source_render_rx) = test_client_writer();
+        let source = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(true),
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(source_writer),
+        );
+        server.clients.insert(1, source);
+        connect_client_projection(
+            &mut server,
+            1,
+            crate::protocol::ExternalOpenPolicy::Disabled,
+        );
+
+        let (other_writer, other_control_rx, other_render_rx) = test_client_writer();
+        let other = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(false),
+            2,
+            RenderEncoding::SemanticFrame,
+            Some(other_writer),
+        );
+        server.clients.insert(2, other);
+        connect_client_projection(&mut server, 2, crate::protocol::ExternalOpenPolicy::Enabled);
+        server.foreground_client_id = Some(2);
+
+        server.handle_client_input_events(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                crate::input::TerminalKey::new(
+                    crossterm::event::KeyCode::Char(' '),
+                    KeyModifiers::empty(),
+                ),
+            )],
+        );
+
+        assert!(source_control_rx.try_recv().is_err());
+        assert!(other_control_rx.try_recv().is_err());
+
+        server.promote_client_to_foreground(2);
+        server.render_and_stream();
+
+        let source_text = frame_text(&read_server_frame(
+            source_render_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("source projected frame"),
+        ));
+        let other_text = frame_text(&read_server_frame(
+            other_render_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("other projected frame"),
+        ));
+        assert!(source_text.contains("open remote links on this device [ ] saving…"));
+        assert!(other_text.contains("open remote links on this device [✓]"));
+        assert!(!other_text.contains("open remote links on this device [✓] saving…"));
+        assert!(source_control_rx.try_recv().is_err());
+        assert!(!acknowledge_next_client_frame(&mut server, 1));
+
+        let request_id = match read_server_message(
+            source_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("source policy mutation request after saving frame"),
+        ) {
+            ServerMessage::ExternalOpenPolicyMutationRequest {
+                request_id,
+                requested_policy,
+            } => {
+                assert_eq!(
+                    requested_policy,
+                    crate::protocol::ExternalOpenPolicy::Enabled
+                );
+                request_id
+            }
+            other => panic!("expected source mutation request, got {other:?}"),
+        };
+        assert_ne!(request_id, 0);
+        assert!(other_control_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn successful_policy_mutation_adopts_effective_value_without_notice() {
+        let mut server = test_headless_server();
+        server.app.state.mode = crate::app::Mode::Settings;
+        server.app.state.settings.section = crate::app::state::SettingsSection::Experiments;
+        server.app.state.settings.list.selected = 2;
+        let (writer, control_rx, render_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(writer),
+            ),
+        );
+        connect_client_projection(
+            &mut server,
+            1,
+            crate::protocol::ExternalOpenPolicy::Disabled,
+        );
+
+        server.handle_client_input_events(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                crate::input::TerminalKey::new(
+                    crossterm::event::KeyCode::Char(' '),
+                    KeyModifiers::empty(),
+                ),
+            )],
+        );
+        server.render_and_stream();
+        let pending = frame_text(&read_server_frame(
+            render_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("saving frame"),
+        ));
+        assert!(pending.contains("open remote links on this device [ ] saving…"));
+        assert!(!acknowledge_next_client_frame(&mut server, 1));
+        let request_id = match read_server_message(
+            control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("presented mutation request"),
+        ) {
+            ServerMessage::ExternalOpenPolicyMutationRequest { request_id, .. } => request_id,
+            other => panic!("expected policy mutation request, got {other:?}"),
+        };
+
+        assert!(
+            server.handle_server_event(ServerEvent::ExternalOpenPolicyMutationResult {
+                client_id: 1,
+                request_id,
+                requested_policy: crate::protocol::ExternalOpenPolicy::Enabled,
+                persisted_policy: Some(crate::protocol::ExternalOpenPolicy::Enabled),
+                effective_policy: crate::protocol::ExternalOpenPolicy::Enabled,
+                failure_stage: None,
+            })
+        );
+        server.render_and_stream();
+
+        let confirmed = frame_text(&read_server_frame(
+            render_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("confirmed frame"),
+        ));
+        assert!(confirmed.contains("open remote links on this device [✓]"));
+        assert!(!confirmed.contains("saving…"));
+        assert_eq!(client_projection_notice(&server, 1), None);
+    }
+
+    #[test]
+    fn disconnect_destroys_source_projection_without_broadcasting_it() {
+        let mut server = test_headless_server();
+        let now = Instant::now();
+        let source = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            1,
+            RenderEncoding::SemanticFrame,
+            None,
+        );
+        server.clients.insert(1, source);
+        connect_client_projection(
+            &mut server,
+            1,
+            crate::protocol::ExternalOpenPolicy::Disabled,
+        );
+        let failed = begin_presented_policy_mutation(&mut server, 1);
+        assert!(server
+            .client_projections
+            .apply(
+                1,
+                crate::server::client_projection::ClientProjectionAction::SettlePolicy {
+                    result: crate::server::client_projection::PolicyMutationResult {
+                        request_id: failed.request_id,
+                        requested_policy: failed.requested_policy,
+                        persisted_policy: None,
+                        effective_policy: crate::protocol::ExternalOpenPolicy::Disabled,
+                        failure_stage: Some(
+                            crate::protocol::ExternalOpenPolicyMutationFailureStage::Write,
+                        ),
+                    },
+                    now,
+                },
+            )
+            .changed());
+        assert!(server
+            .client_projections
+            .apply(
+                1,
+                crate::server::client_projection::ClientProjectionAction::TogglePolicy,
+            )
+            .changed());
+
+        let (other_writer, other_control_rx, other_render_rx) = test_client_writer();
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(other_writer),
+            ),
+        );
+
+        server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 1 });
+
+        assert!(!server.clients.contains_key(&1));
+        assert!(server.client_projections.render(1).is_none());
+        assert!(other_control_rx.try_recv().is_err());
+        assert!(other_render_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn escape_dismisses_only_the_source_connection_notice_despite_other_focus() {
+        let mut server = test_headless_server();
+        let now = Instant::now();
+        for client_id in [1, 2] {
+            let client = ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                client_id,
+                RenderEncoding::SemanticFrame,
+                None,
+            );
+            server.clients.insert(client_id, client);
+            connect_client_projection(
+                &mut server,
+                client_id,
+                crate::protocol::ExternalOpenPolicy::Disabled,
+            );
+            let request = begin_presented_policy_mutation(&mut server, client_id);
+            assert!(server
+                .client_projections
+                .apply(
+                    client_id,
+                    crate::server::client_projection::ClientProjectionAction::SettlePolicy {
+                        result: crate::server::client_projection::PolicyMutationResult {
+                            request_id: request.request_id,
+                            requested_policy: request.requested_policy,
+                            persisted_policy: None,
+                            effective_policy: crate::protocol::ExternalOpenPolicy::Disabled,
+                            failure_stage: Some(
+                                crate::protocol::ExternalOpenPolicyMutationFailureStage::Write,
+                            ),
+                        },
+                        now,
+                    },
+                )
+                .changed());
+        }
+        server.foreground_client_id = Some(2);
+
+        server.handle_client_input_events(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                crate::input::TerminalKey::new(
+                    crossterm::event::KeyCode::Esc,
+                    KeyModifiers::empty(),
+                ),
+            )],
+        );
+
+        assert_eq!(client_projection_notice(&server, 1), None);
+        assert!(client_projection_notice(&server, 2).is_some());
+    }
+
+    #[test]
+    fn server_expires_client_notice_at_exact_deadline() {
+        let mut server = test_headless_server();
+        let now = Instant::now();
+        let (writer, _control_rx, render_rx) = test_client_writer();
+        let client = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(writer),
+        );
+        server.clients.insert(1, client);
+        connect_client_projection(
+            &mut server,
+            1,
+            crate::protocol::ExternalOpenPolicy::Disabled,
+        );
+        let request = begin_presented_policy_mutation(&mut server, 1);
+        assert!(server
+            .client_projections
+            .apply(
+                1,
+                crate::server::client_projection::ClientProjectionAction::SettlePolicy {
+                    result: crate::server::client_projection::PolicyMutationResult {
+                        request_id: request.request_id,
+                        requested_policy: request.requested_policy,
+                        persisted_policy: Some(crate::protocol::ExternalOpenPolicy::Enabled),
+                        effective_policy: crate::protocol::ExternalOpenPolicy::Disabled,
+                        failure_stage: Some(
+                            crate::protocol::ExternalOpenPolicyMutationFailureStage::Reload,
+                        ),
+                    },
+                    now,
+                },
+            )
+            .changed());
+        server.render_and_stream();
+        let visible = frame_text(&read_server_frame(
+            render_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("visible notice frame"),
+        ));
+        assert!(visible.contains("Couldn’t reload remote link setting · previous value kept"));
+
+        assert!(
+            !server.expire_client_notices(now + Duration::from_secs(5) - Duration::from_nanos(1))
+        );
+        assert!(client_projection_notice(&server, 1).is_some());
+        assert!(server.expire_client_notices(now + Duration::from_secs(5)));
+        server.render_and_stream();
+        let expired = frame_text(&read_server_frame(
+            render_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("expired notice frame"),
+        ));
+        assert!(!expired.contains("remote link setting"));
+        assert_eq!(client_projection_notice(&server, 1), None);
+    }
+
+    #[test]
+    fn narrow_mobile_settings_keeps_failed_reload_notice_visible_only_on_source_frame() {
+        let mut server = test_headless_server();
+        server.app.state.mode = crate::app::Mode::Settings;
+        server.app.state.settings.section = crate::app::state::SettingsSection::Experiments;
+        server.app.state.settings.list.selected = 2;
+
+        let (source_writer, source_control_rx, source_render_rx) = test_client_writer();
+        let source = ClientConnection::new(
+            (44, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(true),
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(source_writer),
+        );
+        server.clients.insert(1, source);
+        connect_client_projection(
+            &mut server,
+            1,
+            crate::protocol::ExternalOpenPolicy::Disabled,
+        );
+
+        let (other_writer, other_control_rx, other_render_rx) = test_client_writer();
+        let other = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(false),
+            2,
+            RenderEncoding::SemanticFrame,
+            Some(other_writer),
+        );
+        server.clients.insert(2, other);
+        connect_client_projection(&mut server, 2, crate::protocol::ExternalOpenPolicy::Enabled);
+
+        server.handle_client_input_events(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                crate::input::TerminalKey::new(
+                    crossterm::event::KeyCode::Char(' '),
+                    KeyModifiers::empty(),
+                ),
+            )],
+        );
+        server.render_and_stream();
+        let pending_source_text = frame_text(&read_server_frame(
+            source_render_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("source saving frame"),
+        ));
+        assert!(
+            pending_source_text.contains("open remote links on this device [ ]"),
+            "{pending_source_text}"
+        );
+        assert!(server
+            .client_projections
+            .render(1)
+            .is_some_and(|projection| projection.view().saving()));
+        let _ = other_render_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("other initial frame");
+        assert!(!acknowledge_next_client_frame(&mut server, 1));
+        let request_id = match read_server_message(
+            source_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("source policy mutation request"),
+        ) {
+            ServerMessage::ExternalOpenPolicyMutationRequest { request_id, .. } => request_id,
+            other => panic!("expected source mutation request, got {other:?}"),
+        };
+
+        assert!(
+            server.handle_server_event(ServerEvent::ExternalOpenPolicyMutationResult {
+                client_id: 1,
+                request_id,
+                requested_policy: crate::protocol::ExternalOpenPolicy::Enabled,
+                persisted_policy: Some(crate::protocol::ExternalOpenPolicy::Enabled),
+                effective_policy: crate::protocol::ExternalOpenPolicy::Disabled,
+                failure_stage: Some(
+                    crate::protocol::ExternalOpenPolicyMutationFailureStage::Reload,
+                ),
+            })
+        );
+        assert!(other_control_rx.try_recv().is_err());
+
+        server.promote_client_to_foreground(2);
+        server.render_and_stream();
+        let source_text = frame_text(&read_server_frame(
+            source_render_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("source failure frame"),
+        ));
+        assert!(other_render_rx.try_recv().is_err());
+        let notice = "Couldn’t reload remote link setting · previous value kept";
+        let rendered_notice = "Couldn’t reload remote link setting · previ";
+        assert!(source_text.contains("open remote links on this device [ ]"));
+        assert!(!source_text.contains("saving…"));
+        assert_eq!(client_projection_notice(&server, 1), Some(notice));
+        assert_eq!(
+            source_text.matches(rendered_notice).count(),
+            1,
+            "{source_text}"
+        );
+    }
+
+    #[test]
     fn policy_updates_apply_only_to_full_app_connections_and_cancel_preparing_work() {
         let mut server = test_headless_server();
         let (app_writer, app_rx, _app_render_rx) = test_client_writer();
-        let mut app_client = ClientConnection::new(
+        let app_client = ClientConnection::new(
             (80, 24),
             crate::kitty_graphics::HostCellSize::default(),
             crate::terminal_theme::TerminalTheme::default(),
@@ -4810,8 +6496,8 @@ mod tests {
             RenderEncoding::SemanticFrame,
             Some(app_writer),
         );
-        app_client.external_open_policy = Some(crate::protocol::ExternalOpenPolicy::Enabled);
         server.clients.insert(1, app_client);
+        connect_client_projection(&mut server, 1, crate::protocol::ExternalOpenPolicy::Enabled);
 
         let (terminal_writer, terminal_rx, _terminal_render_rx) = test_client_writer();
         let mut terminal_client = ClientConnection::new(
@@ -4826,7 +6512,6 @@ mod tests {
         terminal_client.mode = ClientConnectionMode::TerminalObserve {
             terminal_id: "term_2".to_owned(),
         };
-        terminal_client.external_open_policy = None;
         server.clients.insert(2, terminal_client);
 
         server.handle_host_actions(
@@ -4841,19 +6526,18 @@ mod tests {
             other => panic!("expected prepare, got {other:?}"),
         };
 
-        server.handle_server_event(ServerEvent::ExternalOpenPolicyUpdate {
-            client_id: 1,
-            policy: crate::protocol::ExternalOpenPolicy::Disabled,
-        });
+        assert!(
+            server.handle_server_event(ServerEvent::ExternalOpenPolicyUpdate {
+                client_id: 1,
+                policy: crate::protocol::ExternalOpenPolicy::Disabled,
+            })
+        );
         assert_eq!(
             read_server_message(app_rx.recv().expect("policy cancellation")),
             ServerMessage::ExternalOpenCancel { request_id }
         );
         assert_eq!(
-            server
-                .clients
-                .get(&1)
-                .and_then(|client| client.external_open_policy),
+            server.client_projections.confirmed_policy(1),
             Some(crate::protocol::ExternalOpenPolicy::Disabled)
         );
 
@@ -4861,13 +6545,7 @@ mod tests {
             client_id: 2,
             policy: crate::protocol::ExternalOpenPolicy::Enabled,
         });
-        assert_eq!(
-            server
-                .clients
-                .get(&2)
-                .and_then(|client| client.external_open_policy),
-            None
-        );
+        assert_eq!(server.client_projections.confirmed_policy(2), None);
         assert!(terminal_rx.try_recv().is_err());
     }
 
@@ -4875,7 +6553,7 @@ mod tests {
     fn external_open_deadline_cancels_before_commit_at_equality() {
         let mut server = test_headless_server();
         let (writer, control_rx, _render_rx) = test_client_writer();
-        let mut client = ClientConnection::new(
+        let client = ClientConnection::new(
             (80, 24),
             crate::kitty_graphics::HostCellSize::default(),
             crate::terminal_theme::TerminalTheme::default(),
@@ -4884,8 +6562,8 @@ mod tests {
             RenderEncoding::SemanticFrame,
             Some(writer),
         );
-        client.external_open_policy = Some(crate::protocol::ExternalOpenPolicy::Enabled);
         server.clients.insert(1, client);
+        connect_client_projection(&mut server, 1, crate::protocol::ExternalOpenPolicy::Enabled);
         let accepted_at = Instant::now();
         server.handle_host_actions(
             1,
@@ -4955,6 +6633,11 @@ mod tests {
                 RenderEncoding::SemanticFrame,
                 Some(client_tx),
             ),
+        );
+        connect_client_projection(
+            &mut server,
+            1,
+            crate::protocol::ExternalOpenPolicy::Disabled,
         );
         server.foreground_client_id = Some(1);
         server.sync_foreground_client_state();
@@ -7818,7 +9501,7 @@ next_tab = ""
             "expected initial full frame to include toast text"
         );
 
-        let toast_row = server.app.state.view.toast_hit_area.y;
+        let toast_row = server.app.state.view.toast_hit_area().y;
         let inner_rect = server.app.state.view.pane_infos[0].inner_rect;
         let pane_row = toast_row
             .checked_sub(inner_rect.y)
@@ -7837,6 +9520,467 @@ next_tab = ""
             client_rx.recv_timeout(Duration::from_millis(50)).is_err(),
             "retained path should not stream a frame that can overwrite toast cells"
         );
+    }
+
+    #[test]
+    fn two_client_notice_layouts_do_not_contaminate_shared_view_state() {
+        let mut server = test_headless_server();
+        let active = crate::workspace::Workspace::test_new("active");
+        let background = crate::workspace::Workspace::test_new("background");
+        let target_pane = background.tabs[0].root_pane;
+        let target_workspace = background.id.clone();
+        server.app.state.workspaces = vec![active, background];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.toast_config.herdr.position = crate::config::ToastHerdrPosition::TopLeft;
+        let toast = crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::Finished,
+            title: "render target".to_owned(),
+            context: "source local geometry".to_owned(),
+            position: None,
+            target: Some(crate::app::state::ToastTarget {
+                workspace_id: target_workspace,
+                pane_id: target_pane,
+            }),
+        };
+        server.app.state.toast = Some(toast.clone());
+
+        let (source_writer, _source_control_rx, source_render_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (65, 10),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(source_writer),
+            ),
+        );
+        connect_client_projection(
+            &mut server,
+            1,
+            crate::protocol::ExternalOpenPolicy::Disabled,
+        );
+
+        let (other_writer, _other_control_rx, other_render_rx) = test_client_writer();
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (44, 10),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(false),
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(other_writer),
+            ),
+        );
+        connect_client_projection(&mut server, 2, crate::protocol::ExternalOpenPolicy::Enabled);
+        server.foreground_client_id = Some(1);
+
+        let notice = "Couldn’t open link · link is invalid";
+        show_client_notice(&mut server, 1, notice, Instant::now());
+        server.render_and_stream();
+
+        let source = read_server_frame(source_render_rx.recv().expect("source frame"));
+        let other = read_server_frame(other_render_rx.recv().expect("other frame"));
+        let source_text = frame_text(&source);
+        let other_text = frame_text(&other);
+        assert!(source_text.contains(notice), "{source_text}");
+        assert!(!other_text.contains("Couldn’t open link"), "{other_text}");
+        assert!(!acknowledge_next_client_frame(&mut server, 1));
+        assert!(!acknowledge_next_client_frame(&mut server, 2));
+        assert_eq!(
+            server
+                .client_projections
+                .displayed_render_context(1)
+                .expect("source displayed context")
+                .toast_hit_area(),
+            Rect::new(0, 1, 27, 4)
+        );
+        assert_eq!(
+            server
+                .client_projections
+                .displayed_render_context(2)
+                .expect("other displayed context")
+                .toast_hit_area(),
+            Rect::new(0, 9, 44, 1)
+        );
+        assert_eq!(
+            server.app.state.view.toast_hit_area(),
+            Rect::new(0, 0, 27, 4),
+            "shared geometry must not encode the foreground connection's notice presence"
+        );
+
+        assert_eq!(server.foreground_client_id, Some(1));
+        server.handle_client_input_events(
+            1,
+            vec![crate::raw_input::RawInputEvent::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: 1,
+                    row: 1,
+                    modifiers: KeyModifiers::empty(),
+                },
+            )],
+        );
+        assert_eq!(server.app.state.active, Some(1));
+
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.toast = Some(toast);
+        assert_eq!(server.foreground_client_id, Some(1));
+        server.handle_client_input_events(
+            2,
+            vec![crate::raw_input::RawInputEvent::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: 1,
+                    row: 9,
+                    modifiers: KeyModifiers::empty(),
+                },
+            )],
+        );
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert_eq!(server.app.state.active, Some(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_hit_geometry_advances_only_after_the_exact_frame_is_written() {
+        let mut server = test_headless_server();
+        let active = crate::workspace::Workspace::test_new("active");
+        let background = crate::workspace::Workspace::test_new("background");
+        let target_pane = background.tabs[0].root_pane;
+        let target_workspace = background.id.clone();
+        server.app.state.workspaces = vec![active, background];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.toast_config.herdr.position = crate::config::ToastHerdrPosition::TopLeft;
+        let toast = crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::Finished,
+            title: "render target".to_owned(),
+            context: "acknowledged geometry".to_owned(),
+            position: None,
+            target: Some(crate::app::state::ToastTarget {
+                workspace_id: target_workspace,
+                pane_id: target_pane,
+            }),
+        };
+        server.app.state.toast = Some(toast.clone());
+
+        let (client_id, mut client) =
+            connect_socket_app_client(&mut server, crate::protocol::ExternalOpenPolicy::Disabled);
+        server.foreground_client_id = Some(client_id);
+        assert!(server
+            .client_projections
+            .apply(
+                client_id,
+                crate::server::client_projection::ClientProjectionAction::TogglePolicy,
+            )
+            .changed());
+
+        server.render_and_stream();
+        assert!(matches!(
+            crate::protocol::read_message::<_, ServerMessage>(&mut client, MAX_FRAME_SIZE)
+                .expect("frame A"),
+            ServerMessage::Frame(_)
+        ));
+        loop {
+            let event = server
+                .server_event_rx
+                .blocking_recv()
+                .expect("frame A writer event");
+            let written = matches!(
+                &event,
+                ServerEvent::ClientFrameWritten {
+                    client_id: written_id,
+                    ..
+                } if *written_id == client_id
+            );
+            server.handle_server_event(event);
+            if written {
+                break;
+            }
+        }
+        let first_request =
+            match crate::protocol::read_message::<_, ServerMessage>(&mut client, MAX_FRAME_SIZE)
+                .expect("first policy mutation request")
+            {
+                ServerMessage::ExternalOpenPolicyMutationRequest {
+                    request_id,
+                    requested_policy,
+                } => (request_id, requested_policy),
+                other => panic!("expected first policy mutation request, got {other:?}"),
+            };
+        assert!(
+            server.handle_server_event(ServerEvent::ExternalOpenPolicyMutationResult {
+                client_id,
+                request_id: first_request.0,
+                requested_policy: first_request.1,
+                persisted_policy: Some(first_request.1),
+                effective_policy: first_request.1,
+                failure_stage: None,
+            },)
+        );
+        assert!(server
+            .client_projections
+            .apply(
+                client_id,
+                crate::server::client_projection::ClientProjectionAction::TogglePolicy,
+            )
+            .changed());
+        show_client_notice(
+            &mut server,
+            client_id,
+            "Couldn’t open link · link is invalid",
+            Instant::now(),
+        );
+
+        let blocked_write = server.clients[&client_id]
+            .writer
+            .as_ref()
+            .expect("client writer")
+            .block_next_render_write_for_test()
+            .expect("production queue writer");
+        server.render_and_stream();
+        blocked_write.wait_until_blocked();
+
+        server.handle_client_input_events(
+            client_id,
+            vec![crate::raw_input::RawInputEvent::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: 1,
+                    row: 0,
+                    modifiers: KeyModifiers::empty(),
+                },
+            )],
+        );
+        assert!(
+            server.app.state.toast.is_none(),
+            "unwritten frame B must not replace frame A hit geometry"
+        );
+
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.toast = Some(toast.clone());
+        blocked_write.release();
+        assert!(matches!(
+            crate::protocol::read_message::<_, ServerMessage>(&mut client, MAX_FRAME_SIZE)
+                .expect("frame B"),
+            ServerMessage::Frame(_)
+        ));
+        loop {
+            let event = server
+                .server_event_rx
+                .blocking_recv()
+                .expect("frame B writer event");
+            let written = matches!(
+                &event,
+                ServerEvent::ClientFrameWritten {
+                    client_id: written_id,
+                    ..
+                } if *written_id == client_id
+            );
+            server.handle_server_event(event);
+            if written {
+                break;
+            }
+        }
+
+        server.handle_client_input_events(
+            client_id,
+            vec![crate::raw_input::RawInputEvent::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: 1,
+                    row: 0,
+                    modifiers: KeyModifiers::empty(),
+                },
+            )],
+        );
+        assert!(
+            server.app.state.toast.is_some(),
+            "acknowledged frame B geometry must replace frame A geometry"
+        );
+    }
+
+    #[test]
+    fn full_render_queue_does_not_advance_client_notice_hit_geometry() {
+        let mut server = test_headless_server();
+        server.app.state.toast_config.herdr.position = crate::config::ToastHerdrPosition::TopLeft;
+        server.app.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::Finished,
+            title: "render target".to_owned(),
+            context: "source local geometry".to_owned(),
+            position: None,
+            target: None,
+        });
+
+        let (writer, _control_rx, render_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (65, 10),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(writer),
+            ),
+        );
+        connect_client_projection(
+            &mut server,
+            1,
+            crate::protocol::ExternalOpenPolicy::Disabled,
+        );
+        server.foreground_client_id = Some(1);
+
+        server.render_and_stream();
+        assert!(!acknowledge_next_client_frame(&mut server, 1));
+        assert_eq!(
+            server
+                .client_projections
+                .displayed_render_context(1)
+                .expect("displayed context")
+                .toast_hit_area(),
+            Rect::new(0, 0, 27, 4)
+        );
+
+        show_client_notice(
+            &mut server,
+            1,
+            "Couldn’t open link · link is invalid",
+            Instant::now(),
+        );
+        server.render_and_stream();
+        assert!(server.clients[&1].render_pending);
+        assert_eq!(
+            server
+                .client_projections
+                .displayed_render_context(1)
+                .expect("displayed context")
+                .toast_hit_area(),
+            Rect::new(0, 0, 27, 4),
+            "queue-full rendering must retain geometry from the last sent frame"
+        );
+
+        drop(render_rx);
+    }
+
+    #[tokio::test]
+    async fn retained_pty_update_declines_while_client_projection_notice_is_visible() {
+        let (mut server, client_rx, pane_id) = retained_test_server(b"aaaa");
+        let notice = "Couldn’t open link · link is invalid";
+        show_client_notice(&mut server, 1, notice, Instant::now());
+        server.render_and_stream();
+        let initial = read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial frame"),
+        );
+        assert!(frame_text(&initial).contains(notice));
+
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        runtime.test_process_pty_bytes(b"\rZ");
+
+        assert!(!server.render_retained_pty_update_and_stream());
+        assert_eq!(
+            client_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "retained PTY output must not enqueue a frame over a client-local notice"
+        );
+
+        server.render_and_stream();
+        let full = read_server_frame(client_rx.recv().expect("full frame with retained notice"));
+        assert!(frame_text(&full).contains(notice));
+        assert!(full.cells.iter().any(|cell| cell.symbol == "Z"));
+    }
+
+    #[tokio::test]
+    async fn client_projection_notice_lifecycle_forces_full_frames_until_notice_is_gone() {
+        let (mut server, client_rx, pane_id) = retained_test_server(b"aaaa");
+        let now = Instant::now();
+        let first = "Couldn’t open link · link is invalid";
+        let replacement = "Couldn’t open link · managed SSH is required";
+        show_client_notice(&mut server, 1, first, now);
+        show_client_notice(&mut server, 1, replacement, now + Duration::from_secs(1));
+
+        server.render_and_stream();
+        let replacement_frame = read_server_frame(client_rx.recv().expect("replacement frame"));
+        let replacement_text = frame_text(&replacement_frame);
+        assert!(replacement_text.contains(replacement));
+        assert!(!replacement_text.contains(first));
+
+        server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime")
+            .test_process_pty_bytes(b"\rY");
+        assert!(!server.render_retained_pty_update_and_stream());
+        server.render_and_stream();
+        let output_under_replacement = read_server_frame(
+            client_rx
+                .recv()
+                .expect("full replacement frame after output"),
+        );
+        assert!(frame_text(&output_under_replacement).contains(replacement));
+        assert!(output_under_replacement
+            .cells
+            .iter()
+            .any(|cell| cell.symbol == "Y"));
+
+        assert!(server
+            .client_projections
+            .apply(
+                1,
+                crate::server::client_projection::ClientProjectionAction::DismissNotice,
+            )
+            .changed());
+        server.render_and_stream();
+        let dismissed = read_server_frame(client_rx.recv().expect("dismissed frame"));
+        assert!(!frame_text(&dismissed).contains("Couldn’t open link"));
+        assert!(dismissed.cells.iter().any(|cell| cell.symbol == "Y"));
+
+        let expiring = "Couldn’t open link · local forwarding failed";
+        show_client_notice(&mut server, 1, expiring, now + Duration::from_secs(2));
+        server.render_and_stream();
+        let expiring_frame = read_server_frame(client_rx.recv().expect("expiring notice frame"));
+        assert!(frame_text(&expiring_frame).contains(expiring));
+
+        server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime")
+            .test_process_pty_bytes(b"\rZ");
+        assert!(!server.render_retained_pty_update_and_stream());
+        assert!(server.expire_client_notices(now + Duration::from_secs(7)));
+        assert!(
+            !server.render_retained_pty_update_and_stream(),
+            "expiry must clear the notice through a full frame before retained PTY patches resume"
+        );
+        assert_eq!(
+            client_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        server.render_and_stream();
+        let expired = read_server_frame(client_rx.recv().expect("expired notice frame"));
+        assert!(!frame_text(&expired).contains(expiring));
+        assert!(expired.cells.iter().any(|cell| cell.symbol == "Z"));
     }
 
     #[tokio::test]
@@ -8043,9 +10187,10 @@ next_tab = ""
         let hyperlink_idx =
             usize::from(inner_rect.y) * usize::from(frame.width) + usize::from(inner_rect.x);
         frame.cells[hyperlink_idx].hyperlink = Some(0);
+        let render_context = crate::ui::ClientRenderContext::default();
         let prepared = client
             .render_state
-            .prepare_frame(frame)
+            .prepare_frame(frame, render_context)
             .expect("hyperlink frame differs");
         client.render_state.commit_sent_frame(prepared);
 
@@ -8376,10 +10521,7 @@ next_tab = ""
         server.foreground_client_id = Some(2);
         server.sync_foreground_client_state();
         // Drain any setup messages (e.g. mouse-capture sync) before exercising the event.
-        while foreground_control_rx
-            .recv_timeout(Duration::from_millis(20))
-            .is_ok()
-        {}
+        while foreground_control_rx.try_recv().is_ok() {}
 
         let changed = server
             .handle_internal_event_with_forwarding(AppEvent::PrefixInputSource { active: true });

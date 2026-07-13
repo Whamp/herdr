@@ -94,10 +94,11 @@ impl AppState {
         }
     }
 
-    pub(super) fn handle_mouse(
+    pub(super) fn handle_mouse_with_render_context(
         &mut self,
         terminal_runtimes: &mut TerminalRuntimeRegistry,
         mouse: MouseEvent,
+        render_context: Option<&crate::ui::ClientRenderContext>,
     ) -> Option<MouseAction> {
         if self.mode == Mode::Onboarding {
             self.handle_onboarding_mouse(mouse);
@@ -105,14 +106,14 @@ impl AppState {
         }
 
         if self.mode == Mode::Terminal
-            && self.clickable_toast_at(mouse.column, mouse.row)
+            && self.clickable_toast_at(mouse.column, mouse.row, render_context)
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         {
             return Some(MouseAction::FocusToastTarget);
         }
 
         if self.mode == Mode::Terminal
-            && self.clickable_toast_at(mouse.column, mouse.row)
+            && self.clickable_toast_at(mouse.column, mouse.row, render_context)
             && matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
         {
             return None;
@@ -1421,11 +1422,19 @@ impl AppState {
         let _ = pane_id;
     }
 
-    fn clickable_toast_at(&self, col: u16, row: u16) -> bool {
+    fn clickable_toast_at(
+        &self,
+        col: u16,
+        row: u16,
+        render_context: Option<&crate::ui::ClientRenderContext>,
+    ) -> bool {
+        let toast_hit_area = render_context
+            .map(crate::ui::ClientRenderContext::toast_hit_area)
+            .unwrap_or_else(|| self.view.toast_hit_area());
         self.toast
             .as_ref()
             .is_some_and(|toast| toast.target.is_some())
-            && rect_contains(self.view.toast_hit_area, col, row)
+            && rect_contains(toast_hit_area, col, row)
     }
 
     #[cfg(test)]
@@ -2405,7 +2414,7 @@ mod tests {
             });
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
 
-        let hit = app.state.view.toast_hit_area;
+        let hit = app.state.view.toast_hit_area();
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             hit.x + 1,
@@ -2424,6 +2433,103 @@ mod tests {
             app.state.workspaces[0].focused_pane_id(),
             Some(app.state.workspaces[0].tabs[0].root_pane)
         );
+    }
+
+    fn app_with_clickable_toast_and_all_banners() -> (crate::app::App, crate::layout::PaneId) {
+        let mut app = app_for_mouse_test();
+        let active = Workspace::test_new("active");
+        let background = Workspace::test_new("background");
+        let target_pane = background.tabs[0].root_pane;
+        let workspace_id = background.id.clone();
+
+        app.state.workspaces = vec![active, background];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.config_diagnostic = Some("shared first\nshared second".into());
+        app.state.toast_config.herdr.position = crate::config::ToastHerdrPosition::TopLeft;
+        app.state.toast_config.clipboard.position =
+            crate::config::ToastClipboardPosition::TopCenter;
+        app.state.copy_feedback = Some(crate::app::state::CopyFeedback {
+            message: "copied".into(),
+        });
+        app.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::Finished,
+            title: "pi finished".into(),
+            context: "background · 2".into(),
+            position: None,
+            target: Some(crate::app::state::ToastTarget {
+                workspace_id,
+                pane_id: target_pane,
+            }),
+        });
+        (app, target_pane)
+    }
+
+    fn click_rendered_toast_with_all_banners(area: Rect) {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let (mut app, target_pane) = app_with_clickable_toast_and_all_banners();
+        let client_notice = "client-local notice";
+        crate::ui::compute_view_with_runtime_registry(&mut app.state, &app.terminal_runtimes, area);
+        let render_context =
+            crate::ui::ClientRenderContext::compute(&app.state, Some(client_notice), area);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height))
+            .expect("notification mouse test terminal");
+        terminal
+            .draw(|frame| {
+                crate::ui::render_with_runtime_registry_and_client_local_projection(
+                    &app.state,
+                    &app.terminal_runtimes,
+                    None,
+                    &render_context,
+                    frame,
+                );
+            })
+            .expect("render all notification banners");
+
+        let hit = render_context.toast_hit_area();
+        let mut rendered_hit_text = String::new();
+        for row in hit.y..hit.y.saturating_add(hit.height) {
+            for col in hit.x..hit.x.saturating_add(hit.width) {
+                rendered_hit_text.push_str(
+                    terminal
+                        .backend()
+                        .buffer()
+                        .cell((col, row))
+                        .expect("toast hit cell")
+                        .symbol(),
+                );
+            }
+        }
+        assert!(
+            rendered_hit_text.contains("background"),
+            "{rendered_hit_text}"
+        );
+
+        app.handle_mouse_with_host_client_local_actions_and_render_context(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                hit.x.saturating_add(1).min(area.width.saturating_sub(1)),
+                hit.y,
+            ),
+            Some(&render_context),
+        );
+
+        assert_eq!(app.state.active, Some(1));
+        assert_eq!(app.state.workspaces[1].focused_pane_id(), Some(target_pane));
+        assert!(app.state.toast.is_none());
+    }
+
+    #[test]
+    fn clicking_visible_desktop_toast_with_all_banners_focuses_target() {
+        click_rendered_toast_with_all_banners(Rect::new(0, 0, 65, 7));
+    }
+
+    #[test]
+    fn clicking_visible_mobile_toast_with_all_banners_focuses_target() {
+        click_rendered_toast_with_all_banners(Rect::new(0, 0, 44, 7));
     }
 
     #[test]
@@ -2450,7 +2556,7 @@ mod tests {
         app.state.mode = Mode::Settings;
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
 
-        let hit = app.state.view.toast_hit_area;
+        let hit = app.state.view.toast_hit_area();
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             hit.x + 1,

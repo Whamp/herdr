@@ -30,20 +30,24 @@ impl ClientRenderState {
 
     pub(crate) fn reset_baseline(&mut self) {
         match self {
-            Self::Semantic { last_frame } => *last_frame = None,
+            Self::Semantic { last_frame, .. } => *last_frame = None,
             Self::TerminalAnsi { blit_encoder, .. } => *blit_encoder = BlitEncoder::new(),
         }
     }
 
     pub(crate) fn reset_semantic_input_baseline(&mut self) {
-        if let Self::Semantic { last_frame } = self {
+        if let Self::Semantic { last_frame, .. } = self {
             *last_frame = None;
         }
     }
 
-    pub(crate) fn prepare_frame(&mut self, frame: FrameData) -> Option<PreparedRender> {
+    pub(crate) fn prepare_frame(
+        &mut self,
+        frame: FrameData,
+        render_context: crate::ui::ClientRenderContext,
+    ) -> Option<PreparedRender> {
         match self {
-            Self::Semantic { last_frame } => {
+            Self::Semantic { last_frame, .. } => {
                 if last_frame.as_ref() == Some(&frame) {
                     crate::render_prof::event("prepare_frame.semantic.skip_current");
                     return None;
@@ -51,9 +55,12 @@ impl ClientRenderState {
                 crate::render_prof::event("prepare_frame.semantic.changed");
                 Some(PreparedRender::Semantic {
                     message: ServerMessage::Frame(frame),
+                    render_context,
                 })
             }
-            Self::TerminalAnsi { blit_encoder, seq } => {
+            Self::TerminalAnsi {
+                blit_encoder, seq, ..
+            } => {
                 if blit_encoder.is_current(&frame) {
                     crate::render_prof::event("prepare_frame.ansi.skip_current");
                     return None;
@@ -81,6 +88,7 @@ impl ClientRenderState {
                     }),
                     frame,
                     encoded: Some(encoded),
+                    render_context,
                 })
             }
         }
@@ -88,7 +96,7 @@ impl ClientRenderState {
 
     pub(crate) fn last_frame(&self) -> Option<&FrameData> {
         match self {
-            Self::Semantic { last_frame } => last_frame.as_ref(),
+            Self::Semantic { last_frame, .. } => last_frame.as_ref(),
             Self::TerminalAnsi { blit_encoder, .. } => blit_encoder.last_frame(),
         }
     }
@@ -99,8 +107,11 @@ impl ClientRenderState {
                 Self::Semantic { last_frame },
                 PreparedRender::Semantic {
                     message: ServerMessage::Frame(frame),
+                    ..
                 },
-            ) => *last_frame = Some(frame),
+            ) => {
+                *last_frame = Some(frame);
+            }
             (
                 Self::TerminalAnsi { blit_encoder, seq },
                 PreparedRender::TerminalAnsi {
@@ -153,27 +164,44 @@ fn rfind_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 pub(crate) enum PreparedRender {
     Semantic {
         message: ServerMessage,
+        render_context: crate::ui::ClientRenderContext,
     },
     TerminalAnsi {
         message: ServerMessage,
         frame: FrameData,
         encoded: Option<EncodedBlit>,
+        render_context: crate::ui::ClientRenderContext,
     },
 }
 
 impl PreparedRender {
     pub(crate) fn message(&self) -> &ServerMessage {
         match self {
-            Self::Semantic { message } | Self::TerminalAnsi { message, .. } => message,
+            Self::Semantic { message, .. } | Self::TerminalAnsi { message, .. } => message,
         }
     }
 
-    pub(crate) fn into_frame(self) -> Option<FrameData> {
+    pub(crate) fn render_context(&self) -> &crate::ui::ClientRenderContext {
+        match self {
+            Self::Semantic { render_context, .. } | Self::TerminalAnsi { render_context, .. } => {
+                render_context
+            }
+        }
+    }
+
+    pub(crate) fn into_frame_and_render_context(
+        self,
+    ) -> Option<(FrameData, crate::ui::ClientRenderContext)> {
         match self {
             Self::Semantic {
                 message: ServerMessage::Frame(frame),
-            } => Some(frame),
-            Self::TerminalAnsi { frame, .. } => Some(frame),
+                render_context,
+            } => Some((frame, render_context)),
+            Self::TerminalAnsi {
+                frame,
+                render_context,
+                ..
+            } => Some((frame, render_context)),
             _ => None,
         }
     }
@@ -290,6 +318,31 @@ pub(crate) fn render_virtual_with_runtime_registry(
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
+    let (buffer, cursor, _) = render_virtual_with_runtime_registry_and_client_local_preference(
+        app_state,
+        terminal_runtimes,
+        None,
+        None,
+        area,
+        resize_panes,
+        cell_size,
+    );
+    (buffer, cursor)
+}
+
+pub(crate) fn render_virtual_with_runtime_registry_and_client_local_preference(
+    app_state: &mut AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    remote_link_preference: Option<crate::remote_link_preference::RemoteLinkPreferenceView>,
+    client_notice: Option<&str>,
+    area: Rect,
+    resize_panes: bool,
+    cell_size: crate::kitty_graphics::HostCellSize,
+) -> (
+    ratatui::buffer::Buffer,
+    Option<CursorState>,
+    crate::ui::ClientRenderContext,
+) {
     let pre_compute_suppresses_focused_terminal_cursor =
         focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes);
     if resize_panes {
@@ -297,6 +350,7 @@ pub(crate) fn render_virtual_with_runtime_registry(
     } else {
         crate::ui::compute_view_without_resizing_panes(app_state, terminal_runtimes, area);
     }
+    let render_context = crate::ui::ClientRenderContext::compute(app_state, client_notice, area);
     let suppress_focused_terminal_cursor = pre_compute_suppresses_focused_terminal_cursor
         || focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes);
 
@@ -305,7 +359,13 @@ pub(crate) fn render_virtual_with_runtime_registry(
 
     terminal
         .draw(|frame| {
-            crate::ui::render_with_runtime_registry(app_state, terminal_runtimes, frame);
+            crate::ui::render_with_runtime_registry_and_client_local_projection(
+                app_state,
+                terminal_runtimes,
+                remote_link_preference,
+                &render_context,
+                frame,
+            );
         })
         .expect("render to TestBackend should never fail");
 
@@ -320,7 +380,7 @@ pub(crate) fn render_virtual_with_runtime_registry(
         })
     };
 
-    (buffer, cursor)
+    (buffer, cursor, render_context)
 }
 
 /// Renders one server-owned terminal directly for `terminal attach` clients.
