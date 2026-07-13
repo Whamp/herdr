@@ -108,15 +108,40 @@ impl App {
         changed
     }
 
+    #[cfg(test)]
     pub(super) async fn handle_raw_input_batch(
         &mut self,
         first: crate::raw_input::RawInputEvent,
     ) -> bool {
-        let mut changed = self.handle_raw_input_event(first).await;
+        self.handle_raw_input_batch_with_client_local_action(first, &mut |_| {})
+            .await
+    }
+
+    pub(super) async fn handle_raw_input_batch_with_client_local_action(
+        &mut self,
+        first: crate::raw_input::RawInputEvent,
+        on_client_local_action: &mut impl FnMut(
+            crate::remote_link_preference::RemoteLinkPreferenceAction,
+        ),
+    ) -> bool {
+        let (mut changed, action) = self
+            .handle_raw_input_event_with_client_local_action(first)
+            .await;
+        if let Some(action) = action {
+            on_client_local_action(action);
+        }
 
         while let Some(rx) = self.input_rx.as_mut() {
             match rx.try_recv() {
-                Ok(event) => changed |= self.handle_raw_input_event(event).await,
+                Ok(event) => {
+                    let (event_changed, action) = self
+                        .handle_raw_input_event_with_client_local_action(event)
+                        .await;
+                    changed |= event_changed;
+                    if let Some(action) = action {
+                        on_client_local_action(action);
+                    }
+                }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     self.input_rx = None;
@@ -128,11 +153,25 @@ impl App {
         changed
     }
 
+    #[cfg(test)]
     pub(super) async fn handle_raw_input_event(
         &mut self,
         event: crate::raw_input::RawInputEvent,
     ) -> bool {
+        self.handle_raw_input_event_with_client_local_action(event)
+            .await
+            .0
+    }
+
+    pub(crate) async fn handle_raw_input_event_with_client_local_action(
+        &mut self,
+        event: crate::raw_input::RawInputEvent,
+    ) -> (
+        bool,
+        Option<crate::remote_link_preference::RemoteLinkPreferenceAction>,
+    ) {
         let previous_mode = self.state.mode;
+        let mut client_local_action = None;
         let changed = match event {
             crate::raw_input::RawInputEvent::Key(key) => {
                 let key_id = repeat_key_identity(&key);
@@ -143,14 +182,15 @@ impl App {
                         } else {
                             self.suppressed_repeat_keys.insert(key_id);
                         }
-                        self.handle_key(key).await;
+                        client_local_action = self.handle_key_with_client_local_action(key).await;
                         true
                     }
                     crossterm::event::KeyEventKind::Repeat => {
                         if self.state.mode == Mode::Terminal
                             && !self.suppressed_repeat_keys.contains(&key_id)
                         {
-                            self.handle_key(key).await;
+                            client_local_action =
+                                self.handle_key_with_client_local_action(key).await;
                             true
                         } else {
                             false
@@ -168,9 +208,12 @@ impl App {
             }
             crate::raw_input::RawInputEvent::Mouse(mouse) => {
                 if self.state.mouse_capture {
-                    if let Some(action) = self.handle_mouse(mouse) {
+                    let (host_action, preference_action) =
+                        self.handle_mouse_with_host_and_client_local_actions(mouse);
+                    if let Some(action) = host_action {
                         consume_monolithic_host_action(action);
                     }
+                    client_local_action = preference_action;
                 } else {
                     self.state
                         .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
@@ -200,7 +243,7 @@ impl App {
         };
         self.sync_prefix_input_source(previous_mode);
         self.shutdown_detached_terminal_runtimes();
-        changed
+        (changed, client_local_action)
     }
 
     fn handle_resize_poll(&mut self) -> bool {

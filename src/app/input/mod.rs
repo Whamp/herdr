@@ -76,15 +76,24 @@ enum ModifiedUrlClick {
 // ---------------------------------------------------------------------------
 
 impl App {
+    #[cfg(test)]
     pub(super) async fn handle_key(&mut self, key: TerminalKey) {
+        self.handle_key_with_client_local_action(key).await;
+    }
+
+    pub(crate) async fn handle_key_with_client_local_action(
+        &mut self,
+        key: TerminalKey,
+    ) -> Option<crate::remote_link_preference::RemoteLinkPreferenceAction> {
         let key_event = key.as_key_event();
         if modal_paste_target_active(&self.state) && is_modal_paste_shortcut(&key_event) {
             if let Some(text) = crate::platform::read_clipboard_text() {
                 self.paste_into_active_text_input(&text);
             }
-            return;
+            return None;
         }
 
+        let mut client_local_action = None;
         match self.state.mode {
             Mode::Terminal => self.handle_terminal_key(key).await,
             Mode::Prefix => self.handle_prefix_key(key),
@@ -106,7 +115,9 @@ impl App {
                 Mode::ContextMenu => {
                     self.handle_context_menu_key_via_api(key_event);
                 }
-                Mode::Settings => self.handle_settings_key(key_event),
+                Mode::Settings => {
+                    client_local_action = self.handle_settings_key(key_event);
+                }
                 Mode::GlobalMenu => handle_global_menu_key(&mut self.state, key_event),
                 Mode::KeybindHelp => handle_keybind_help_key(&mut self.state, key_event),
                 Mode::Navigator => {
@@ -115,6 +126,7 @@ impl App {
                 Mode::Terminal => unreachable!(),
             },
         }
+        client_local_action
     }
 
     pub(super) async fn handle_paste(&mut self, text: String) {
@@ -246,8 +258,28 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<HostAction> {
+        self.handle_mouse_with_host_and_client_local_actions(mouse)
+            .0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handle_mouse_with_client_local_action(
+        &mut self,
+        mouse: MouseEvent,
+    ) -> Option<crate::remote_link_preference::RemoteLinkPreferenceAction> {
+        self.handle_mouse_with_host_and_client_local_actions(mouse)
+            .1
+    }
+
+    pub(super) fn handle_mouse_with_host_and_client_local_actions(
+        &mut self,
+        mouse: MouseEvent,
+    ) -> (
+        Option<HostAction>,
+        Option<crate::remote_link_preference::RemoteLinkPreferenceAction>,
+    ) {
         if self.handle_overlay_mouse(mouse) {
-            return None;
+            return (None, None);
         }
 
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -266,18 +298,19 @@ impl App {
                 self.state.sidebar_width_auto = false;
                 self.state.mark_session_dirty();
                 self.state.drag = None;
-                return None;
+                return (None, None);
             }
         }
 
         match self.handle_modified_url_click(mouse) {
             ModifiedUrlClick::NotHandled => {}
-            ModifiedUrlClick::Handled => return None,
-            ModifiedUrlClick::HostAction(action) => return Some(action),
+            ModifiedUrlClick::Handled => return (None, None),
+            ModifiedUrlClick::HostAction(action) => return (Some(action), None),
         }
 
         let handled_pane_double_click = self.handle_pane_double_click(mouse);
 
+        let mut client_local_action = None;
         let previous_agent_panel_sort = self.state.agent_panel_sort;
         let previous_settings_section = self.state.settings.section;
         if !handled_pane_double_click {
@@ -318,6 +351,9 @@ impl App {
                         }
                         SettingsAction::SaveSwitchAsciiInputSourceInPrefix(enabled) => {
                             self.save_switch_ascii_input_source_in_prefix(enabled)
+                        }
+                        SettingsAction::ChangeRemoteLinkPreference(action) => {
+                            client_local_action = Some(action)
                         }
                         SettingsAction::InstallRecommendedIntegrations => {
                             self.install_recommended_integrations()
@@ -381,7 +417,7 @@ impl App {
                 Some(std::time::Instant::now() + super::SELECTION_AUTOSCROLL_INTERVAL);
         }
 
-        None
+        (None, client_local_action)
     }
 
     fn handle_modified_url_click(&mut self, mouse: MouseEvent) -> ModifiedUrlClick {

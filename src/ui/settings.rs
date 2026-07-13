@@ -32,7 +32,17 @@ pub(crate) fn settings_popup_height(app: &AppState) -> u16 {
     (14 + list_rows + footer_rows).max(SETTINGS_POPUP_BASE_HEIGHT)
 }
 
+#[cfg(test)]
 pub(super) fn render_settings_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+    render_settings_overlay_with_client_local_preference(app, None, frame, area);
+}
+
+pub(super) fn render_settings_overlay_with_client_local_preference(
+    app: &AppState,
+    remote_link_preference: Option<crate::remote_link_preference::RemoteLinkPreferenceView>,
+    frame: &mut Frame,
+    area: Rect,
+) {
     use crate::app::state::SettingsSection;
 
     let p = &app.palette;
@@ -150,7 +160,7 @@ pub(super) fn render_settings_overlay(app: &AppState, frame: &mut Frame, area: R
             );
         }
         SettingsSection::Experiments => {
-            render_settings_experiments(app, frame, content_area);
+            render_settings_experiments(app, remote_link_preference, frame, content_area);
         }
         SettingsSection::Integrations => {
             render_settings_integrations(app, frame, content_area);
@@ -413,7 +423,12 @@ fn render_settings_toggle(
     );
 }
 
-fn render_settings_experiments(app: &AppState, frame: &mut Frame, area: Rect) {
+fn render_settings_experiments(
+    app: &AppState,
+    remote_link_preference: Option<crate::remote_link_preference::RemoteLinkPreferenceView>,
+    frame: &mut Frame,
+    area: Rect,
+) {
     let p = &app.palette;
     let [desc_area, _, list_area] = Layout::vertical([
         Constraint::Length(2),
@@ -430,7 +445,21 @@ fn render_settings_experiments(app: &AppState, frame: &mut Frame, area: Rect) {
     );
 
     for (idx, setting) in ExperimentSetting::ALL.iter().copied().enumerate() {
-        let marker = if setting.enabled(app) { "[✓]" } else { "[ ]" };
+        let value = match setting {
+            ExperimentSetting::PaneHistory => Some((app.pane_history_persistence_enabled(), false)),
+            ExperimentSetting::SwitchAsciiInputSourceInPrefix => {
+                Some((app.switch_ascii_input_source_in_prefix_enabled(), false))
+            }
+            ExperimentSetting::OpenRemoteLinksOnClient => remote_link_preference
+                .map(|preference| (preference.confirmed(), preference.saving())),
+        };
+        let suffix = value
+            .map(|(confirmed, saving)| {
+                let marker = if confirmed { "[✓]" } else { "[ ]" };
+                let saving = if saving { " saving…" } else { "" };
+                format!(" {marker}{saving}")
+            })
+            .unwrap_or_default();
         let style = if app.settings.list.selected == idx {
             Style::default()
                 .bg(p.surface0)
@@ -441,7 +470,7 @@ fn render_settings_experiments(app: &AppState, frame: &mut Frame, area: Rect) {
         };
         let row = Rect::new(list_area.x, list_area.y + idx as u16, list_area.width, 1);
         frame.render_widget(
-            Paragraph::new(format!(" {} {marker}", setting.label())).style(style),
+            Paragraph::new(format!(" {}{suffix}", setting.label())).style(style),
             row,
         );
     }
@@ -527,5 +556,72 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("switch to ascii input source in prefix (macOS) [✓]"));
+    }
+
+    #[test]
+    fn experiments_without_client_local_view_does_not_project_remote_link_state() {
+        let mut app = AppState::test_new();
+        app.settings.section = SettingsSection::Experiments;
+        app.settings.list.selected = 2;
+        app.mode = Mode::Settings;
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("test terminal should initialize");
+        terminal
+            .draw(|frame| render_settings_overlay(&app, frame, Rect::new(0, 0, 80, 24)))
+            .expect("settings overlay should render");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("open remote links on this device"));
+        assert!(!rendered.contains("open remote links on this device [ ]"));
+        assert!(!rendered.contains("open remote links on this device [✓]"));
+        assert!(!rendered.contains("open remote links on this device saving…"));
+    }
+
+    #[test]
+    fn experiments_renders_pending_device_remote_link_preference_third() {
+        let mut app = AppState::test_new();
+        app.settings.section = SettingsSection::Experiments;
+        app.settings.list.selected = 2;
+        app.mode = Mode::Settings;
+        let mut preference = crate::remote_link_preference::RemoteLinkPreference::new(false);
+        preference.apply(crate::remote_link_preference::RemoteLinkPreferenceAction::Toggle);
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("test terminal should initialize");
+        terminal
+            .draw(|frame| {
+                render_settings_overlay_with_client_local_preference(
+                    &app,
+                    Some(preference.view()),
+                    frame,
+                    Rect::new(0, 0, 80, 24),
+                )
+            })
+            .expect("settings overlay should render");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        let pane_history = rendered
+            .find("pane screen history")
+            .expect("pane history row should render");
+        let ascii_input = rendered
+            .find("switch to ascii input source in prefix (macOS)")
+            .expect("ascii input row should render");
+        let remote_links = rendered
+            .find("open remote links on this device [ ] saving…")
+            .expect("pending remote-link row should render");
+        assert!(pane_history < ascii_input && ascii_input < remote_links);
     }
 }

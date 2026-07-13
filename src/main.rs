@@ -88,6 +88,7 @@ mod pty;
 mod raw_input;
 mod release_notes;
 mod remote;
+mod remote_link_preference;
 mod render_prof;
 mod selection;
 mod server;
@@ -384,6 +385,8 @@ pane_history = false
 # even when a CJK IME is active, then restore the previous input source
 # when prefix mode exits. macOS only; best-effort. Default: false.
 # switch_ascii_input_source_in_prefix = false
+# Open eligible links from remote sessions on this device. Default: false.
+# open_remote_links_on_client = false
 # Expose the focused pane's cursor to the outer terminal so macOS input
 # methods keep tracking the candidate window when TUIs paint their own
 # cursor (Claude Code, pi, codex). Trade-off: extra cursor visible for
@@ -791,7 +794,10 @@ fn main() -> io::Result<()> {
             api_rx,
             event_hub,
         );
-        let result = app.run(&mut terminal).await;
+        let mut remote_link_preference = remote_link_preference::RemoteLinkPreference::new(
+            config.experimental.open_remote_links_on_client,
+        );
+        let result = app.run(&mut terminal, &mut remote_link_preference).await;
 
         // Reset modifyOtherKeys if we enabled it.
         if modify_other_keys_mode.is_some() {

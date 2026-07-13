@@ -874,7 +874,11 @@ impl App {
         self.prefix_input_source = source;
     }
 
-    pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+    pub async fn run(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        remote_link_preference: &mut crate::remote_link_preference::RemoteLinkPreference,
+    ) -> io::Result<()> {
         if self.input_rx.is_none() {
             self.input_rx = Some(crate::raw_input::spawn_input_reader());
         }
@@ -884,6 +888,26 @@ impl App {
         let mut host_mouse_capture_active = self.state.mouse_capture;
 
         while !self.state.should_quit {
+            if let Some(settlement) = remote_link_preference.settle_presented() {
+                match settlement {
+                    crate::remote_link_preference::RemoteLinkPreferenceSettlement::Confirmed => {
+                        tracing::debug!(
+                            effective = remote_link_preference.view().effective(),
+                            "device-local remote-link preference confirmed"
+                        );
+                    }
+                    crate::remote_link_preference::RemoteLinkPreferenceSettlement::Failed(
+                        stage,
+                    ) => {
+                        tracing::warn!(
+                            failure_stage = ?stage,
+                            "device-local remote-link preference mutation failed"
+                        );
+                    }
+                }
+                needs_render = true;
+            }
+
             if self.render_dirty.load(Ordering::Acquire) {
                 needs_render = true;
             }
@@ -1000,6 +1024,16 @@ impl App {
                 needs_render = true;
             }
 
+            if self.take_config_reloaded_from_disk() {
+                match remote_link_preference.reload_from_disk() {
+                    Ok(changed) => needs_render |= changed,
+                    Err(stage) => tracing::warn!(
+                        failure_stage = ?stage,
+                        "device-local remote-link preference reload failed"
+                    ),
+                }
+            }
+
             if self.ensure_default_workspace() {
                 needs_render = true;
             }
@@ -1037,12 +1071,14 @@ impl App {
                             area,
                         );
                     }
-                    crate::ui::render_with_runtime_registry(
+                    crate::ui::render_with_runtime_registry_and_client_local_preference(
                         &self.state,
                         &self.terminal_runtimes,
+                        Some(remote_link_preference.view()),
                         frame,
                     );
                 })?;
+                remote_link_preference.mark_presented();
                 if kitty_graphics_enabled {
                     crate::kitty_graphics::paint_local_pane_graphics(
                         &self.state,
@@ -1093,7 +1129,18 @@ impl App {
                     }
                 }
                 LoopEvent::RawInput(input) => {
-                    if self.handle_raw_input_batch(input).await {
+                    if self
+                        .handle_raw_input_batch_with_client_local_action(input, &mut |action| {
+                            if remote_link_preference.apply(action)
+                                == crate::remote_link_preference::MutationDisposition::Suppressed
+                            {
+                                tracing::debug!(
+                                    "duplicate device-local remote-link preference toggle suppressed"
+                                );
+                            }
+                        })
+                        .await
+                    {
                         needs_render = true;
                     }
                 }
