@@ -201,6 +201,8 @@ pub struct HeadlessServer {
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
+    external_open_requests: crate::server::external_open::ExternalOpenRequests,
+    external_open_clock: crate::server::monotonic_clock::MonotonicClock,
     #[cfg(unix)]
     next_client_id: u64,
     /// The client currently driving the shared pane runtime size, theme, and input keybindings.
@@ -398,6 +400,8 @@ impl HeadlessServer {
             client_socket_path: client_path,
             client_socket_identity,
             clients: HashMap::new(),
+            external_open_requests: crate::server::external_open::ExternalOpenRequests::default(),
+            external_open_clock: crate::server::monotonic_clock::MonotonicClock::default(),
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
@@ -552,15 +556,19 @@ impl HeadlessServer {
             }
 
             // 8. Wait for next event.
-            let next_deadline = self
-                .app
-                .next_headless_loop_deadline_with_git_refresh(
+            let next_deadline = [
+                self.app.next_headless_loop_deadline_with_git_refresh(
                     now,
                     needs_render,
                     self.has_app_client(),
-                )
-                .map(|deadline| deadline.min(now + CLIENT_ACCEPT_POLL_INTERVAL))
-                .or(Some(now + CLIENT_ACCEPT_POLL_INTERVAL));
+                ),
+                self.external_open_requests.next_deadline(),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .map(|deadline| deadline.min(now + CLIENT_ACCEPT_POLL_INTERVAL))
+            .or(Some(now + CLIENT_ACCEPT_POLL_INTERVAL));
             let event = {
                 tokio::select! {
                     maybe_api = self.app.api_rx.recv() => match maybe_api {
@@ -1197,6 +1205,7 @@ impl HeadlessServer {
         self.server_config_diagnostic = server_config_diagnostic;
         self.server_config_diagnostic_without_keybindings =
             server_config_diagnostic_without_keybindings;
+        self.app.state.request_client_config_reload = true;
         self.sync_foreground_client_state();
         report
     }
@@ -1247,6 +1256,11 @@ impl HeadlessServer {
 
     fn remove_client(&mut self, client_id: u64) -> bool {
         let was_foreground = self.foreground_client_id == Some(client_id);
+        for closed in self.external_open_requests.connection_lost(client_id) {
+            self.report_external_open_transition(
+                crate::server::external_open::ExternalOpenTransition::Closed(closed),
+            );
+        }
         self.send_client_graphics_cleanup(client_id);
         let removed = self.clients.remove(&client_id);
         if let Some(removed) = removed {
@@ -1286,6 +1300,13 @@ impl HeadlessServer {
         let foreground_changed = self.remove_client(client_id);
         if needs_shared_resize || foreground_changed {
             self.resize_shared_runtime_to_effective_size();
+        }
+    }
+
+    fn remove_all_clients(&mut self) {
+        let client_ids = self.clients.keys().copied().collect::<Vec<_>>();
+        for client_id in client_ids {
+            let _ = self.remove_client(client_id);
         }
     }
 
@@ -2170,7 +2191,7 @@ impl HeadlessServer {
             return;
         }
         self.app.state.request_client_config_reload = false;
-        self.send_to_all_clients(ServerMessage::ReloadSoundConfig);
+        self.send_to_all_clients(ServerMessage::ReloadClientConfig);
     }
 
     /// Encodes a server message into a length-prefixed frame.
@@ -2440,8 +2461,11 @@ impl HeadlessServer {
             self.resize_shared_runtime_to_effective_size_before_input();
         }
         let theme_changed = self.update_client_host_theme_from_events(client_id, &events);
-        self.app
+        let host_actions = self
+            .app
             .route_client_events(events, self.foreground_client_id == Some(client_id));
+        let accepted_at = self.external_open_clock.now();
+        self.handle_host_actions(client_id, host_actions, accepted_at);
         if self.app.take_config_reloaded_from_disk() {
             self.reload_server_config(false);
         } else {
@@ -2470,6 +2494,174 @@ impl HeadlessServer {
         }
     }
 
+    fn handle_host_actions(
+        &mut self,
+        client_id: u64,
+        actions: Vec<crate::app::HostAction>,
+        accepted_at: Instant,
+    ) {
+        for action in actions {
+            match action {
+                crate::app::HostAction::OpenExternalUrl { url } => {
+                    let policy = self.clients.get(&client_id).and_then(|client| {
+                        client
+                            .is_full_app_client()
+                            .then_some(client.external_open_policy)
+                            .flatten()
+                    });
+                    match policy {
+                        Some(crate::protocol::ExternalOpenPolicy::Disabled) => {
+                            if crate::platform::open_url(&url).is_err() {
+                                warn!("server platform opener rejected external URL");
+                            }
+                        }
+                        Some(crate::protocol::ExternalOpenPolicy::Enabled) => {
+                            let Some(dispatch) =
+                                self.external_open_requests.start(client_id, accepted_at)
+                            else {
+                                warn!("external-open request id space exhausted");
+                                continue;
+                            };
+                            let prepare =
+                                Self::frame_server_message(&ServerMessage::ExternalOpenPrepare {
+                                    request_id: dispatch.request_id(),
+                                    url,
+                                });
+                            let writer = self.clients.get(&client_id).and_then(|client| {
+                                client.writer.as_ref().map(|writer| writer.control.clone())
+                            });
+                            #[cfg(debug_assertions)]
+                            if external_open_delivery_failure_armed_for_test() {
+                                if let Some(writer) = writer.as_ref() {
+                                    writer.fail_next_send_for_test();
+                                }
+                            }
+                            let delivered = prepare
+                                .ok()
+                                .zip(writer)
+                                .is_some_and(|(framed, writer)| writer.send(framed).is_ok());
+                            if !delivered {
+                                let transition = self
+                                    .external_open_requests
+                                    .delivery_failed(client_id, dispatch.request_id());
+                                self.report_external_open_transition(transition);
+                                self.remove_client_and_resize_if_needed(client_id);
+                            }
+                        }
+                        None => {
+                            debug!("ignored external-open host action from non-app client");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn report_external_open_transition(
+        &mut self,
+        transition: crate::server::external_open::ExternalOpenTransition,
+    ) {
+        if let crate::server::external_open::ExternalOpenTransition::Closed(closed) = transition {
+            let now = self.external_open_clock.now();
+            info!(
+                request_id = closed.request_id,
+                lifecycle_phase = "terminal",
+                outcome = closed.outcome.canonical_outcome(),
+                elapsed_ms = closed.elapsed_ms(now),
+                commit_state = closed.commit_state(),
+                forward_status = closed.forward_status(),
+                "external-open request settled"
+            );
+        }
+    }
+
+    fn update_external_open_policy(
+        &mut self,
+        client_id: u64,
+        policy: crate::protocol::ExternalOpenPolicy,
+    ) {
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return;
+        };
+        if !client.is_full_app_client() {
+            debug!("ignored external-open policy from non-app client");
+            return;
+        }
+        client.external_open_policy = Some(policy);
+        info!(
+            lifecycle_phase = "policy_change",
+            outcome = "applied",
+            "external-open policy updated"
+        );
+        if policy != crate::protocol::ExternalOpenPolicy::Disabled {
+            return;
+        }
+
+        let closed = self
+            .external_open_requests
+            .cancel_preparing_for_client(client_id);
+        for closed in closed {
+            self.send_to_client(
+                client_id,
+                ServerMessage::ExternalOpenCancel {
+                    request_id: closed.request_id,
+                },
+            );
+            self.report_external_open_transition(
+                crate::server::external_open::ExternalOpenTransition::Closed(closed),
+            );
+        }
+    }
+
+    fn handle_external_open_ready(
+        &mut self,
+        client_id: u64,
+        request_id: u64,
+        target: crate::protocol::ExternalOpenTarget,
+        now: Instant,
+    ) {
+        let commit = Self::frame_server_message(&ServerMessage::ExternalOpenCommit { request_id });
+        let writer = self.clients.get(&client_id).and_then(|client| {
+            client
+                .is_full_app_client()
+                .then(|| client.writer.as_ref().map(|writer| writer.control.clone()))
+                .flatten()
+        });
+        let transition =
+            self.external_open_requests
+                .ready(client_id, request_id, target, now, |_| {
+                    commit
+                        .ok()
+                        .zip(writer)
+                        .is_some_and(|(framed, writer)| writer.send(framed).is_ok())
+                });
+        let delivery_failed = matches!(
+            transition,
+            crate::server::external_open::ExternalOpenTransition::Closed(
+                crate::server::external_open::ExternalOpenClosed {
+                    outcome: crate::server::external_open::ExternalOpenTerminalOutcome::ClientDeliveryFailed,
+                    ..
+                }
+            )
+        );
+        let timed_out_before_commit = matches!(
+            transition,
+            crate::server::external_open::ExternalOpenTransition::Closed(
+                crate::server::external_open::ExternalOpenClosed {
+                    outcome: crate::server::external_open::ExternalOpenTerminalOutcome::TimedOutBeforeCommit,
+                    ..
+                }
+            )
+        );
+        if timed_out_before_commit {
+            self.send_to_client(client_id, ServerMessage::ExternalOpenCancel { request_id });
+        }
+        self.report_external_open_transition(transition);
+        if delivery_failed {
+            self.remove_client_and_resize_if_needed(client_id);
+        }
+    }
+
     fn handle_server_event(&mut self, ev: ServerEvent) -> bool {
         if self.handoff_in_progress && Self::ignore_client_event_during_handoff(&ev) {
             return false;
@@ -2486,6 +2678,7 @@ impl HeadlessServer {
                 writer,
                 render_encoding,
                 direct_attach_requested,
+                external_open_policy,
             } => {
                 if self.handoff_in_progress {
                     if let Ok(message) =
@@ -2526,6 +2719,7 @@ impl HeadlessServer {
                         last_activity,
                         render_encoding,
                         direct_attach_requested,
+                        external_open_policy,
                         Some(writer),
                     ),
                 );
@@ -2629,6 +2823,43 @@ impl HeadlessServer {
                     .map(crate::protocol::ClientInputEvent::to_raw_input_event)
                     .collect();
                 self.handle_client_input_events(client_id, events)
+            }
+            ServerEvent::ExternalOpenPolicyUpdate { client_id, policy } => {
+                self.update_external_open_policy(client_id, policy);
+                false
+            }
+            ServerEvent::ExternalOpenReady {
+                client_id,
+                request_id,
+                target,
+            } => {
+                let now = self.external_open_clock.now();
+                self.handle_external_open_ready(client_id, request_id, target, now);
+                false
+            }
+            ServerEvent::ExternalOpenPreparationFailed {
+                client_id,
+                request_id,
+                reason,
+            } => {
+                let now = self.external_open_clock.now();
+                let transition = self
+                    .external_open_requests
+                    .preparation_failed(client_id, request_id, reason, now);
+                self.report_external_open_transition(transition);
+                false
+            }
+            ServerEvent::ExternalOpenResult {
+                client_id,
+                request_id,
+                result,
+            } => {
+                let now = self.external_open_clock.now();
+                let transition = self
+                    .external_open_requests
+                    .result(client_id, request_id, result, now);
+                self.report_external_open_transition(transition);
+                false
             }
             ServerEvent::ClientClipboardImage {
                 client_id,
@@ -2739,6 +2970,11 @@ impl HeadlessServer {
                     false
                 }
             }
+            ServerEvent::ClientWriterFailed { client_id } => {
+                info!(client_id, "client writer failed");
+                self.remove_client_and_resize_if_needed(client_id);
+                true
+            }
             ServerEvent::QuitSignal => {
                 // The quit check at the top of the loop handles this.
                 // No render needed — the next iteration will initiate shutdown.
@@ -2753,6 +2989,7 @@ impl HeadlessServer {
             ServerEvent::ClientConnected { .. }
                 | ServerEvent::ClientDisconnected { .. }
                 | ServerEvent::ClientWriterDrained { .. }
+                | ServerEvent::ClientWriterFailed { .. }
                 | ServerEvent::QuitSignal
         )
     }
@@ -3614,6 +3851,24 @@ impl HeadlessServer {
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
 
+        let external_open_now = self.external_open_clock.now();
+        let expired = self.external_open_requests.expire_due(external_open_now);
+        for closed in expired {
+            if closed.outcome
+                == crate::server::external_open::ExternalOpenTerminalOutcome::TimedOutBeforeCommit
+            {
+                self.send_to_client(
+                    closed.client_id,
+                    ServerMessage::ExternalOpenCancel {
+                        request_id: closed.request_id,
+                    },
+                );
+            }
+            self.report_external_open_transition(
+                crate::server::external_open::ExternalOpenTransition::Closed(closed),
+            );
+        }
+
         self.app.sync_headless_animation_timer(now);
 
         // No resize polling needed — server has no terminal.
@@ -3787,13 +4042,8 @@ impl HeadlessServer {
         // Drain remaining API requests with server_unavailable.
         self.drain_api_requests_with_shutdown_check();
 
-        // Close all client connections.
-        let staged_files = self
-            .clients
-            .drain()
-            .flat_map(|(_, client)| client.staged_clipboard_files)
-            .collect::<Vec<_>>();
-        crate::server::clipboard_image::remove_files(staged_files);
+        // Close all client connections through the canonical lifecycle seam.
+        self.remove_all_clients();
 
         // Remove socket files.
         self.cleanup_sockets()?;
@@ -3820,12 +4070,7 @@ impl HeadlessServer {
 
 impl Drop for HeadlessServer {
     fn drop(&mut self) {
-        let staged_files = self
-            .clients
-            .drain()
-            .flat_map(|(_, client)| client.staged_clipboard_files)
-            .collect::<Vec<_>>();
-        crate::server::clipboard_image::remove_files(staged_files);
+        self.remove_all_clients();
         let _ = self.cleanup_sockets();
     }
 }
@@ -3850,6 +4095,14 @@ async fn sleep_until_or_pending(deadline: Option<Instant>) {
         Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
         None => std::future::pending().await,
     }
+}
+
+#[cfg(debug_assertions)]
+fn external_open_delivery_failure_armed_for_test() -> bool {
+    let Some(path) = std::env::var_os("HERDR_TEST_EXTERNAL_OPEN_DELIVERY_FAILURE_PATH") else {
+        return false;
+    };
+    std::fs::remove_file(path).is_ok()
 }
 
 fn sanitize_notification_text(value: &str, max_chars: usize) -> Option<String> {
@@ -4207,6 +4460,8 @@ mod tests {
             client_socket_path: socket_path,
             client_socket_identity,
             clients: HashMap::new(),
+            external_open_requests: crate::server::external_open::ExternalOpenRequests::default(),
+            external_open_clock: crate::server::monotonic_clock::MonotonicClock::default(),
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
@@ -4468,6 +4723,207 @@ mod tests {
         )
     }
 
+    #[test]
+    fn enabled_external_open_targets_exact_input_source_not_foreground() {
+        let mut server = test_headless_server();
+        let (source_writer, source_rx, _source_render_rx) = test_client_writer();
+        let (other_writer, other_rx, _other_render_rx) = test_client_writer();
+        for (client_id, writer, policy) in [
+            (
+                1,
+                source_writer,
+                crate::protocol::ExternalOpenPolicy::Enabled,
+            ),
+            (
+                2,
+                other_writer,
+                crate::protocol::ExternalOpenPolicy::Enabled,
+            ),
+        ] {
+            let mut client = ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                client_id,
+                RenderEncoding::SemanticFrame,
+                Some(writer),
+            );
+            client.external_open_policy = Some(policy);
+            server.clients.insert(client_id, client);
+        }
+        server.foreground_client_id = Some(2);
+
+        server.handle_host_actions(
+            1,
+            vec![crate::app::HostAction::OpenExternalUrl {
+                url: "https://example.com/private".to_owned(),
+            }],
+            Instant::now(),
+        );
+
+        let request_id = match read_server_message(source_rx.recv().expect("source prepare")) {
+            ServerMessage::ExternalOpenPrepare { request_id, url } => {
+                assert_eq!(url, "https://example.com/private");
+                request_id
+            }
+            other => panic!("expected source prepare, got {other:?}"),
+        };
+        assert!(other_rx.try_recv().is_err());
+
+        server.foreground_client_id = Some(2);
+        server.handle_server_event(ServerEvent::ExternalOpenReady {
+            client_id: 1,
+            request_id,
+            target: crate::protocol::ExternalOpenTarget::Direct,
+        });
+        assert_eq!(
+            read_server_message(
+                source_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("source commit"),
+            ),
+            ServerMessage::ExternalOpenCommit { request_id }
+        );
+        assert!(other_rx.try_recv().is_err());
+
+        server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 1 });
+        assert_eq!(server.external_open_requests.next_deadline(), None);
+        server.handle_server_event(ServerEvent::ExternalOpenResult {
+            client_id: 1,
+            request_id,
+            result: crate::protocol::ExternalOpenResult::OpenedDirectly,
+        });
+        assert!(other_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn policy_updates_apply_only_to_full_app_connections_and_cancel_preparing_work() {
+        let mut server = test_headless_server();
+        let (app_writer, app_rx, _app_render_rx) = test_client_writer();
+        let mut app_client = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(app_writer),
+        );
+        app_client.external_open_policy = Some(crate::protocol::ExternalOpenPolicy::Enabled);
+        server.clients.insert(1, app_client);
+
+        let (terminal_writer, terminal_rx, _terminal_render_rx) = test_client_writer();
+        let mut terminal_client = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            2,
+            RenderEncoding::TerminalAnsi,
+            Some(terminal_writer),
+        );
+        terminal_client.mode = ClientConnectionMode::TerminalObserve {
+            terminal_id: "term_2".to_owned(),
+        };
+        terminal_client.external_open_policy = None;
+        server.clients.insert(2, terminal_client);
+
+        server.handle_host_actions(
+            1,
+            vec![crate::app::HostAction::OpenExternalUrl {
+                url: "https://example.com/cancel".to_owned(),
+            }],
+            Instant::now(),
+        );
+        let request_id = match read_server_message(app_rx.recv().expect("prepare")) {
+            ServerMessage::ExternalOpenPrepare { request_id, .. } => request_id,
+            other => panic!("expected prepare, got {other:?}"),
+        };
+
+        server.handle_server_event(ServerEvent::ExternalOpenPolicyUpdate {
+            client_id: 1,
+            policy: crate::protocol::ExternalOpenPolicy::Disabled,
+        });
+        assert_eq!(
+            read_server_message(app_rx.recv().expect("policy cancellation")),
+            ServerMessage::ExternalOpenCancel { request_id }
+        );
+        assert_eq!(
+            server
+                .clients
+                .get(&1)
+                .and_then(|client| client.external_open_policy),
+            Some(crate::protocol::ExternalOpenPolicy::Disabled)
+        );
+
+        server.handle_server_event(ServerEvent::ExternalOpenPolicyUpdate {
+            client_id: 2,
+            policy: crate::protocol::ExternalOpenPolicy::Enabled,
+        });
+        assert_eq!(
+            server
+                .clients
+                .get(&2)
+                .and_then(|client| client.external_open_policy),
+            None
+        );
+        assert!(terminal_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn external_open_deadline_cancels_before_commit_at_equality() {
+        let mut server = test_headless_server();
+        let (writer, control_rx, _render_rx) = test_client_writer();
+        let mut client = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(writer),
+        );
+        client.external_open_policy = Some(crate::protocol::ExternalOpenPolicy::Enabled);
+        server.clients.insert(1, client);
+        let accepted_at = Instant::now();
+        server.handle_host_actions(
+            1,
+            vec![crate::app::HostAction::OpenExternalUrl {
+                url: "https://example.com/deadline".to_owned(),
+            }],
+            accepted_at,
+        );
+        let request_id = match read_server_message(control_rx.recv().expect("prepare")) {
+            ServerMessage::ExternalOpenPrepare { request_id, .. } => request_id,
+            other => panic!("expected prepare, got {other:?}"),
+        };
+        let deadline = accepted_at + Duration::from_secs(10);
+        assert_eq!(
+            server.external_open_requests.next_deadline(),
+            Some(deadline)
+        );
+
+        server.handle_external_open_ready(
+            1,
+            request_id,
+            crate::protocol::ExternalOpenTarget::Direct,
+            deadline,
+        );
+        assert_eq!(
+            read_server_message(
+                control_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("cancel"),
+            ),
+            ServerMessage::ExternalOpenCancel { request_id }
+        );
+        assert_eq!(server.external_open_requests.next_deadline(), None);
+
+        server.handle_scheduled_tasks_headless(deadline, false);
+        assert!(control_rx.try_recv().is_err());
+    }
+
     fn retained_test_server(
         initial_screen: &[u8],
     ) -> (
@@ -4557,6 +5013,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
             writer: writer_a,
         }));
         assert_eq!(
@@ -4581,6 +5038,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
             writer: writer_b,
         }));
         assert_eq!(
@@ -4621,6 +5079,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
             writer: writer_a,
         }));
         assert_eq!(server.app.state.config_diagnostic, without_keybindings);
@@ -4634,6 +5093,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
             writer: writer_b,
         }));
         assert_eq!(
@@ -4677,6 +5137,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
             writer,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -4752,6 +5213,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_config.live_keybinds().unwrap())),
             direct_attach_requested: false,
+            external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
             writer: writer_a,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -4772,6 +5234,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
             writer: writer_b,
         }));
         assert_eq!(
@@ -4806,6 +5269,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            external_open_policy: None,
             writer,
         }));
         assert!(server.clients.contains_key(&7));
@@ -4871,6 +5335,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            external_open_policy: None,
             writer,
         }));
         control_rx
@@ -5173,6 +5638,7 @@ next_tab = ""
             render_encoding,
             keybindings: None,
             direct_attach_requested: false,
+            external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
             writer,
         }));
 
@@ -5207,6 +5673,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            external_open_policy: None,
             writer,
         }));
 
@@ -5240,6 +5707,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
             writer,
         }));
         assert!(server.has_app_client());
@@ -5285,6 +5753,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            external_open_policy: None,
             writer,
         }));
         assert!(
@@ -6849,6 +7318,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            external_open_policy: None,
             writer,
         }));
         assert!(
@@ -7042,7 +7512,7 @@ next_tab = ""
             .recv_timeout(Duration::from_millis(100))
             .expect("initial semantic frame");
 
-        let queued = HeadlessServer::frame_server_message(&ServerMessage::ReloadSoundConfig)
+        let queued = HeadlessServer::frame_server_message(&ServerMessage::ReloadClientConfig)
             .expect("serialize dummy message");
         server
             .clients
@@ -7066,7 +7536,7 @@ next_tab = ""
         assert!(server.clients.get(&1).unwrap().render_pending);
         assert!(matches!(
             read_server_message(client_rx.recv_timeout(Duration::from_millis(100)).unwrap()),
-            ServerMessage::ReloadSoundConfig
+            ServerMessage::ReloadClientConfig
         ));
 
         let runtime = server
@@ -7170,7 +7640,7 @@ next_tab = ""
     fn full_render_queue_does_not_advance_terminal_ansi_baseline() {
         let mut server = test_headless_server();
         let (client_tx, _client_control_rx, client_rx) = test_client_writer();
-        let queued = HeadlessServer::frame_server_message(&ServerMessage::ReloadSoundConfig)
+        let queued = HeadlessServer::frame_server_message(&ServerMessage::ReloadClientConfig)
             .expect("serialize dummy message");
         client_tx
             .render
@@ -7205,7 +7675,7 @@ next_tab = ""
         );
         assert!(matches!(
             read_server_message(client_rx.recv_timeout(Duration::from_millis(100)).unwrap()),
-            ServerMessage::ReloadSoundConfig
+            ServerMessage::ReloadClientConfig
         ));
         assert!(client_rx.recv_timeout(Duration::from_millis(50)).is_err());
     }
@@ -7214,7 +7684,7 @@ next_tab = ""
     fn writer_drained_retries_pending_terminal_ansi_render() {
         let mut server = test_headless_server();
         let (client_tx, _client_control_rx, client_rx) = test_client_writer();
-        let queued = HeadlessServer::frame_server_message(&ServerMessage::ReloadSoundConfig)
+        let queued = HeadlessServer::frame_server_message(&ServerMessage::ReloadClientConfig)
             .expect("serialize dummy message");
         client_tx
             .render
@@ -7239,7 +7709,7 @@ next_tab = ""
         assert!(server.clients.get(&1).unwrap().render_pending);
         assert!(matches!(
             read_server_message(client_rx.recv_timeout(Duration::from_millis(100)).unwrap()),
-            ServerMessage::ReloadSoundConfig
+            ServerMessage::ReloadClientConfig
         ));
 
         assert!(server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 1 }));
@@ -7693,7 +8163,7 @@ next_tab = ""
     #[tokio::test]
     async fn full_redraw_pending_survives_full_render_queue_full() {
         let (mut server, client_rx, pane_id) = retained_test_server(b"aaaa");
-        let queued = HeadlessServer::frame_server_message(&ServerMessage::ReloadSoundConfig)
+        let queued = HeadlessServer::frame_server_message(&ServerMessage::ReloadClientConfig)
             .expect("serialize dummy message");
         server
             .clients
@@ -7713,7 +8183,7 @@ next_tab = ""
         assert!(server.clients.get(&1).unwrap().render_pending);
         assert!(matches!(
             read_server_message(client_rx.recv_timeout(Duration::from_millis(100)).unwrap()),
-            ServerMessage::ReloadSoundConfig
+            ServerMessage::ReloadClientConfig
         ));
 
         let runtime = server
@@ -7753,8 +8223,8 @@ next_tab = ""
                 .recv_timeout(Duration::from_millis(100))
                 .expect("client config reload message"),
         ) {
-            ServerMessage::ReloadSoundConfig => {}
-            other => panic!("expected ReloadSoundConfig, got {other:?}"),
+            ServerMessage::ReloadClientConfig => {}
+            other => panic!("expected ReloadClientConfig, got {other:?}"),
         }
         assert!(!server.app.state.request_client_config_reload);
     }

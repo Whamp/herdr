@@ -12,6 +12,7 @@
 //! - Forwards OSC 52 clipboard writes from server to its own stdout
 //! - Displays sound/toast notifications forwarded from server
 
+mod external_open;
 mod input;
 
 use std::collections::HashSet;
@@ -51,13 +52,44 @@ static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::ne
 // Client state
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientConnectionKind {
+    FullApp,
+    TerminalAttach,
+    TerminalObserve,
+    TerminalControl,
+}
+
+impl ClientConnectionKind {
+    fn is_full_app(self) -> bool {
+        self == Self::FullApp
+    }
+
+    fn launch_mode(self) -> ClientLaunchMode {
+        if self.is_full_app() {
+            ClientLaunchMode::App
+        } else {
+            ClientLaunchMode::TerminalAttach
+        }
+    }
+
+    fn advertised_external_open_policy(
+        self,
+        policy: crate::protocol::ExternalOpenPolicy,
+    ) -> Option<crate::protocol::ExternalOpenPolicy> {
+        self.is_full_app().then_some(policy)
+    }
+}
+
 struct ClientLoopConfig {
+    connection_kind: ClientConnectionKind,
     sound_config: crate::config::SoundConfig,
     mouse_scroll_lines: usize,
     redraw_on_focus_gained: bool,
     host_cursor: crate::config::HostCursorModeConfig,
     kitty_graphics_enabled: bool,
     mouse_capture_active: bool,
+    external_open_policy: crate::protocol::ExternalOpenPolicy,
     #[cfg(unix)]
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
 }
@@ -724,6 +756,28 @@ fn set_handshake_recv_timeout(
         .map_err(ClientError::ConnectionFailed)
 }
 
+fn client_hello(
+    cols: u16,
+    rows: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
+    requested_encoding: RenderEncoding,
+    connection_kind: ClientConnectionKind,
+    external_open_policy: crate::protocol::ExternalOpenPolicy,
+) -> ClientMessage {
+    ClientMessage::Hello {
+        version: PROTOCOL_VERSION,
+        cols,
+        rows,
+        cell_width_px,
+        cell_height_px,
+        requested_encoding,
+        keybindings: requested_keybindings(),
+        launch_mode: connection_kind.launch_mode(),
+        external_open_policy: connection_kind.advertised_external_open_policy(external_open_policy),
+    }
+}
+
 /// Performs the client→server handshake.
 ///
 /// Sends Hello with the terminal size and protocol version, reads the Welcome
@@ -735,27 +789,23 @@ fn do_handshake(
     cell_width_px: u32,
     cell_height_px: u32,
     requested_encoding: RenderEncoding,
-    direct_attach_requested: bool,
+    connection_kind: ClientConnectionKind,
+    external_open_policy: crate::protocol::ExternalOpenPolicy,
 ) -> Result<RenderEncoding, ClientError> {
     stream
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
 
     // Send Hello.
-    let hello = ClientMessage::Hello {
-        version: PROTOCOL_VERSION,
+    let hello = client_hello(
         cols,
         rows,
         cell_width_px,
         cell_height_px,
         requested_encoding,
-        keybindings: requested_keybindings(),
-        launch_mode: if direct_attach_requested {
-            ClientLaunchMode::TerminalAttach
-        } else {
-            ClientLaunchMode::App
-        },
-    };
+        connection_kind,
+        external_open_policy,
+    );
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
 
@@ -806,6 +856,8 @@ enum ClientLoopEvent {
     Resize(u16, u16, u32, u32),
     /// Server message received.
     ServerMessage(ServerMessage),
+    /// A committed platform-open attempt completed on its worker thread.
+    ExternalOpenCompleted(ClientMessage),
     /// Server reader thread exited (connection lost).
     ServerDisconnected,
     /// Timer tick.
@@ -817,9 +869,8 @@ enum ClientLoopEvent {
 ///
 /// This is the entry point called from `main.rs` when running in client mode.
 pub fn run_client() -> io::Result<()> {
-    let _forwarding_capability = crate::platform::adopt_inherited_forwarding_capability(false)?;
-
     run_client_with_mode(
+        ClientConnectionKind::FullApp,
         requested_render_encoding(),
         None,
         None,
@@ -831,6 +882,7 @@ pub fn run_client() -> io::Result<()> {
 #[cfg(unix)]
 pub fn run_terminal_attach(terminal_id: String, takeover: bool) -> io::Result<()> {
     run_client_with_mode(
+        ClientConnectionKind::TerminalAttach,
         RenderEncoding::TerminalAnsi,
         Some((terminal_id, takeover)),
         Some(AttachEscapeState::default()),
@@ -850,8 +902,13 @@ pub fn run_terminal_attach(_terminal_id: String, _takeover: bool) -> io::Result<
 
 /// Runs a read-only terminal session observer and prints one JSON envelope per frame.
 pub fn run_terminal_session_observe(target: String, cols: u16, rows: u16) -> io::Result<()> {
-    let mut stream =
-        connect_terminal_session_stream(target.clone(), cols, rows, "observing terminal session")?;
+    let mut stream = connect_terminal_session_stream(
+        ClientConnectionKind::TerminalObserve,
+        target.clone(),
+        cols,
+        rows,
+        "observing terminal session",
+    )?;
     write_to_server(&mut stream, &ClientMessage::ObserveTerminal { target })?;
     write_terminal_session_output(stream)
 }
@@ -864,6 +921,7 @@ pub fn run_terminal_session_control(
     rows: u16,
 ) -> io::Result<()> {
     let mut stream = connect_terminal_session_stream(
+        ClientConnectionKind::TerminalControl,
         target.clone(),
         cols,
         rows,
@@ -904,6 +962,7 @@ pub fn run_terminal_session_control(
 }
 
 fn connect_terminal_session_stream(
+    connection_kind: ClientConnectionKind,
     target: String,
     cols: u16,
     rows: u16,
@@ -930,7 +989,8 @@ fn connect_terminal_session_stream(
         0,
         0,
         RenderEncoding::TerminalAnsi,
-        true,
+        connection_kind,
+        crate::protocol::ExternalOpenPolicy::Disabled,
     ) {
         Ok(RenderEncoding::TerminalAnsi) => {}
         Ok(encoding) => {
@@ -1106,6 +1166,7 @@ fn terminal_control_command_from_json(raw: &str) -> Result<ClientMessage, String
 }
 
 fn run_client_with_mode(
+    connection_kind: ClientConnectionKind,
     requested_encoding: RenderEncoding,
     attach_request: Option<(String, bool)>,
     attach_escape: Option<AttachEscapeState>,
@@ -1120,17 +1181,40 @@ fn run_client_with_mode(
     let redraw_on_focus_gained = loaded_config.config.ui.redraw_on_focus_gained;
     let host_cursor = loaded_config.config.ui.host_cursor;
     let direct_attach_requested = attach_request.is_some();
+    debug_assert_eq!(
+        direct_attach_requested,
+        connection_kind == ClientConnectionKind::TerminalAttach
+    );
+    let external_open_policy = if loaded_config
+        .config
+        .experimental
+        .open_remote_links_on_client
+    {
+        crate::protocol::ExternalOpenPolicy::Enabled
+    } else {
+        crate::protocol::ExternalOpenPolicy::Disabled
+    };
+    let _forwarding_capability = connection_kind
+        .is_full_app()
+        .then(|| {
+            crate::platform::adopt_inherited_forwarding_capability(
+                external_open_policy == crate::protocol::ExternalOpenPolicy::Enabled,
+            )
+        })
+        .transpose()?;
     #[cfg(unix)]
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
     let kitty_graphics_enabled =
         loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
     let loop_config = ClientLoopConfig {
+        connection_kind,
         sound_config: loaded_config.config.ui.sound,
         mouse_scroll_lines,
         redraw_on_focus_gained,
         host_cursor,
         kitty_graphics_enabled,
         mouse_capture_active: mouse_capture,
+        external_open_policy,
         #[cfg(unix)]
         remote_image_paste_key,
     };
@@ -1162,7 +1246,8 @@ fn run_client_with_mode(
         cell_width_px,
         cell_height_px,
         requested_encoding,
-        direct_attach_requested,
+        connection_kind,
+        external_open_policy,
     ) {
         Ok(encoding) => encoding,
         Err(err) => {
@@ -1361,6 +1446,12 @@ async fn run_client_loop(
     // This (foreground) client owns the prefix ASCII input-source switch; a no-op on non-macOS.
     use crate::platform::PrefixInputSource;
     let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
+    let mut external_open =
+        external_open::ClientExternalOpen::new(if config.connection_kind.is_full_app() {
+            config.external_open_policy
+        } else {
+            crate::protocol::ExternalOpenPolicy::Disabled
+        });
 
     // Main event loop.
     while !should_quit.load(Ordering::Acquire) {
@@ -1562,14 +1653,24 @@ async fn run_client_loop(
                     write_window_title(title.as_deref());
                     let _ = io::stdout().flush();
                 }
-                ServerMessage::ReloadSoundConfig => {
-                    reload_local_client_config(
+                ServerMessage::ReloadClientConfig => {
+                    if let Some(policy) = reload_local_client_config(
                         &mut state.sound_config,
                         &mut state.redraw_on_focus_gained,
                         &mut state.draw_host_cursor,
                         #[cfg(unix)]
                         &mut state.remote_image_paste_key,
-                    );
+                    ) {
+                        if let Some(update) = confirmed_external_open_policy_update(
+                            config.connection_kind,
+                            &mut external_open,
+                            policy,
+                        ) {
+                            if let Err(error) = write_to_server(&mut write_stream, &update) {
+                                return Err(ClientError::ConnectionLost(error));
+                            }
+                        }
+                    }
                 }
                 ServerMessage::MouseCapture { enabled } => {
                     let desired = enabled;
@@ -1590,10 +1691,45 @@ async fn run_client_loop(
                         prefix_input_source.restore();
                     }
                 }
+                ServerMessage::ExternalOpenPrepare { request_id, url } => {
+                    if config.connection_kind.is_full_app() {
+                        if let Some(reply) = external_open.prepare(
+                            request_id,
+                            url,
+                            crate::platform::external_open_platform(),
+                        ) {
+                            if let Err(error) = write_to_server(&mut write_stream, &reply) {
+                                return Err(ClientError::ConnectionLost(error));
+                            }
+                        }
+                    }
+                }
+                ServerMessage::ExternalOpenCommit { request_id } => {
+                    if config.connection_kind.is_full_app() {
+                        if let Some(committed) = external_open.commit(request_id) {
+                            let completion_tx = event_tx.clone();
+                            std::thread::spawn(move || {
+                                let result = committed.execute(crate::platform::open_url);
+                                let _ = completion_tx
+                                    .blocking_send(ClientLoopEvent::ExternalOpenCompleted(result));
+                            });
+                        }
+                    }
+                }
+                ServerMessage::ExternalOpenCancel { request_id } => {
+                    if config.connection_kind.is_full_app() {
+                        external_open.cancel(request_id);
+                    }
+                }
                 ServerMessage::Welcome { .. } => {
                     debug!("received unexpected Welcome in main loop");
                 }
             },
+            ClientLoopEvent::ExternalOpenCompleted(result) => {
+                if let Err(error) = write_to_server(&mut write_stream, &result) {
+                    return Err(ClientError::ConnectionLost(error));
+                }
+            }
             ClientLoopEvent::ServerDisconnected => {
                 return Err(ClientError::ConnectionLost(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -1697,6 +1833,16 @@ fn client_remote_image_paste_key(
     }
 }
 
+fn confirmed_external_open_policy_update(
+    connection_kind: ClientConnectionKind,
+    external_open: &mut external_open::ClientExternalOpen,
+    policy: crate::protocol::ExternalOpenPolicy,
+) -> Option<ClientMessage> {
+    connection_kind
+        .is_full_app()
+        .then(|| external_open.confirm_policy(policy))
+}
+
 fn reload_local_client_config(
     sound_config: &mut crate::config::SoundConfig,
     redraw_on_focus_gained: &mut bool,
@@ -1705,7 +1851,7 @@ fn reload_local_client_config(
         crossterm::event::KeyCode,
         crossterm::event::KeyModifiers,
     )>,
-) {
+) -> Option<crate::protocol::ExternalOpenPolicy> {
     match crate::config::load_live_config() {
         Ok(loaded) => {
             for diagnostic in loaded.config.ui.sound.diagnostics() {
@@ -1721,9 +1867,19 @@ fn reload_local_client_config(
                 *remote_image_paste_key = loaded_remote_image_paste_key;
             }
             debug!("reloaded local client config");
+            (!loaded
+                .invalid_sections
+                .iter()
+                .any(|section| section == "experimental"))
+            .then_some(if loaded.config.experimental.open_remote_links_on_client {
+                crate::protocol::ExternalOpenPolicy::Enabled
+            } else {
+                crate::protocol::ExternalOpenPolicy::Disabled
+            })
         }
         Err(diagnostics) => {
             warn!(diagnostics = ?diagnostics, "failed to reload local client config; keeping current client config");
+            None
         }
     }
 }
@@ -2167,6 +2323,53 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             restore_env_var(self.key, self.previous.clone());
+        }
+    }
+
+    #[test]
+    fn client_hello_advertises_policy_only_for_full_app_connections() {
+        for kind in [
+            ClientConnectionKind::FullApp,
+            ClientConnectionKind::TerminalAttach,
+            ClientConnectionKind::TerminalObserve,
+            ClientConnectionKind::TerminalControl,
+        ] {
+            let hello = client_hello(
+                80,
+                24,
+                8,
+                16,
+                if kind.is_full_app() {
+                    RenderEncoding::SemanticFrame
+                } else {
+                    RenderEncoding::TerminalAnsi
+                },
+                kind,
+                crate::protocol::ExternalOpenPolicy::Enabled,
+            );
+            let mut wire = Vec::new();
+            protocol::write_message(&mut wire, &hello).expect("write hello");
+            let decoded =
+                protocol::read_message::<_, ClientMessage>(&mut wire.as_slice(), MAX_FRAME_SIZE)
+                    .expect("read hello");
+
+            match decoded {
+                ClientMessage::Hello {
+                    launch_mode,
+                    external_open_policy,
+                    ..
+                } => {
+                    assert_eq!(launch_mode, kind.launch_mode(), "kind={kind:?}");
+                    assert_eq!(
+                        external_open_policy,
+                        kind.advertised_external_open_policy(
+                            crate::protocol::ExternalOpenPolicy::Enabled
+                        ),
+                        "kind={kind:?}"
+                    );
+                }
+                other => panic!("expected hello for {kind:?}, got {other:?}"),
+            }
         }
     }
 
@@ -2774,7 +2977,7 @@ mod tests {
         #[cfg(unix)]
         let mut remote_image_paste_key = None;
 
-        reload_local_client_config(
+        let _ = reload_local_client_config(
             &mut sound_config,
             &mut redraw_on_focus_gained,
             &mut draw_host_cursor,

@@ -26,6 +26,8 @@ pub(crate) struct ClientConnection {
     pub(crate) mode: ClientConnectionMode,
     /// True after the handshake for clients that will switch into direct terminal attach mode.
     pub(crate) pending_terminal_attach: bool,
+    /// Effective device-local policy advertised only by a full app connection.
+    pub(crate) external_open_policy: Option<crate::protocol::ExternalOpenPolicy>,
     /// Client-local app keybindings. None means use the server's keybindings.
     pub(crate) keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
     /// The client's terminal size after clamping.
@@ -81,6 +83,7 @@ impl ClientConnection {
             last_activity,
             render_encoding,
             false,
+            Some(crate::protocol::ExternalOpenPolicy::Disabled),
             writer,
         )
     }
@@ -95,11 +98,13 @@ impl ClientConnection {
         last_activity: u64,
         render_encoding: RenderEncoding,
         pending_terminal_attach: bool,
+        external_open_policy: Option<crate::protocol::ExternalOpenPolicy>,
         writer: Option<ClientWriter>,
     ) -> Self {
         Self {
             mode,
             pending_terminal_attach,
+            external_open_policy,
             keybindings,
             terminal_size,
             cell_size,

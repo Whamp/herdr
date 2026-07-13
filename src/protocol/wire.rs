@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -59,6 +59,56 @@ pub enum ClientLaunchMode {
     App,
     /// Direct terminal attach client.
     TerminalAttach,
+}
+
+/// Effective device-local policy advertised by a full app connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExternalOpenPolicy {
+    Disabled,
+    Enabled,
+}
+
+/// Coarse forwarding metadata that never discloses either port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExternalOpenPortStatus {
+    SamePort,
+    RemappedPort,
+}
+
+/// Prepared target authorized by a later server commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExternalOpenTarget {
+    Direct,
+    Forwarded { port_status: ExternalOpenPortStatus },
+}
+
+/// Closed client-owned reasons that can stop preparation before commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExternalOpenPreparationFailure {
+    UnsupportedScheme,
+    AuthorityUserinfoForbidden,
+    InvalidPort,
+    InvalidAbsoluteUrl,
+    UnsupportedLoopbackForm,
+    LoopbackUnsupportedOnPlatform,
+    ManagedSshRequired,
+    ForwardingUnavailable,
+    TooManyOpensInProgress,
+    TooManyForwardRequests,
+    TooManyMappingWaiters,
+    ForwardCapacityExhausted,
+    ForwardBindExhausted,
+    AtomicForwardCreationFailed,
+    ForwardCommandRejected,
+    ForwardCommandTimedOut,
+}
+
+/// Closed result reported after an irrevocable server commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExternalOpenResult {
+    OpenedDirectly,
+    OpenedThroughForward { port_status: ExternalOpenPortStatus },
+    PlatformOpenRejected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,6 +374,8 @@ pub enum ClientMessage {
         keybindings: ClientKeybindings,
         /// Whether this connection will render the full app or attach directly to a pane terminal.
         launch_mode: ClientLaunchMode,
+        /// Effective local policy for full app connections; absent for terminal connections.
+        external_open_policy: Option<ExternalOpenPolicy>,
     },
 
     /// Raw input bytes read from the client's stdin.
@@ -394,6 +446,27 @@ pub enum ClientMessage {
         target: String,
         /// Replace an existing writable controller for this terminal.
         takeover: bool,
+    },
+
+    /// Replace this full app connection's effective device-local policy.
+    ExternalOpenPolicyUpdate { policy: ExternalOpenPolicy },
+
+    /// Report that preparation completed and is waiting for server commit.
+    ExternalOpenReady {
+        request_id: u64,
+        target: ExternalOpenTarget,
+    },
+
+    /// Report a terminal preparation failure before commit.
+    ExternalOpenPreparationFailed {
+        request_id: u64,
+        reason: ExternalOpenPreparationFailure,
+    },
+
+    /// Report the platform-open result after commit.
+    ExternalOpenResult {
+        request_id: u64,
+        result: ExternalOpenResult,
     },
 }
 
@@ -649,7 +722,7 @@ pub enum ServerMessage {
     },
 
     /// Client-local runtime config changed on disk; refresh it without reconnecting.
-    ReloadSoundConfig,
+    ReloadClientConfig,
 
     /// Whether the client should currently capture host mouse input.
     MouseCapture {
@@ -664,6 +737,15 @@ pub enum ServerMessage {
         /// Whether the ASCII input source should be active.
         active: bool,
     },
+
+    /// Ask the initiating full app connection to prepare one external open.
+    ExternalOpenPrepare { request_id: u64, url: String },
+
+    /// Irrevocably authorize the prepared platform-open side effect.
+    ExternalOpenCommit { request_id: u64 },
+
+    /// Cancel an uncommitted request best-effort.
+    ExternalOpenCancel { request_id: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -943,7 +1025,7 @@ mod tests {
     // ---- Round-trip: ClientMessage ----
 
     #[test]
-    fn client_hello_roundtrip() {
+    fn client_hello_roundtrip_includes_full_app_external_open_policy() {
         let msg = ClientMessage::Hello {
             version: PROTOCOL_VERSION,
             cols: 80,
@@ -953,6 +1035,26 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            external_open_policy: Some(ExternalOpenPolicy::Enabled),
+        };
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn terminal_connection_hello_roundtrip_omits_external_open_policy() {
+        let msg = ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            requested_encoding: RenderEncoding::TerminalAnsi,
+            keybindings: ClientKeybindings::Server,
+            launch_mode: ClientLaunchMode::TerminalAttach,
+            external_open_policy: None,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -990,6 +1092,7 @@ mod tests {
                 requested_encoding: RenderEncoding::SemanticFrame,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                external_open_policy: Some(ExternalOpenPolicy::Disabled),
             }),
             0
         );
@@ -1043,6 +1146,151 @@ mod tests {
             }),
             9
         );
+    }
+
+    #[test]
+    fn external_open_client_message_wire_tags_append_after_protocol_16_order() {
+        fn tag(msg: &ClientMessage) -> u8 {
+            *bincode::serde::encode_to_vec(msg, bincode::config::standard())
+                .unwrap()
+                .first()
+                .expect("encoded client message should include enum tag")
+        }
+
+        assert_eq!(
+            tag(&ClientMessage::ExternalOpenPolicyUpdate {
+                policy: ExternalOpenPolicy::Enabled,
+            }),
+            10
+        );
+        assert_eq!(
+            tag(&ClientMessage::ExternalOpenReady {
+                request_id: 1,
+                target: ExternalOpenTarget::Direct,
+            }),
+            11
+        );
+        assert_eq!(
+            tag(&ClientMessage::ExternalOpenPreparationFailed {
+                request_id: 1,
+                reason: ExternalOpenPreparationFailure::InvalidAbsoluteUrl,
+            }),
+            12
+        );
+        assert_eq!(
+            tag(&ClientMessage::ExternalOpenResult {
+                request_id: 1,
+                result: ExternalOpenResult::OpenedDirectly,
+            }),
+            13
+        );
+    }
+
+    #[test]
+    fn external_open_client_messages_roundtrip() {
+        let messages = [
+            ClientMessage::ExternalOpenPolicyUpdate {
+                policy: ExternalOpenPolicy::Enabled,
+            },
+            ClientMessage::ExternalOpenReady {
+                request_id: 41,
+                target: ExternalOpenTarget::Direct,
+            },
+            ClientMessage::ExternalOpenReady {
+                request_id: 42,
+                target: ExternalOpenTarget::Forwarded {
+                    port_status: ExternalOpenPortStatus::RemappedPort,
+                },
+            },
+            ClientMessage::ExternalOpenPreparationFailed {
+                request_id: 43,
+                reason: ExternalOpenPreparationFailure::ForwardCommandTimedOut,
+            },
+            ClientMessage::ExternalOpenResult {
+                request_id: 44,
+                result: ExternalOpenResult::OpenedDirectly,
+            },
+            ClientMessage::ExternalOpenResult {
+                request_id: 45,
+                result: ExternalOpenResult::OpenedThroughForward {
+                    port_status: ExternalOpenPortStatus::SamePort,
+                },
+            },
+            ClientMessage::ExternalOpenResult {
+                request_id: 46,
+                result: ExternalOpenResult::PlatformOpenRejected,
+            },
+        ];
+
+        for message in messages {
+            let encoded =
+                bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
+            let (decoded, consumed): (ClientMessage, usize) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(decoded, message);
+        }
+    }
+
+    #[test]
+    fn external_open_closed_value_wire_order_is_stable() {
+        fn tag<T: Serialize>(value: &T) -> u8 {
+            *bincode::serde::encode_to_vec(value, bincode::config::standard())
+                .unwrap()
+                .first()
+                .expect("encoded enum should include tag")
+        }
+
+        assert_eq!(tag(&ExternalOpenPolicy::Disabled), 0);
+        assert_eq!(tag(&ExternalOpenPolicy::Enabled), 1);
+        assert_eq!(tag(&ExternalOpenPortStatus::SamePort), 0);
+        assert_eq!(tag(&ExternalOpenPortStatus::RemappedPort), 1);
+        assert_eq!(tag(&ExternalOpenTarget::Direct), 0);
+        assert_eq!(
+            tag(&ExternalOpenTarget::Forwarded {
+                port_status: ExternalOpenPortStatus::SamePort,
+            }),
+            1
+        );
+        assert_eq!(tag(&ExternalOpenResult::OpenedDirectly), 0);
+        assert_eq!(
+            tag(&ExternalOpenResult::OpenedThroughForward {
+                port_status: ExternalOpenPortStatus::SamePort,
+            }),
+            1
+        );
+        assert_eq!(tag(&ExternalOpenResult::PlatformOpenRejected), 2);
+
+        for (reason, expected_tag) in [
+            (ExternalOpenPreparationFailure::UnsupportedScheme, 0),
+            (
+                ExternalOpenPreparationFailure::AuthorityUserinfoForbidden,
+                1,
+            ),
+            (ExternalOpenPreparationFailure::InvalidPort, 2),
+            (ExternalOpenPreparationFailure::InvalidAbsoluteUrl, 3),
+            (ExternalOpenPreparationFailure::UnsupportedLoopbackForm, 4),
+            (
+                ExternalOpenPreparationFailure::LoopbackUnsupportedOnPlatform,
+                5,
+            ),
+            (ExternalOpenPreparationFailure::ManagedSshRequired, 6),
+            (ExternalOpenPreparationFailure::ForwardingUnavailable, 7),
+            (ExternalOpenPreparationFailure::TooManyOpensInProgress, 8),
+            (ExternalOpenPreparationFailure::TooManyForwardRequests, 9),
+            (ExternalOpenPreparationFailure::TooManyMappingWaiters, 10),
+            (ExternalOpenPreparationFailure::ForwardCapacityExhausted, 11),
+            (ExternalOpenPreparationFailure::ForwardBindExhausted, 12),
+            (
+                ExternalOpenPreparationFailure::AtomicForwardCreationFailed,
+                13,
+            ),
+            (ExternalOpenPreparationFailure::ForwardCommandRejected, 14),
+            (ExternalOpenPreparationFailure::ForwardCommandTimedOut, 15),
+        ] {
+            assert_eq!(tag(&reason), expected_tag);
+        }
+        assert_eq!(PROTOCOL_VERSION, 17);
     }
 
     #[test]
@@ -1210,6 +1458,33 @@ mod tests {
     }
 
     // ---- Round-trip: ServerMessage ----
+
+    #[test]
+    fn external_open_server_messages_roundtrip_in_stable_order() {
+        fn roundtrip(msg: ServerMessage) {
+            let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+            let tag = *encoded
+                .first()
+                .expect("encoded server message should include enum tag");
+            let (decoded, consumed): (ServerMessage, usize) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(decoded, msg);
+            match msg {
+                ServerMessage::ExternalOpenPrepare { .. } => assert_eq!(tag, 11),
+                ServerMessage::ExternalOpenCommit { .. } => assert_eq!(tag, 12),
+                ServerMessage::ExternalOpenCancel { .. } => assert_eq!(tag, 13),
+                other => panic!("unexpected external-open server fixture: {other:?}"),
+            }
+        }
+
+        roundtrip(ServerMessage::ExternalOpenPrepare {
+            request_id: 41,
+            url: "https://example.com/a?b=c#d".to_owned(),
+        });
+        roundtrip(ServerMessage::ExternalOpenCommit { request_id: 41 });
+        roundtrip(ServerMessage::ExternalOpenCancel { request_id: 41 });
+    }
 
     #[test]
     fn server_welcome_roundtrip() {
@@ -1395,9 +1670,10 @@ mod tests {
     }
 
     #[test]
-    fn server_reload_sound_config_roundtrip() {
-        let msg = ServerMessage::ReloadSoundConfig;
+    fn server_reload_client_config_roundtrip() {
+        let msg = ServerMessage::ReloadClientConfig;
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        assert_eq!(encoded.first(), Some(&8));
         let (decoded, _): (ServerMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(msg, decoded);
@@ -1436,6 +1712,7 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            external_open_policy: Some(ExternalOpenPolicy::Disabled),
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -1510,6 +1787,7 @@ mod tests {
                     requested_encoding: RenderEncoding::SemanticFrame,
                     keybindings: ClientKeybindings::Server,
                     launch_mode: ClientLaunchMode::App,
+                    external_open_policy: Some(ExternalOpenPolicy::Disabled),
                 },
                 1 => ClientMessage::Input {
                     data: vec![(i % 256) as u8; (i as usize % 50) + 1],
@@ -1946,6 +2224,7 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            external_open_policy: Some(ExternalOpenPolicy::Disabled),
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -1982,6 +2261,7 @@ mod tests {
                 requested_encoding: RenderEncoding::SemanticFrame,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                external_open_policy: Some(ExternalOpenPolicy::Disabled),
             },
             ClientMessage::Input {
                 data: b"hello world".to_vec(),

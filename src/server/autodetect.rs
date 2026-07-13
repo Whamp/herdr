@@ -126,6 +126,7 @@ fn client_protocol_accepts_hello(socket_path: &Path) -> io::Result<bool> {
         requested_encoding: crate::protocol::RenderEncoding::SemanticFrame,
         keybindings: crate::protocol::ClientKeybindings::Server,
         launch_mode: crate::protocol::ClientLaunchMode::App,
+        external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
     };
 
     match crate::protocol::write_message(&mut stream, &hello) {

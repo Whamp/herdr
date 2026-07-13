@@ -134,6 +134,15 @@ impl ClientControlWriter {
             ClientControlTarget::Channel(sender) => sender.send(data),
         }
     }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn fail_next_send_for_test(&self) {
+        match &self.target {
+            ClientControlTarget::Queue(queue) => queue.close_writer(),
+            #[cfg(test)]
+            ClientControlTarget::Channel(_) => {}
+        }
+    }
 }
 
 impl Clone for ClientRenderWriter {
@@ -291,6 +300,7 @@ pub(crate) enum ServerEvent {
         render_encoding: RenderEncoding,
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
         direct_attach_requested: bool,
+        external_open_policy: Option<crate::protocol::ExternalOpenPolicy>,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -299,6 +309,29 @@ pub(crate) enum ServerEvent {
     ClientInputEvents {
         client_id: u64,
         events: Vec<crate::protocol::ClientInputEvent>,
+    },
+    /// A full app client replaced its effective device-local external-open policy.
+    ExternalOpenPolicyUpdate {
+        client_id: u64,
+        policy: crate::protocol::ExternalOpenPolicy,
+    },
+    /// A full app client completed external-open preparation.
+    ExternalOpenReady {
+        client_id: u64,
+        request_id: u64,
+        target: crate::protocol::ExternalOpenTarget,
+    },
+    /// A full app client failed external-open preparation.
+    ExternalOpenPreparationFailed {
+        client_id: u64,
+        request_id: u64,
+        reason: crate::protocol::ExternalOpenPreparationFailure,
+    },
+    /// A full app client reported the result of a committed external open.
+    ExternalOpenResult {
+        client_id: u64,
+        request_id: u64,
+        result: crate::protocol::ExternalOpenResult,
     },
     /// A client sent local clipboard image bytes to paste into a remote pane.
     ClientClipboardImage {
@@ -344,6 +377,8 @@ pub(crate) enum ServerEvent {
     ClientDisconnected { client_id: u64 },
     /// A client writer drained its render slot and can accept another render.
     ClientWriterDrained { client_id: u64 },
+    /// A client writer could not deliver queued bytes to its socket.
+    ClientWriterFailed { client_id: u64 },
     /// Ctrl+C or external shutdown signal received.
     QuitSignal,
 }
@@ -463,6 +498,7 @@ pub(crate) fn handle_client_handshake(
         render_encoding,
         keybindings,
         direct_attach_requested,
+        external_open_policy,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -473,6 +509,7 @@ pub(crate) fn handle_client_handshake(
             requested_encoding,
             keybindings,
             launch_mode,
+            external_open_policy,
         } => {
             // Version check.
             match protocol::check_client_version(version) {
@@ -502,6 +539,34 @@ pub(crate) fn handle_client_handshake(
                 }
             };
 
+            let direct_attach_requested = match (launch_mode, external_open_policy) {
+                (ClientLaunchMode::App, Some(_)) => false,
+                (ClientLaunchMode::TerminalAttach, None) => true,
+                (ClientLaunchMode::App, None) => {
+                    let welcome = ServerMessage::Welcome {
+                        version: PROTOCOL_VERSION,
+                        encoding: RenderEncoding::SemanticFrame,
+                        error: Some(
+                            "full app client must advertise external-open policy".to_owned(),
+                        ),
+                    };
+                    let _ = protocol::write_message(&mut stream, &welcome);
+                    return Ok(());
+                }
+                (ClientLaunchMode::TerminalAttach, Some(_)) => {
+                    let welcome = ServerMessage::Welcome {
+                        version: PROTOCOL_VERSION,
+                        encoding: RenderEncoding::SemanticFrame,
+                        error: Some(
+                            "terminal connection must not advertise external-open policy"
+                                .to_owned(),
+                        ),
+                    };
+                    let _ = protocol::write_message(&mut stream, &welcome);
+                    return Ok(());
+                }
+            };
+
             // Clamp size.
             let (clamped_cols, clamped_rows) = clamp_terminal_size(cols, rows);
             (
@@ -511,7 +576,8 @@ pub(crate) fn handle_client_handshake(
                 cell_height_px,
                 requested_encoding,
                 keybindings,
-                launch_mode == ClientLaunchMode::TerminalAttach,
+                direct_attach_requested,
+                external_open_policy,
             )
         }
         _ => {
@@ -566,6 +632,7 @@ pub(crate) fn handle_client_handshake(
         render_encoding,
         keybindings,
         direct_attach_requested,
+        external_open_policy,
         writer,
     });
 
@@ -580,10 +647,12 @@ fn client_writer_loop(
     writer_queue: Arc<ClientWriterQueue>,
     server_event_tx: mpsc::Sender<ServerEvent>,
 ) {
+    let mut write_failed = false;
     while let Some(item) = writer_queue.recv() {
         match item {
             ClientWriteItem::Control(data) => {
                 if !write_framed_bytes(&mut stream, &data) {
+                    write_failed = true;
                     break;
                 }
             }
@@ -591,12 +660,16 @@ fn client_writer_loop(
                 let _ =
                     server_event_tx.blocking_send(ServerEvent::ClientWriterDrained { client_id });
                 if !write_framed_bytes(&mut stream, &data) {
+                    write_failed = true;
                     break;
                 }
             }
         }
     }
     writer_queue.close_writer();
+    if write_failed {
+        let _ = server_event_tx.blocking_send(ServerEvent::ClientWriterFailed { client_id });
+    }
     debug!("client writer thread exiting");
 }
 
@@ -744,6 +817,30 @@ fn client_read_loop(
                 row,
                 modifiers,
             },
+            ClientMessage::ExternalOpenPolicyUpdate { policy } => {
+                ServerEvent::ExternalOpenPolicyUpdate { client_id, policy }
+            }
+            ClientMessage::ExternalOpenReady { request_id, target } => {
+                ServerEvent::ExternalOpenReady {
+                    client_id,
+                    request_id,
+                    target,
+                }
+            }
+            ClientMessage::ExternalOpenPreparationFailed { request_id, reason } => {
+                ServerEvent::ExternalOpenPreparationFailed {
+                    client_id,
+                    request_id,
+                    reason,
+                }
+            }
+            ClientMessage::ExternalOpenResult { request_id, result } => {
+                ServerEvent::ExternalOpenResult {
+                    client_id,
+                    request_id,
+                    result,
+                }
+            }
             ClientMessage::Hello { .. } => {
                 // Duplicate Hello — ignore.
                 continue;
@@ -845,7 +942,7 @@ mod tests {
             .expect("queue render");
         writer
             .control
-            .send(frame_server_message(&ServerMessage::ReloadSoundConfig))
+            .send(frame_server_message(&ServerMessage::ReloadClientConfig))
             .expect("queue control");
 
         let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
@@ -854,7 +951,7 @@ mod tests {
         });
 
         match protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read control") {
-            ServerMessage::ReloadSoundConfig => {}
+            ServerMessage::ReloadClientConfig => {}
             other => panic!("expected control message first, got {other:?}"),
         }
         match protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read render") {
@@ -906,12 +1003,12 @@ mod tests {
         drop(writer);
         cloned_writer
             .control
-            .send(frame_server_message(&ServerMessage::ReloadSoundConfig))
+            .send(frame_server_message(&ServerMessage::ReloadClientConfig))
             .expect("cloned writer still sends after original drops");
         match protocol::read_message(&mut client_stream, MAX_FRAME_SIZE)
             .expect("read control from cloned writer")
         {
-            ServerMessage::ReloadSoundConfig => {}
+            ServerMessage::ReloadClientConfig => {}
             other => panic!("expected cloned control message, got {other:?}"),
         }
         assert!(
@@ -934,7 +1031,7 @@ mod tests {
             .set_send_timeout(Some(Duration::from_millis(100)))
             .expect("set test send timeout");
         let (writer, queue) = test_queue_writer();
-        let (server_event_tx, _server_event_rx) = mpsc::channel(4);
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             client_writer_loop(server_stream, 13, queue, server_event_tx);
@@ -949,6 +1046,10 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("writer exits after socket write failure");
+        assert!(matches!(
+            server_event_rx.blocking_recv(),
+            Some(ServerEvent::ClientWriterFailed { client_id: 13 })
+        ));
 
         assert!(matches!(writer.control.send(vec![b'y']), Err(SendError(_))));
         assert!(matches!(
@@ -1057,6 +1158,7 @@ new_tab = "ctrl+notakey"
                 requested_encoding: RenderEncoding::TerminalAnsi,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
             },
         )
         .expect("write hello");
@@ -1089,6 +1191,7 @@ new_tab = "ctrl+notakey"
                 render_encoding,
                 keybindings,
                 direct_attach_requested,
+                external_open_policy,
                 writer,
             } => {
                 assert_eq!(client_id, 42);
@@ -1097,6 +1200,10 @@ new_tab = "ctrl+notakey"
                 assert_eq!(render_encoding, RenderEncoding::TerminalAnsi);
                 assert!(keybindings.is_none());
                 assert!(!direct_attach_requested);
+                assert_eq!(
+                    external_open_policy,
+                    Some(crate::protocol::ExternalOpenPolicy::Disabled)
+                );
                 drop(writer);
             }
             other => panic!("expected ClientConnected, got {other:?}"),
@@ -1132,6 +1239,7 @@ new_tab = "ctrl+notakey"
                 requested_encoding: RenderEncoding::TerminalAnsi,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::TerminalAttach,
+                external_open_policy: None,
             },
         )
         .expect("write hello");
@@ -1157,10 +1265,12 @@ new_tab = "ctrl+notakey"
         {
             ServerEvent::ClientConnected {
                 direct_attach_requested,
+                external_open_policy,
                 writer,
                 ..
             } => {
                 assert!(direct_attach_requested);
+                assert_eq!(external_open_policy, None);
                 drop(writer);
             }
             other => panic!("expected ClientConnected, got {other:?}"),
@@ -1172,6 +1282,61 @@ new_tab = "ctrl+notakey"
             .join()
             .expect("handshake thread join")
             .expect("handshake thread result");
+    }
+
+    #[test]
+    fn handshake_rejects_policy_presence_for_the_wrong_connection_kind() {
+        for (name, launch_mode, external_open_policy, expected_error) in [
+            (
+                "app-missing-policy",
+                ClientLaunchMode::App,
+                None,
+                "full app client must advertise external-open policy",
+            ),
+            (
+                "terminal-advertises-policy",
+                ClientLaunchMode::TerminalAttach,
+                Some(crate::protocol::ExternalOpenPolicy::Enabled),
+                "terminal connection must not advertise external-open policy",
+            ),
+        ] {
+            let (mut client_stream, server_stream, _path) = local_stream_pair(name);
+            let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+            let should_quit = Arc::new(AtomicBool::new(false));
+            let handshake_quit = should_quit.clone();
+            let handle = std::thread::spawn(move || {
+                handle_client_handshake(server_stream, 42, &server_event_tx, &handshake_quit)
+            });
+            protocol::write_message(
+                &mut client_stream,
+                &ClientMessage::Hello {
+                    version: PROTOCOL_VERSION,
+                    cols: 80,
+                    rows: 24,
+                    cell_width_px: 0,
+                    cell_height_px: 0,
+                    requested_encoding: RenderEncoding::SemanticFrame,
+                    keybindings: ClientKeybindings::Server,
+                    launch_mode,
+                    external_open_policy,
+                },
+            )
+            .expect("write invalid hello");
+
+            let welcome: ServerMessage =
+                protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read rejection");
+            assert!(matches!(
+                welcome,
+                ServerMessage::Welcome { error: Some(error), .. } if error == expected_error
+            ));
+            assert!(server_event_rx.try_recv().is_err());
+            drop(client_stream);
+            should_quit.store(true, Ordering::Release);
+            handle
+                .join()
+                .expect("handshake thread join")
+                .expect("handshake result");
+        }
     }
 
     #[test]

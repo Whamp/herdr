@@ -503,6 +503,10 @@ pub fn read_clipboard_text() -> Option<String> {
     None
 }
 
+pub(crate) const fn external_open_platform() -> crate::external_open::ExternalOpenPlatform {
+    crate::external_open::ExternalOpenPlatform::Unsupported
+}
+
 pub fn open_url(url: &str) -> std::io::Result<()> {
     let operation = wide_null("open");
     let url = wide_null(url);
