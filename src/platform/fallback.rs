@@ -87,6 +87,10 @@ pub fn read_clipboard_text() -> Option<String> {
 }
 
 /// Unsupported platform stub.
+pub(crate) const fn external_open_platform() -> crate::external_open::ExternalOpenPlatform {
+    crate::external_open::ExternalOpenPlatform::Unsupported
+}
+
 pub fn open_url(_url: &str) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
