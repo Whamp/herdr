@@ -65,6 +65,9 @@ mod client;
 mod config;
 mod detect;
 mod events;
+// The pure policy is introduced before the routing tickets that consume it.
+#[allow(dead_code)]
+mod external_open;
 mod ghostty;
 mod handoff_runtime;
 mod input;
