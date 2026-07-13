@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
-    io::Write,
-    os::fd::RawFd,
+    io::{self, Write},
+    os::fd::{AsRawFd, RawFd},
     path::PathBuf,
     process::{Command, Stdio},
     sync::Mutex,
@@ -10,8 +10,151 @@ use std::{
 
 use super::{
     read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
-    LimitedRead, Signal,
+    InheritedPeerIdentity, LimitedRead, Signal,
 };
+
+pub(crate) fn inherited_peer_identity_for_current_process() -> InheritedPeerIdentity {
+    InheritedPeerIdentity {
+        pid: std::process::id(),
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+    }
+}
+
+pub(crate) fn inherited_peer_identity_for_child(pid: u32) -> InheritedPeerIdentity {
+    InheritedPeerIdentity {
+        pid,
+        ..inherited_peer_identity_for_current_process()
+    }
+}
+
+pub(crate) fn inherited_peer_identity_for_parent() -> InheritedPeerIdentity {
+    InheritedPeerIdentity {
+        pid: unsafe { libc::getppid() as u32 },
+        ..inherited_peer_identity_for_current_process()
+    }
+}
+
+pub(crate) fn set_inherited_descriptor_cloexec(fd: RawFd, enabled: bool) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let flags = if enabled {
+        flags | libc::FD_CLOEXEC
+    } else {
+        flags & !libc::FD_CLOEXEC
+    };
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn inherited_descriptor_is_cloexec(fd: RawFd) -> io::Result<bool> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags & libc::FD_CLOEXEC != 0)
+}
+
+pub(crate) fn prepare_inherited_credential_receiver(
+    stream: &std::os::unix::net::UnixStream,
+) -> io::Result<()> {
+    let enabled: libc::c_int = 1;
+    let result = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PASSCRED,
+            std::ptr::addr_of!(enabled).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub(crate) fn read_authenticated_inherited_bytes(
+    stream: &std::os::unix::net::UnixStream,
+    expected: InheritedPeerIdentity,
+    mut bytes: &mut [u8],
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_mut_ptr().cast(),
+            iov_len: bytes.len(),
+        };
+        let credential_bytes = std::mem::size_of::<libc::ucred>();
+        let control_bytes = unsafe { libc::CMSG_SPACE(credential_bytes as u32) as usize };
+        let word_bytes = std::mem::size_of::<usize>();
+        let mut control = vec![0_usize; control_bytes.div_ceil(word_bytes)];
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = std::ptr::addr_of_mut!(iov);
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control_bytes;
+
+        let received = loop {
+            let received = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, 0) };
+            if received < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break received;
+        };
+        if received < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if received == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated inherited broker frame",
+            ));
+        }
+        if message.msg_flags & libc::MSG_CTRUNC != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "inherited broker credentials truncated",
+            ));
+        }
+
+        let mut credentials = None;
+        unsafe {
+            let mut cmsg = libc::CMSG_FIRSTHDR(&message);
+            while !cmsg.is_null() {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET
+                    && (*cmsg).cmsg_type == libc::SCM_CREDENTIALS
+                    && (*cmsg).cmsg_len as usize >= libc::CMSG_LEN(credential_bytes as u32) as usize
+                {
+                    credentials = Some(*(libc::CMSG_DATA(cmsg) as *const libc::ucred));
+                    break;
+                }
+                cmsg = libc::CMSG_NXTHDR(&message, cmsg);
+            }
+        }
+        let credentials = credentials.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "inherited broker credentials missing",
+            )
+        })?;
+        if credentials.pid as u32 != expected.pid
+            || credentials.uid != expected.uid
+            || credentials.gid != expected.gid
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "inherited broker credentials rejected",
+            ));
+        }
+        bytes = &mut bytes[received as usize..];
+    }
+    Ok(())
+}
 
 const FOREGROUND_MEMBERS_CACHE_TTL: Duration = Duration::from_millis(250);
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
