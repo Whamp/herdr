@@ -257,6 +257,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<HostAction> {
         self.handle_mouse_with_host_and_client_local_actions(mouse)
             .0
@@ -274,6 +275,17 @@ impl App {
     pub(super) fn handle_mouse_with_host_and_client_local_actions(
         &mut self,
         mouse: MouseEvent,
+    ) -> (
+        Option<HostAction>,
+        Option<crate::remote_link_preference::RemoteLinkPreferenceAction>,
+    ) {
+        self.handle_mouse_with_host_client_local_actions_and_render_context(mouse, None)
+    }
+
+    pub(super) fn handle_mouse_with_host_client_local_actions_and_render_context(
+        &mut self,
+        mouse: MouseEvent,
+        render_context: Option<&crate::ui::ClientRenderContext>,
     ) -> (
         Option<HostAction>,
         Option<crate::remote_link_preference::RemoteLinkPreferenceAction>,
@@ -335,7 +347,11 @@ impl App {
                     self.focus_pane_internal_via_api(ws_idx, info.id);
                 }
             }
-            if let Some(action) = self.state.handle_mouse(&mut self.terminal_runtimes, mouse) {
+            if let Some(action) = self.state.handle_mouse_with_render_context(
+                &mut self.terminal_runtimes,
+                mouse,
+                render_context,
+            ) {
                 match action {
                     MouseAction::Settings(action) => match action {
                         SettingsAction::SaveTheme(name) => self.save_theme(&name),

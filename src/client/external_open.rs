@@ -28,6 +28,10 @@ impl ClientExternalOpen {
         }
     }
 
+    pub(super) fn policy(&self) -> ExternalOpenPolicy {
+        self.policy
+    }
+
     pub(super) fn prepare(
         &mut self,
         request_id: u64,

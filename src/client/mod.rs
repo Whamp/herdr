@@ -1654,21 +1654,29 @@ async fn run_client_loop(
                     let _ = io::stdout().flush();
                 }
                 ServerMessage::ReloadClientConfig => {
-                    if let Some(policy) = reload_local_client_config(
+                    let reloaded_policy = reload_local_client_config(
                         &mut state.sound_config,
                         &mut state.redraw_on_focus_gained,
                         &mut state.draw_host_cursor,
                         #[cfg(unix)]
                         &mut state.remote_image_paste_key,
-                    ) {
-                        if let Some(update) = confirmed_external_open_policy_update(
+                    );
+                    let policy_message = if let Some(policy) = reloaded_policy {
+                        confirmed_external_open_policy_update(
                             config.connection_kind,
                             &mut external_open,
                             policy,
-                        ) {
-                            if let Err(error) = write_to_server(&mut write_stream, &update) {
-                                return Err(ClientError::ConnectionLost(error));
-                            }
+                        )
+                    } else {
+                        config.connection_kind.is_full_app().then_some(
+                            ClientMessage::ExternalOpenPolicyReloadFailed {
+                                effective_policy: external_open.policy(),
+                            },
+                        )
+                    };
+                    if let Some(policy_message) = policy_message {
+                        if let Err(error) = write_to_server(&mut write_stream, &policy_message) {
+                            return Err(ClientError::ConnectionLost(error));
                         }
                     }
                 }
@@ -1719,6 +1727,29 @@ async fn run_client_loop(
                 ServerMessage::ExternalOpenCancel { request_id } => {
                     if config.connection_kind.is_full_app() {
                         external_open.cancel(request_id);
+                    }
+                }
+                ServerMessage::ExternalOpenPolicyMutationRequest {
+                    request_id,
+                    requested_policy,
+                } => {
+                    if config.connection_kind.is_full_app() {
+                        let prior_effective = external_open.policy();
+                        let result = mutate_external_open_policy(
+                            request_id,
+                            requested_policy,
+                            prior_effective,
+                        );
+                        if let ClientMessage::ExternalOpenPolicyMutationResult {
+                            effective_policy,
+                            ..
+                        } = &result
+                        {
+                            external_open.confirm_policy(*effective_policy);
+                        }
+                        if let Err(error) = write_to_server(&mut write_stream, &result) {
+                            return Err(ClientError::ConnectionLost(error));
+                        }
                     }
                 }
                 ServerMessage::Welcome { .. } => {
@@ -1830,6 +1861,42 @@ fn client_remote_image_paste_key(
             warn!(diagnostic = %diagnostic, "local remote image paste key config diagnostic");
             None
         }
+    }
+}
+
+fn mutate_external_open_policy(
+    request_id: u64,
+    requested_policy: crate::protocol::ExternalOpenPolicy,
+    prior_effective_policy: crate::protocol::ExternalOpenPolicy,
+) -> ClientMessage {
+    let requested = requested_policy == crate::protocol::ExternalOpenPolicy::Enabled;
+    let prior_effective = prior_effective_policy == crate::protocol::ExternalOpenPolicy::Enabled;
+    let mutation = crate::remote_link_preference::persist_remote_link_preference_mutation(
+        requested,
+        prior_effective,
+    );
+    let policy = |enabled| {
+        if enabled {
+            crate::protocol::ExternalOpenPolicy::Enabled
+        } else {
+            crate::protocol::ExternalOpenPolicy::Disabled
+        }
+    };
+    let failure_stage = mutation.failure_stage().map(|stage| match stage {
+        crate::remote_link_preference::RemoteLinkPreferenceFailureStage::Write => {
+            crate::protocol::ExternalOpenPolicyMutationFailureStage::Write
+        }
+        crate::remote_link_preference::RemoteLinkPreferenceFailureStage::Reload => {
+            crate::protocol::ExternalOpenPolicyMutationFailureStage::Reload
+        }
+    });
+
+    ClientMessage::ExternalOpenPolicyMutationResult {
+        request_id,
+        requested_policy,
+        persisted_policy: mutation.persisted().map(policy),
+        effective_policy: policy(mutation.effective()),
+        failure_stage,
     }
 }
 
@@ -2951,6 +3018,47 @@ mod tests {
     #[test]
     fn sound_from_notify_message_rejects_unknown_payloads() {
         assert_eq!(sound_from_notify_message("toast"), None);
+    }
+
+    #[test]
+    fn policy_mutation_persists_and_returns_complete_result_identity_and_values() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-client-policy-mutation-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            "[experimental]\nopen_remote_links_on_client = false\n",
+        )
+        .unwrap();
+        let path_string = path.to_string_lossy().to_string();
+        let _env = EnvVarGuard::set(crate::config::CONFIG_PATH_ENV_VAR, &path_string);
+
+        let result = mutate_external_open_policy(
+            73,
+            crate::protocol::ExternalOpenPolicy::Enabled,
+            crate::protocol::ExternalOpenPolicy::Disabled,
+        );
+
+        assert_eq!(
+            result,
+            ClientMessage::ExternalOpenPolicyMutationResult {
+                request_id: 73,
+                requested_policy: crate::protocol::ExternalOpenPolicy::Enabled,
+                persisted_policy: Some(crate::protocol::ExternalOpenPolicy::Enabled),
+                effective_policy: crate::protocol::ExternalOpenPolicy::Enabled,
+                failure_stage: None,
+            }
+        );
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("open_remote_links_on_client = true"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

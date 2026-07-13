@@ -44,6 +44,48 @@ impl FileRemoteLinkPreferenceStore {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PersistedRemoteLinkPreferenceMutation {
+    persisted: Option<bool>,
+    effective: bool,
+    failure_stage: Option<RemoteLinkPreferenceFailureStage>,
+}
+
+impl PersistedRemoteLinkPreferenceMutation {
+    pub(crate) fn persisted(self) -> Option<bool> {
+        self.persisted
+    }
+
+    pub(crate) fn effective(self) -> bool {
+        self.effective
+    }
+
+    pub(crate) fn failure_stage(self) -> Option<RemoteLinkPreferenceFailureStage> {
+        self.failure_stage
+    }
+}
+
+pub(crate) fn persist_remote_link_preference_mutation(
+    requested: bool,
+    prior_effective: bool,
+) -> PersistedRemoteLinkPreferenceMutation {
+    match FileRemoteLinkPreferenceStore.persist_and_reload(requested) {
+        Ok(effective) => PersistedRemoteLinkPreferenceMutation {
+            persisted: Some(requested),
+            effective,
+            failure_stage: None,
+        },
+        Err(stage) => PersistedRemoteLinkPreferenceMutation {
+            persisted: match stage {
+                RemoteLinkPreferenceFailureStage::Write => None,
+                RemoteLinkPreferenceFailureStage::Reload => Some(requested),
+            },
+            effective: prior_effective,
+            failure_stage: Some(stage),
+        },
+    }
+}
+
 impl RemoteLinkPreferenceStore for FileRemoteLinkPreferenceStore {
     fn persist_and_reload(
         &self,
@@ -93,6 +135,14 @@ pub(crate) struct RemoteLinkPreferenceView {
 }
 
 impl RemoteLinkPreferenceView {
+    pub(crate) fn projected(confirmed: bool, saving: bool) -> Self {
+        Self {
+            confirmed,
+            effective: confirmed,
+            saving,
+        }
+    }
+
     pub(crate) fn confirmed(self) -> bool {
         self.confirmed
     }
