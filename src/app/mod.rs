@@ -75,6 +75,11 @@ pub(crate) struct OverlayPaneState {
     temp_files: Vec<std::path::PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostAction {
+    OpenExternalUrl { url: String },
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PaneClickState {
     pane_id: crate::layout::PaneId,
@@ -1538,16 +1543,17 @@ impl App {
     /// focused pane's negotiated keyboard protocol instead of passing host
     /// terminal escape sequences through unchanged.
     #[cfg(test)]
-    pub(crate) fn route_client_input(&mut self, data: Vec<u8>) {
+    pub(crate) fn route_client_input(&mut self, data: Vec<u8>) -> Vec<HostAction> {
         let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
-        self.route_client_events(events, true);
+        self.route_client_events(events, true)
     }
 
     pub(crate) fn route_client_events(
         &mut self,
         events: Vec<crate::raw_input::RawInputEvent>,
         apply_host_terminal_theme: bool,
-    ) {
+    ) -> Vec<HostAction> {
+        let mut host_actions = Vec::new();
         for event in events {
             let previous_mode = self.state.mode;
             match event {
@@ -1579,7 +1585,9 @@ impl App {
                 }
                 crate::raw_input::RawInputEvent::Mouse(mouse) => {
                     if self.state.mouse_capture {
-                        self.handle_mouse_event_headless(mouse);
+                        if let Some(action) = self.handle_mouse_event_headless(mouse) {
+                            host_actions.push(action);
+                        }
                     } else {
                         self.state
                             .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
@@ -1630,6 +1638,7 @@ impl App {
             }
             self.sync_prefix_input_source(previous_mode);
         }
+        host_actions
     }
 
     /// Handles a key event in non-terminal mode for the headless server.
@@ -1710,8 +1719,11 @@ impl App {
     /// Delegates to the same mouse handling logic used in the monolithic
     /// mode (hit-testing against the rendered UI), which works because
     /// the server's AppState maintains view geometry from virtual rendering.
-    fn handle_mouse_event_headless(&mut self, mouse: crossterm::event::MouseEvent) {
-        self.handle_mouse(mouse);
+    fn handle_mouse_event_headless(
+        &mut self,
+        mouse: crossterm::event::MouseEvent,
+    ) -> Option<HostAction> {
+        self.handle_mouse(mouse)
     }
 }
 

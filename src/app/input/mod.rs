@@ -62,7 +62,14 @@ use self::{
     settings::SettingsAction,
 };
 use super::state::{AppState, Mode};
-use super::App;
+use super::{App, HostAction};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModifiedUrlClick {
+    NotHandled,
+    Handled,
+    HostAction(HostAction),
+}
 
 // ---------------------------------------------------------------------------
 // Key handling
@@ -238,9 +245,9 @@ impl App {
         }
     }
 
-    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
+    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<HostAction> {
         if self.handle_overlay_mouse(mouse) {
-            return;
+            return None;
         }
 
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -259,12 +266,14 @@ impl App {
                 self.state.sidebar_width_auto = false;
                 self.state.mark_session_dirty();
                 self.state.drag = None;
-                return;
+                return None;
             }
         }
 
-        if self.handle_modified_url_click(mouse) {
-            return;
+        match self.handle_modified_url_click(mouse) {
+            ModifiedUrlClick::NotHandled => {}
+            ModifiedUrlClick::Handled => return None,
+            ModifiedUrlClick::HostAction(action) => return Some(action),
         }
 
         let handled_pane_double_click = self.handle_pane_double_click(mouse);
@@ -371,18 +380,20 @@ impl App {
             self.selection_autoscroll_deadline =
                 Some(std::time::Instant::now() + super::SELECTION_AUTOSCROLL_INTERVAL);
         }
+
+        None
     }
 
-    fn handle_modified_url_click(&mut self, mouse: MouseEvent) -> bool {
+    fn handle_modified_url_click(&mut self, mouse: MouseEvent) -> ModifiedUrlClick {
         if self.state.mode != Mode::Terminal
             || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             || !mouse.modifiers.contains(modified_url_click_modifier())
         {
-            return false;
+            return ModifiedUrlClick::NotHandled;
         }
 
         let Some(info) = self.state.pane_at(mouse.column, mouse.row).cloned() else {
-            return false;
+            return ModifiedUrlClick::NotHandled;
         };
         let viewport_row = mouse.row.saturating_sub(info.inner_rect.y);
         let col = mouse.column.saturating_sub(info.inner_rect.x);
@@ -390,21 +401,18 @@ impl App {
             self.state
                 .url_at_pane_cell(&self.terminal_runtimes, info.id, viewport_row, col)
         else {
-            return false;
+            return ModifiedUrlClick::NotHandled;
         };
 
         self.last_pane_click = None;
         match self.invoke_plugin_link_handler_for_url(&url, info.id) {
-            Ok(true) => return true,
+            Ok(true) => return ModifiedUrlClick::Handled,
             Ok(false) => {}
             Err(err) => {
                 tracing::warn!(err = %err, url = %url, "failed to invoke plugin link handler");
             }
         }
-        if let Err(err) = crate::platform::open_url(&url) {
-            tracing::warn!(err = %err, url = %url, "failed to open pane URL");
-        }
-        true
+        ModifiedUrlClick::HostAction(HostAction::OpenExternalUrl { url })
     }
 
     fn handle_pane_double_click(&mut self, mouse: MouseEvent) -> bool {

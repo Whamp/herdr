@@ -1,3 +1,4 @@
+use std::io;
 use std::time::{Duration, Instant};
 
 use crossterm::terminal;
@@ -36,6 +37,21 @@ pub(crate) struct WorkspaceGitRefreshJob {
 pub(crate) struct WorkspaceGitRefreshOutput {
     pub(crate) results: Vec<WorkspaceGitStatus>,
     pub(crate) cache_updates: Vec<(std::path::PathBuf, GitStatusCacheEntry)>,
+}
+
+fn consume_monolithic_host_action_with(
+    action: super::HostAction,
+    open_url: impl FnOnce(&str) -> io::Result<()>,
+) -> io::Result<()> {
+    match action {
+        super::HostAction::OpenExternalUrl { url } => open_url(&url),
+    }
+}
+
+fn consume_monolithic_host_action(action: super::HostAction) {
+    if let Err(err) = consume_monolithic_host_action_with(action, crate::platform::open_url) {
+        tracing::warn!(err = %err, "failed to open pane URL");
+    }
 }
 
 impl App {
@@ -152,7 +168,9 @@ impl App {
             }
             crate::raw_input::RawInputEvent::Mouse(mouse) => {
                 if self.state.mouse_capture {
-                    self.handle_mouse(mouse);
+                    if let Some(action) = self.handle_mouse(mouse) {
+                        consume_monolithic_host_action(action);
+                    }
                 } else {
                     self.state
                         .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
@@ -696,6 +714,24 @@ mod tests {
     use crate::app::state;
     use crate::workspace::Workspace;
     use std::path::PathBuf;
+
+    #[test]
+    fn monolithic_host_consumes_external_open_with_local_opener() {
+        let mut opened = Vec::new();
+
+        consume_monolithic_host_action_with(
+            super::super::HostAction::OpenExternalUrl {
+                url: "https://example.com/pr/307".to_owned(),
+            },
+            |url| {
+                opened.push(url.to_owned());
+                Ok(())
+            },
+        )
+        .expect("local opener should accept URL");
+
+        assert_eq!(opened, vec!["https://example.com/pr/307"]);
+    }
 
     fn test_app_with_pane() -> (super::super::App, crate::layout::PaneId) {
         let mut app = super::super::App::new(

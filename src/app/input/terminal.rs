@@ -542,6 +542,30 @@ mod tests {
         assert!(app.selection_highlight_clear_deadline.is_none());
     }
 
+    #[tokio::test]
+    async fn ctrl_click_unhandled_url_emits_external_open_host_action() {
+        let line = "see https://example.com/pr/307.";
+        let col = line.find("example").expect("url host") as u16;
+        let (mut app, info) = app_with_screen_bytes(line.as_bytes());
+
+        let actions = app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Mouse(modified_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                info.inner_rect.x + col,
+                info.inner_rect.y,
+                KeyModifiers::CONTROL,
+            ))],
+            true,
+        );
+
+        assert_eq!(
+            actions,
+            vec![crate::app::HostAction::OpenExternalUrl {
+                url: "https://example.com/pr/307".to_owned(),
+            }]
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn ctrl_click_url_invokes_plugin_link_handler_but_super_click_does_not() {
@@ -550,13 +574,17 @@ mod tests {
 
         let (mut ctrl_app, ctrl_info) = app_with_screen_bytes(line.as_bytes());
         install_test_link_handler(&mut ctrl_app);
-        ctrl_app.handle_mouse(modified_mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            ctrl_info.inner_rect.x + col,
-            ctrl_info.inner_rect.y,
-            KeyModifiers::CONTROL,
-        ));
+        let ctrl_actions = ctrl_app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Mouse(modified_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                ctrl_info.inner_rect.x + col,
+                ctrl_info.inner_rect.y,
+                KeyModifiers::CONTROL,
+            ))],
+            true,
+        );
 
+        assert!(ctrl_actions.is_empty());
         let ctrl_log = ctrl_app
             .state
             .plugin_command_logs
