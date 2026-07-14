@@ -317,6 +317,9 @@ fn classify_openssh_control_stderr(stderr: &str) -> OpenSshControlFailure {
     }
     let collision = stderr.lines().any(|line| {
         let lowercase = line.trim().to_ascii_lowercase();
+        if lowercase == "mux_client_forward: forwarding request failed: port forwarding failed" {
+            return true;
+        }
         let Some(binding) = lowercase.strip_prefix("bind [") else {
             return false;
         };
@@ -1028,6 +1031,7 @@ mod tests {
         for stderr in [
             "bind [127.0.0.1]:80: Address already in use",
             "bind [::1]:8080: address already in use\r\nCould not request local forwarding.",
+            "mux_client_forward: forwarding request failed: Port forwarding failed",
         ] {
             assert_eq!(
                 classify_openssh_control_stderr(stderr),
