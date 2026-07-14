@@ -21,7 +21,13 @@ trait MappingCommandCall: Send {
 }
 
 trait PolicyCommandCall: Send {
-    fn poll(&mut self) -> Option<(bool, Result<(), ForwardFailure>)>;
+    fn poll(
+        &mut self,
+    ) -> Option<(
+        bool,
+        crate::config::SavedPortForwardLimit,
+        Result<(), ForwardFailure>,
+    )>;
     fn cancel(&mut self);
 }
 
@@ -34,6 +40,7 @@ trait ForwardCommand: Send + Sync {
     fn begin_set_enabled(
         &self,
         enabled: bool,
+        saved_mapping_limit: crate::config::SavedPortForwardLimit,
     ) -> Result<Box<dyn PolicyCommandCall>, ForwardFailure>;
 }
 
@@ -48,7 +55,13 @@ impl MappingCommandCall for MappingCall {
 }
 
 impl PolicyCommandCall for PolicyCall {
-    fn poll(&mut self) -> Option<(bool, Result<(), ForwardFailure>)> {
+    fn poll(
+        &mut self,
+    ) -> Option<(
+        bool,
+        crate::config::SavedPortForwardLimit,
+        Result<(), ForwardFailure>,
+    )> {
         self.try_wait()
     }
 
@@ -74,8 +87,9 @@ impl ForwardCommand for ForwardingClient {
     fn begin_set_enabled(
         &self,
         enabled: bool,
+        saved_mapping_limit: crate::config::SavedPortForwardLimit,
     ) -> Result<Box<dyn PolicyCommandCall>, ForwardFailure> {
-        self.begin_assert_policy(enabled)
+        self.begin_assert_policy(enabled, saved_mapping_limit)
             .map(|call| Box::new(call) as Box<dyn PolicyCommandCall>)
             .map_err(|_| ForwardFailure::CapabilityClosed)
     }
@@ -137,13 +151,15 @@ impl ForwardingController for NumericForwardingController {
     fn begin_set_enabled(
         &self,
         enabled: bool,
+        saved_mapping_limit: crate::config::SavedPortForwardLimit,
     ) -> Result<Box<dyn ForwardingPolicyChange>, ForwardingPreparationError> {
         let call = self
             .command
-            .begin_set_enabled(enabled)
+            .begin_set_enabled(enabled, saved_mapping_limit)
             .map_err(forwarding_failure)?;
         Ok(Box::new(NumericPolicyOperation {
             requested: enabled,
+            requested_saved_mapping_limit: saved_mapping_limit,
             call: Some(call),
             settled: false,
         }))
@@ -207,6 +223,7 @@ impl Drop for MappingForwardOperation {
 
 struct NumericPolicyOperation {
     requested: bool,
+    requested_saved_mapping_limit: crate::config::SavedPortForwardLimit,
     call: Option<Box<dyn PolicyCommandCall>>,
     settled: bool,
 }
@@ -216,12 +233,14 @@ impl ForwardingPolicyChange for NumericPolicyOperation {
         if self.settled {
             return None;
         }
-        let (effective, result) = self.call.as_mut()?.poll()?;
+        let (effective, effective_saved_mapping_limit, result) = self.call.as_mut()?.poll()?;
         self.call = None;
         self.settled = true;
         Some(ForwardingPolicySettlement {
             requested: self.requested,
             effective,
+            requested_saved_mapping_limit: self.requested_saved_mapping_limit,
+            effective_saved_mapping_limit,
             result: result.map_err(forwarding_failure),
         })
     }
@@ -247,6 +266,8 @@ impl Drop for NumericPolicyOperation {
 fn forwarding_failure(error: ForwardFailure) -> ForwardingPreparationError {
     match error {
         ForwardFailure::TooManyRequests => ForwardingPreparationError::TooManyRequests,
+        ForwardFailure::TooManyWaiters => ForwardingPreparationError::TooManyWaiters,
+        ForwardFailure::CapacityExhausted => ForwardingPreparationError::CapacityExhausted,
         ForwardFailure::BindFailed => ForwardingPreparationError::BindExhausted,
         ForwardFailure::AlreadyOwned | ForwardFailure::CommandRejected => {
             ForwardingPreparationError::CommandRejected
@@ -269,11 +290,15 @@ mod tests {
 
     struct ImmediateMappingCall {
         result: Option<Result<u16, ForwardFailure>>,
+        pending_once: bool,
         cancelled: Arc<Mutex<usize>>,
     }
 
     impl MappingCommandCall for ImmediateMappingCall {
         fn poll(&mut self) -> Option<Result<u16, ForwardFailure>> {
+            if std::mem::take(&mut self.pending_once) {
+                return None;
+            }
             self.result.take()
         }
 
@@ -285,12 +310,21 @@ mod tests {
 
     struct ImmediatePolicyCall {
         effective: bool,
+        saved_mapping_limit: crate::config::SavedPortForwardLimit,
         result: Option<Result<(), ForwardFailure>>,
     }
 
     impl PolicyCommandCall for ImmediatePolicyCall {
-        fn poll(&mut self) -> Option<(bool, Result<(), ForwardFailure>)> {
-            self.result.take().map(|result| (self.effective, result))
+        fn poll(
+            &mut self,
+        ) -> Option<(
+            bool,
+            crate::config::SavedPortForwardLimit,
+            Result<(), ForwardFailure>,
+        )> {
+            self.result
+                .take()
+                .map(|result| (self.effective, self.saved_mapping_limit, result))
         }
 
         fn cancel(&mut self) {
@@ -299,7 +333,7 @@ mod tests {
     }
 
     struct FakeForwardCommand {
-        results: Mutex<VecDeque<Result<u16, ForwardFailure>>>,
+        results: Mutex<VecDeque<(bool, Result<u16, ForwardFailure>)>>,
         specs: Mutex<Vec<ForwardSpec>>,
         localhost_ports: Mutex<Vec<u16>>,
         cancelled: Arc<Mutex<usize>>,
@@ -307,6 +341,18 @@ mod tests {
 
     impl FakeForwardCommand {
         fn new(results: impl IntoIterator<Item = Result<u16, ForwardFailure>>) -> Self {
+            Self::with_results(results.into_iter().map(|result| (false, result)))
+        }
+
+        fn with_pending_results(
+            results: impl IntoIterator<Item = Result<u16, ForwardFailure>>,
+        ) -> Self {
+            Self::with_results(results.into_iter().map(|result| (true, result)))
+        }
+
+        fn with_results(
+            results: impl IntoIterator<Item = (bool, Result<u16, ForwardFailure>)>,
+        ) -> Self {
             Self {
                 results: Mutex::new(results.into_iter().collect()),
                 specs: Mutex::new(Vec::new()),
@@ -314,6 +360,42 @@ mod tests {
                 cancelled: Arc::new(Mutex::new(0)),
             }
         }
+    }
+
+    macro_rules! define_forwarding_failure_cases {
+        ($( $failure:ident => $expected:ident ),+ $(,)?) => {
+            const FORWARDING_FAILURE_CASES: &[
+                (&str, ForwardFailure, ForwardingPreparationError)
+            ] = &[
+                $(
+                    (
+                        stringify!($failure),
+                        ForwardFailure::$failure,
+                        ForwardingPreparationError::$expected,
+                    ),
+                )+
+            ];
+
+            fn assert_forward_failure_taxonomy_is_exhaustive(failure: ForwardFailure) {
+                match failure {
+                    $(ForwardFailure::$failure => {},)+
+                }
+            }
+        };
+    }
+
+    define_forwarding_failure_cases! {
+        Disabled => Unavailable,
+        Cancelled => Unavailable,
+        TooManyRequests => TooManyRequests,
+        TooManyWaiters => TooManyWaiters,
+        CapacityExhausted => CapacityExhausted,
+        AlreadyOwned => CommandRejected,
+        BindFailed => BindExhausted,
+        CommandRejected => CommandRejected,
+        CommandTimedOut => CommandTimedOut,
+        AtomicCreationFailed => AtomicCreationFailed,
+        CapabilityClosed => Unavailable,
     }
 
     impl ForwardCommand for FakeForwardCommand {
@@ -329,7 +411,7 @@ mod tests {
                     .expect("localhost ports")
                     .push(remote_port),
             }
-            let result = self
+            let (pending_once, result) = self
                 .results
                 .lock()
                 .expect("results")
@@ -337,6 +419,7 @@ mod tests {
                 .expect("queued result");
             Ok(Box::new(ImmediateMappingCall {
                 result: Some(result),
+                pending_once,
                 cancelled: Arc::clone(&self.cancelled),
             }))
         }
@@ -344,12 +427,48 @@ mod tests {
         fn begin_set_enabled(
             &self,
             enabled: bool,
+            saved_mapping_limit: crate::config::SavedPortForwardLimit,
         ) -> Result<Box<dyn PolicyCommandCall>, ForwardFailure> {
             Ok(Box::new(ImmediatePolicyCall {
                 effective: enabled,
+                saved_mapping_limit,
                 result: Some(Ok(())),
             }))
         }
+    }
+
+    #[test]
+    fn every_broker_settlement_failure_maps_to_its_exact_controller_preparation_error() {
+        let command = Arc::new(FakeForwardCommand::with_pending_results(
+            FORWARDING_FAILURE_CASES
+                .iter()
+                .map(|(_, failure, _)| Err(*failure)),
+        ));
+        let controller = NumericForwardingController::with_capability(command.clone(), true);
+        let target = LoopbackTarget::Ipv4(Ipv4Addr::new(127, 0, 0, 42));
+        let remote_port = NonZeroU16::new(8080).expect("port");
+
+        for (name, failure, expected) in FORWARDING_FAILURE_CASES {
+            assert_forward_failure_taxonomy_is_exhaustive(*failure);
+            let mut operation = controller
+                .begin_prepare_numeric(target, remote_port)
+                .unwrap_or_else(|error| panic!("{name} failed synchronously: {error:?}"));
+            assert_eq!(operation.poll(), None, "{name} did not begin pending");
+            assert_eq!(
+                operation.poll(),
+                Some(Err(*expected)),
+                "wrong settlement mapping for {name}"
+            );
+            assert_eq!(operation.poll(), None, "{name} settled more than once");
+        }
+
+        assert_eq!(
+            *command.specs.lock().expect("specs"),
+            vec![
+                forward_spec(LoopbackAddress::Ipv4([127, 0, 0, 42]), remote_port);
+                FORWARDING_FAILURE_CASES.len()
+            ]
+        );
     }
 
     #[test]

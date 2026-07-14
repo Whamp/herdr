@@ -419,6 +419,8 @@ fn client_handshake(stream: &mut UnixStream, version: u32, cols: u16, rows: u16)
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set read timeout");
 
+    static NEXT_ATTACHMENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let attachment = NEXT_ATTACHMENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // ClientMessage::Hello = variant 0
     let mut payload = encode_varint_u32(0);
     payload.extend_from_slice(&encode_varint_u32(version));
@@ -431,6 +433,9 @@ fn client_handshake(stream: &mut UnixStream, version: u32, cols: u16, rows: u16)
     payload.extend_from_slice(&encode_varint_u32(0)); // ClientLaunchMode::App
     payload.extend_from_slice(&encode_varint_u32(1)); // Some external-open policy
     payload.extend_from_slice(&encode_varint_u32(0)); // ExternalOpenPolicy::Disabled
+    payload.extend_from_slice(&encode_varint_u32(1)); // Some external-open attachment
+    payload.extend_from_slice(&encode_varint_u32(1)); // attachment high u64
+    payload.extend_from_slice(&encode_varint_u32(attachment)); // attachment low u64
 
     stream
         .write_all(&frame_message(&payload))

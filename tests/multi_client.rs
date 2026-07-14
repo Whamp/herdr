@@ -765,6 +765,24 @@ fn encode_varint_u16(v: u16) -> Vec<u8> {
     }
 }
 
+fn encode_varint_u64(v: u64) -> Vec<u8> {
+    if v < 251 {
+        vec![v as u8]
+    } else if u16::try_from(v).is_ok() {
+        let mut buf = vec![251_u8];
+        buf.extend_from_slice(&(v as u16).to_le_bytes());
+        buf
+    } else if u32::try_from(v).is_ok() {
+        let mut buf = vec![252_u8];
+        buf.extend_from_slice(&(v as u32).to_le_bytes());
+        buf
+    } else {
+        let mut buf = vec![253_u8];
+        buf.extend_from_slice(&v.to_le_bytes());
+        buf
+    }
+}
+
 fn frame_message(payload: &[u8]) -> Vec<u8> {
     let len = payload.len() as u32;
     let mut framed = len.to_le_bytes().to_vec();
@@ -897,6 +915,7 @@ fn client_handshake_with_kind(
     rows: u16,
     launch_mode: u32,
     external_open_policy: Option<u32>,
+    external_open_attachment: Option<u64>,
     render_encoding: u32,
 ) -> Result<(), String> {
     stream
@@ -917,6 +936,14 @@ fn client_handshake_with_kind(
         Some(policy) => {
             hello_payload.extend_from_slice(&encode_varint_u32(1));
             hello_payload.extend_from_slice(&encode_varint_u32(policy));
+        }
+        None => hello_payload.extend_from_slice(&encode_varint_u32(0)),
+    }
+    match external_open_attachment {
+        Some(attachment) => {
+            hello_payload.extend_from_slice(&encode_varint_u32(1));
+            hello_payload.extend_from_slice(&encode_varint_u64(1));
+            hello_payload.extend_from_slice(&encode_varint_u64(attachment));
         }
         None => hello_payload.extend_from_slice(&encode_varint_u32(0)),
     }
@@ -976,6 +1003,8 @@ fn connect_full_app_client(
     rows: u16,
     external_open_enabled: bool,
 ) -> UnixStream {
+    static NEXT_ATTACHMENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let attachment = NEXT_ATTACHMENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut stream = UnixStream::connect(client_socket).expect("should connect to client socket");
     client_handshake_with_kind(
         &mut stream,
@@ -984,6 +1013,7 @@ fn connect_full_app_client(
         rows,
         0,
         Some(u32::from(external_open_enabled)),
+        Some(attachment),
         0,
     )
     .expect("full app handshake should succeed");
@@ -992,7 +1022,7 @@ fn connect_full_app_client(
 
 fn connect_terminal_connection(client_socket: &Path, cols: u16, rows: u16) -> UnixStream {
     let mut stream = UnixStream::connect(client_socket).expect("should connect to client socket");
-    client_handshake_with_kind(&mut stream, CURRENT_PROTOCOL, cols, rows, 1, None, 1)
+    client_handshake_with_kind(&mut stream, CURRENT_PROTOCOL, cols, rows, 1, None, None, 1)
         .expect("terminal connection handshake should succeed");
     stream
 }
@@ -1992,11 +2022,11 @@ fn external_open_immediate_target_queue_failure_is_delivery_failed_without_rerou
     let (next_id, prepared_url) =
         read_external_prepare(&mut other, Duration::from_secs(3)).expect("other client prepare");
     assert_eq!(prepared_url, url);
-    assert_ne!(next_id, failed_id);
+    assert_eq!(
+        next_id, failed_id,
+        "distinct attachment ledgers may use the same opaque request id independently"
+    );
     let unknown_id = next_id + 10_000;
-    send_external_ready_direct(&mut other, failed_id);
-    send_external_opened_directly(&mut other, failed_id);
-    send_external_preparation_failed(&mut other, failed_id, 3);
     send_external_ready_direct(&mut other, unknown_id);
     send_external_opened_directly(&mut other, unknown_id);
     assert_no_external_server_message(&mut other, Duration::from_millis(150));
@@ -2021,15 +2051,25 @@ fn external_open_immediate_target_queue_failure_is_delivery_failed_without_rerou
     thread::sleep(Duration::from_millis(100));
 
     assert_eq!(opener.request_ids(), &[next_id]);
+    let settlements = all_external_open_settlement_lines(&server_log_path(&config_home));
     assert_eq!(
-        external_open_settlement_lines(&server_log_path(&config_home), failed_id).len(),
-        1,
-        "delivery failure must remain settled exactly once"
+        settlements.len(),
+        2,
+        "each attachment must settle exactly once"
     );
     assert_eq!(
-        external_open_settlement_lines(&server_log_path(&config_home), next_id).len(),
-        1,
-        "unrelated client request must settle exactly once"
+        settlements
+            .iter()
+            .filter(|line| line.contains("client_delivery_failed"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        settlements
+            .iter()
+            .filter(|line| line.contains("opened_directly"))
+            .count(),
+        1
     );
     assert!(
         external_open_settlement_lines(&server_log_path(&config_home), unknown_id).is_empty(),

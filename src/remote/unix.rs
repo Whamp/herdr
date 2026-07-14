@@ -171,6 +171,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         .remote
         .manage_ssh_config;
     let remote_ssh = RemoteSsh::new(remote.target.clone(), manage_ssh_config);
+    let external_open_attachment_id = crate::remote::new_external_open_attachment_id();
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let forwarding_launch = remote_ssh.forwarding_launch();
     let prepared_remote = prepare_remote_herdr(&remote_ssh, remote.live_handoff)?;
@@ -196,10 +197,16 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         &reattach_command,
         remote.keybindings,
         forwarding_launch,
+        external_open_attachment_id,
     );
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    run_client_process(&local_socket, &reattach_command, remote.keybindings)
+    run_client_process(
+        &local_socket,
+        &reattach_command,
+        remote.keybindings,
+        external_open_attachment_id,
+    )
 }
 
 pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
@@ -2018,6 +2025,7 @@ fn client_process_command(
         .env(REATTACH_COMMAND_ENV_VAR, reattach_command)
         .env(REMOTE_KEYBINDINGS_ENV_VAR, keybindings.as_str())
         .env_remove(crate::api::SOCKET_PATH_ENV_VAR)
+        .env_remove(crate::remote::EXTERNAL_OPEN_ATTACHMENT_ENV_VAR)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -2034,8 +2042,13 @@ fn run_client_process(
     reattach_command: &str,
     keybindings: RemoteKeybindings,
     forwarding_launch: ForwardingLaunch,
+    external_open_attachment_id: crate::protocol::ExternalOpenAttachmentId,
 ) -> io::Result<()> {
     let mut command = client_process_command(local_socket, reattach_command, keybindings)?;
+    command.env(
+        crate::remote::EXTERNAL_OPEN_ATTACHMENT_ENV_VAR,
+        external_open_attachment_id.to_env_value(),
+    );
     let (forwarding_authority, launch_status) = match forwarding_launch {
         ForwardingLaunch::Available(authority) => (
             Some(authority),
@@ -2080,8 +2093,14 @@ fn run_client_process(
     local_socket: &Path,
     reattach_command: &str,
     keybindings: RemoteKeybindings,
+    external_open_attachment_id: crate::protocol::ExternalOpenAttachmentId,
 ) -> io::Result<()> {
-    let status = client_process_command(local_socket, reattach_command, keybindings)?.status()?;
+    let status = client_process_command(local_socket, reattach_command, keybindings)?
+        .env(
+            crate::remote::EXTERNAL_OPEN_ATTACHMENT_ENV_VAR,
+            external_open_attachment_id.to_env_value(),
+        )
+        .status()?;
     remote_client_status(status)
 }
 

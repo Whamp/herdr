@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -11,13 +11,11 @@ use super::protocol::{
     BROKER_PROTOCOL_VERSION,
 };
 use super::registry::{
-    MappingAttempt, MappingControlResult, MappingRegistry, MappingRequest, MappingSettlement,
-    WaiterCancellation,
+    MappingAttempt, MappingCancellation, MappingControlResult, MappingRegistry, MappingRequest,
+    MappingSettlement, SavedLimitChange, WaiterCancellation,
 };
 use super::transport::AuthenticatedFrameReader;
 use super::worker::{CommandRunner, ControlAuthority, ControlResult, ControlWorker, WorkerJob};
-
-const MAX_PENDING_FORWARD_REQUESTS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingKind {
@@ -37,6 +35,7 @@ struct ClientInner {
     pending: Mutex<BTreeMap<u64, PendingClientCall>>,
     next_id: AtomicU64,
     active: AtomicBool,
+    saved_mapping_limit: AtomicU8,
     closed: AtomicBool,
 }
 
@@ -49,6 +48,7 @@ impl ForwardingClient {
     pub(super) fn from_stream(
         stream: UnixStream,
         initial_policy: bool,
+        initial_saved_mapping_limit: crate::config::SavedPortForwardLimit,
         expected_parent: crate::platform::InheritedPeerIdentity,
     ) -> io::Result<Self> {
         let reader_stream = stream.try_clone()?;
@@ -57,6 +57,7 @@ impl ForwardingClient {
             pending: Mutex::new(BTreeMap::new()),
             next_id: AtomicU64::new(1),
             active: AtomicBool::new(false),
+            saved_mapping_limit: AtomicU8::new(crate::config::SavedPortForwardLimit::DEFAULT.get()),
             closed: AtomicBool::new(false),
         });
         spawn_client_reader(reader_stream, expected_parent, Arc::downgrade(&inner))?;
@@ -78,7 +79,7 @@ impl ForwardingClient {
                 "forwarding broker hello rejected",
             ));
         }
-        client.assert_policy(initial_policy)?;
+        client.assert_policy_with_limit(initial_policy, initial_saved_mapping_limit)?;
         Ok(client)
     }
 
@@ -98,6 +99,7 @@ impl ForwardingClient {
         Self::from_stream(
             stream,
             initial_policy,
+            crate::config::SavedPortForwardLimit::DEFAULT,
             crate::platform::InheritedPeerIdentity::current_process(),
         )
     }
@@ -107,18 +109,37 @@ impl ForwardingClient {
         self.inner.active.load(Ordering::Acquire) && !self.inner.closed.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(crate) fn assert_policy(&self, enabled: bool) -> io::Result<()> {
-        let (effective, result) = self.begin_assert_policy(enabled)?.wait()?;
+        self.assert_policy_with_limit(enabled, crate::config::SavedPortForwardLimit::DEFAULT)
+    }
+
+    pub(crate) fn assert_policy_with_limit(
+        &self,
+        enabled: bool,
+        saved_mapping_limit: crate::config::SavedPortForwardLimit,
+    ) -> io::Result<()> {
+        let (effective, _effective_saved_mapping_limit, result) = self
+            .begin_assert_policy(enabled, saved_mapping_limit)?
+            .wait()?;
         self.inner.active.store(effective, Ordering::Release);
         result.map_err(|_| io::Error::other("forwarding broker policy update failed"))
     }
 
-    pub(crate) fn begin_assert_policy(&self, enabled: bool) -> io::Result<PolicyCall> {
-        let (id, receiver) = self.start_call(PendingKind::Policy, |id| {
-            ClientMessage::AssertPolicy { id, enabled }
-        })?;
+    pub(crate) fn begin_assert_policy(
+        &self,
+        enabled: bool,
+        saved_mapping_limit: crate::config::SavedPortForwardLimit,
+    ) -> io::Result<PolicyCall> {
+        let (id, receiver) =
+            self.start_call(PendingKind::Policy, |id| ClientMessage::AssertPolicy {
+                id,
+                enabled,
+                saved_mapping_limit: saved_mapping_limit.get(),
+            })?;
         Ok(PolicyCall {
             requested: enabled,
+            requested_saved_mapping_limit: saved_mapping_limit,
             core: BrokerCallCore::new(
                 id,
                 receiver,
@@ -305,13 +326,23 @@ impl BrokerCallCore {
             .receiver
             .take()
             .and_then(|receiver| receiver.recv().ok())
-            .ok_or(ForwardFailure::CapabilityClosed);
+            .ok_or(ForwardFailure::CapabilityClosed)
+            .and_then(|response| {
+                if self.inner.closed.load(Ordering::Acquire) {
+                    Err(ForwardFailure::CapabilityClosed)
+                } else {
+                    Ok(response)
+                }
+            });
         self.settled = true;
         response
     }
 
     fn try_wait(&mut self) -> Option<Result<ServerMessage, ForwardFailure>> {
         let response = match self.receiver.as_ref()?.try_recv() {
+            Ok(_) if self.inner.closed.load(Ordering::Acquire) => {
+                Err(ForwardFailure::CapabilityClosed)
+            }
             Ok(response) => Ok(response),
             Err(mpsc::TryRecvError::Empty) => return None,
             Err(mpsc::TryRecvError::Disconnected) => Err(ForwardFailure::CapabilityClosed),
@@ -337,8 +368,58 @@ impl BrokerCallCore {
         self.cancelled = true;
     }
 
-    fn set_active(&self, active: bool) {
-        self.inner.active.store(active, Ordering::Release);
+    fn current_policy(&self) -> Option<(bool, crate::config::SavedPortForwardLimit)> {
+        let saved_mapping_limit = crate::config::SavedPortForwardLimit::new(
+            self.inner.saved_mapping_limit.load(Ordering::Acquire),
+        )?;
+        Some((
+            self.inner.active.load(Ordering::Acquire),
+            saved_mapping_limit,
+        ))
+    }
+
+    fn current_policy_or_closed(
+        &self,
+    ) -> (
+        bool,
+        crate::config::SavedPortForwardLimit,
+        Result<(), ForwardFailure>,
+    ) {
+        let (effective, saved_mapping_limit) = self
+            .current_policy()
+            .unwrap_or((false, crate::config::SavedPortForwardLimit::DEFAULT));
+        (
+            effective,
+            saved_mapping_limit,
+            Err(ForwardFailure::CapabilityClosed),
+        )
+    }
+
+    fn apply_policy_settlement(
+        &self,
+        settlement: (
+            bool,
+            crate::config::SavedPortForwardLimit,
+            Result<(), ForwardFailure>,
+        ),
+    ) -> (
+        bool,
+        crate::config::SavedPortForwardLimit,
+        Result<(), ForwardFailure>,
+    ) {
+        let (effective, reported_limit, result) = settlement;
+        let saved_mapping_limit = if result.is_ok() {
+            reported_limit
+        } else if let Some((_, current)) = self.current_policy() {
+            current
+        } else {
+            return self.current_policy_or_closed();
+        };
+        self.inner.active.store(effective, Ordering::Release);
+        self.inner
+            .saved_mapping_limit
+            .store(saved_mapping_limit.get(), Ordering::Release);
+        (effective, saved_mapping_limit, result)
     }
 }
 
@@ -412,29 +493,46 @@ fn localhost_response(
 
 pub(crate) struct PolicyCall {
     requested: bool,
+    requested_saved_mapping_limit: crate::config::SavedPortForwardLimit,
     core: BrokerCallCore,
 }
 
 impl PolicyCall {
-    fn wait(mut self) -> io::Result<(bool, Result<(), ForwardFailure>)> {
+    fn wait(
+        mut self,
+    ) -> io::Result<(
+        bool,
+        crate::config::SavedPortForwardLimit,
+        Result<(), ForwardFailure>,
+    )> {
         let response = self.core.wait().ok();
-        let settled = policy_response(self.requested, response)?;
-        self.core.set_active(settled.0);
-        Ok(settled)
+        let settled =
+            policy_response(self.requested, self.requested_saved_mapping_limit, response)?;
+        Ok(self.core.apply_policy_settlement(settled))
     }
 
-    pub(crate) fn try_wait(&mut self) -> Option<(bool, Result<(), ForwardFailure>)> {
+    pub(crate) fn try_wait(
+        &mut self,
+    ) -> Option<(
+        bool,
+        crate::config::SavedPortForwardLimit,
+        Result<(), ForwardFailure>,
+    )> {
         let response = match self.core.try_wait()? {
             Ok(response) => Some(response),
             Err(ForwardFailure::CapabilityClosed) => {
-                return Some((false, Err(ForwardFailure::CapabilityClosed)));
+                return Some(self.core.current_policy_or_closed());
             }
-            Err(error) => return Some((false, Err(error))),
+            Err(error) => {
+                let Some((effective, saved_mapping_limit)) = self.core.current_policy() else {
+                    return Some(self.core.current_policy_or_closed());
+                };
+                return Some((effective, saved_mapping_limit, Err(error)));
+            }
         };
-        let settled = policy_response(self.requested, response)
-            .unwrap_or((false, Err(ForwardFailure::CapabilityClosed)));
-        self.core.set_active(settled.0);
-        Some(settled)
+        let settled = policy_response(self.requested, self.requested_saved_mapping_limit, response)
+            .unwrap_or_else(|_| self.core.current_policy_or_closed());
+        Some(self.core.apply_policy_settlement(settled))
     }
 
     pub(crate) fn cancel(&mut self) {
@@ -444,20 +542,42 @@ impl PolicyCall {
 
 fn policy_response(
     requested: bool,
+    requested_saved_mapping_limit: crate::config::SavedPortForwardLimit,
     response: Option<ServerMessage>,
-) -> io::Result<(bool, Result<(), ForwardFailure>)> {
-    match response {
-        Some(ServerMessage::PolicyAcknowledged {
-            requested: acknowledged,
-            effective,
-            result,
-            ..
-        }) if acknowledged == requested => Ok((effective, result)),
-        _ => Err(io::Error::new(
+) -> io::Result<(
+    bool,
+    crate::config::SavedPortForwardLimit,
+    Result<(), ForwardFailure>,
+)> {
+    let Some(ServerMessage::PolicyAcknowledged {
+        requested: acknowledged,
+        effective,
+        saved_mapping_limit,
+        result,
+        ..
+    }) = response
+    else {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "forwarding broker policy acknowledgement rejected",
-        )),
+        ));
+    };
+    let saved_mapping_limit = crate::config::SavedPortForwardLimit::new(saved_mapping_limit)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "forwarding broker policy acknowledgement rejected",
+            )
+        })?;
+    if acknowledged != requested
+        || (result.is_ok() && saved_mapping_limit != requested_saved_mapping_limit)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "forwarding broker policy acknowledgement rejected",
+        ));
     }
+    Ok((effective, saved_mapping_limit, result))
 }
 
 fn spawn_client_reader(
@@ -544,9 +664,51 @@ enum BrokerState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MappingKind {
+    Scalar {
+        address: super::protocol::LoopbackAddress,
+        remote_port: u16,
+    },
+    Localhost {
+        remote_port: u16,
+    },
+}
+
+impl MappingKind {
+    const fn is_localhost(self) -> bool {
+        matches!(self, Self::Localhost { .. })
+    }
+
+    fn request(self, mappings: &mut MappingRegistry, id: CorrelationId) -> MappingRequest {
+        match self {
+            Self::Scalar {
+                address,
+                remote_port,
+            } => mappings.request_scalar(id, address, remote_port),
+            Self::Localhost { remote_port } => mappings.request_localhost(id, remote_port),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupOwner {
+    BestEffort,
+    Policy(CorrelationId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueuedJobKind {
     Mapping(MappingAttempt),
-    Cleanup,
+    Cleanup(CleanupOwner),
+}
+
+struct PendingPolicyAcknowledgement {
+    id: CorrelationId,
+    requested: bool,
+    change: SavedLimitChange,
+    remaining_cleanups: usize,
+    cleanup_failure: Option<ForwardFailure>,
+    wait_for_idle: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -631,6 +793,53 @@ impl Drop for BrokerServer {
     }
 }
 
+fn finish_policy_acknowledgement(
+    stream: &mut UnixStream,
+    mappings: &mut MappingRegistry,
+    pending: &mut Option<PendingPolicyAcknowledgement>,
+    queue: &VecDeque<QueuedJob>,
+    active: &Option<QueuedJob>,
+) -> io::Result<()> {
+    let ready = pending.as_ref().is_some_and(|pending| {
+        pending.remaining_cleanups == 0
+            && mappings.saved_limit_change_converged(&pending.change)
+            && (!pending.wait_for_idle || (active.is_none() && queue.is_empty()))
+    });
+    if !ready {
+        return Ok(());
+    }
+    let Some(pending) = pending.take() else {
+        return Ok(());
+    };
+    let (saved_mapping_limit, result) = if let Some(failure) = pending.cleanup_failure {
+        if !mappings.abort_saved_limit_change(&pending.change) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "forwarding saved-limit change mismatch",
+            ));
+        }
+        (mappings.saved_limit(), Err(failure))
+    } else {
+        if !mappings.commit_saved_limit(&pending.change) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "forwarding saved-limit change mismatch",
+            ));
+        }
+        (pending.change.requested_limit, Ok(()))
+    };
+    protocol::write_message(
+        stream,
+        &ServerMessage::PolicyAcknowledged {
+            id: pending.id,
+            requested: pending.requested,
+            effective: pending.requested,
+            saved_mapping_limit: saved_mapping_limit.get(),
+            result,
+        },
+    )
+}
+
 fn run_broker(
     mut stream: UnixStream,
     expected_child: crate::platform::InheritedPeerIdentity,
@@ -661,7 +870,7 @@ fn run_broker(
     let mut highest_id = 0_u64;
     let mut queue = VecDeque::<QueuedJob>::new();
     let mut active: Option<QueuedJob> = None;
-    let mut pending_disable_ack = None;
+    let mut pending_policy_ack = None;
 
     'broker: loop {
         while let Ok(result) = worker.try_recv() {
@@ -678,11 +887,31 @@ fn run_broker(
                         break 'broker;
                     };
                     let completion = mappings.complete(attempt, control_result);
+                    if completion.invariant_error.is_some() {
+                        break 'broker;
+                    }
                     if let Some(next) = completion.attempt {
                         queue.push_front(mapping_job(next));
                     }
                     if let Some(cancelled) = completion.cancellation {
-                        queue.push_front(cleanup_job(cancelled));
+                        if let Some(policy_id) = completion.cancellation_policy {
+                            let Some(pending) = pending_policy_ack.as_mut().filter(
+                                |pending: &&mut PendingPolicyAcknowledgement| {
+                                    pending.id == policy_id
+                                },
+                            ) else {
+                                break 'broker;
+                            };
+                            let Some(remaining_cleanups) =
+                                pending.remaining_cleanups.checked_add(1)
+                            else {
+                                break 'broker;
+                            };
+                            pending.remaining_cleanups = remaining_cleanups;
+                            queue.push_front(policy_attempt_cleanup_job(cancelled, policy_id));
+                        } else {
+                            queue.push_front(cleanup_job(cancelled));
+                        }
                     }
                     for settlement in completion.settlements {
                         if write_mapping_settlement(&mut stream, attempt.is_localhost(), settlement)
@@ -692,27 +921,35 @@ fn run_broker(
                         }
                     }
                 }
-                QueuedJobKind::Cleanup => {}
+                QueuedJobKind::Cleanup(owner) => {
+                    if let CleanupOwner::Policy(policy_id) = owner {
+                        let Some(pending) = pending_policy_ack.as_mut().filter(
+                            |pending: &&mut PendingPolicyAcknowledgement| {
+                                pending.id == policy_id && pending.remaining_cleanups > 0
+                            },
+                        ) else {
+                            break 'broker;
+                        };
+                        pending.remaining_cleanups -= 1;
+                        if pending.cleanup_failure.is_none() {
+                            pending.cleanup_failure = cleanup_failure(result.result);
+                        }
+                    }
+                }
             }
             if dispatch_next(&worker, &mut mappings, &mut queue, &mut active).is_err() {
                 break 'broker;
             }
-            if active.is_none() {
-                if let Some(id) = pending_disable_ack.take() {
-                    if protocol::write_message(
-                        &mut stream,
-                        &ServerMessage::PolicyAcknowledged {
-                            id,
-                            requested: false,
-                            effective: false,
-                            result: Ok(()),
-                        },
-                    )
-                    .is_err()
-                    {
-                        break 'broker;
-                    }
-                }
+            if finish_policy_acknowledgement(
+                &mut stream,
+                &mut mappings,
+                &mut pending_policy_ack,
+                &queue,
+                &active,
+            )
+            .is_err()
+            {
+                break 'broker;
             }
         }
 
@@ -743,26 +980,27 @@ fn run_broker(
                             break 'broker;
                         }
                     }
-                    ClientMessage::AssertPolicy { id, enabled }
-                        if state != BrokerState::AwaitHello && pending_disable_ack.is_none() =>
-                    {
-                        if enabled {
-                            state = BrokerState::Active;
-                            if protocol::write_message(
-                                &mut stream,
-                                &ServerMessage::PolicyAcknowledged {
-                                    id,
-                                    requested: true,
-                                    effective: true,
-                                    result: Ok(()),
-                                },
-                            )
-                            .is_err()
-                            {
-                                break 'broker;
-                            }
+                    ClientMessage::AssertPolicy {
+                        id,
+                        enabled,
+                        saved_mapping_limit,
+                    } if state != BrokerState::AwaitHello && pending_policy_ack.is_none() => {
+                        let Some(saved_mapping_limit) =
+                            crate::config::SavedPortForwardLimit::new(saved_mapping_limit)
+                        else {
+                            break 'broker;
+                        };
+                        let change = mappings.begin_saved_limit_change(saved_mapping_limit, id);
+                        let remaining_cleanups = change.cancellations.len();
+                        for cancellation in change.cancellations.iter().copied() {
+                            queue.push_back(policy_cleanup_job(cancellation));
+                        }
+                        state = if enabled {
+                            BrokerState::Active
                         } else {
-                            state = BrokerState::Disabled;
+                            BrokerState::Disabled
+                        };
+                        if !enabled {
                             for revoked in mappings.revoke_creating() {
                                 if write_mapping_settlement(
                                     &mut stream,
@@ -774,69 +1012,46 @@ fn run_broker(
                                     break 'broker;
                                 }
                             }
-                            if active.is_none()
-                                && dispatch_next(&worker, &mut mappings, &mut queue, &mut active)
-                                    .is_err()
-                            {
-                                break 'broker;
-                            }
-                            if active.is_some() {
-                                pending_disable_ack = Some(id);
-                            } else if protocol::write_message(
-                                &mut stream,
-                                &ServerMessage::PolicyAcknowledged {
-                                    id,
-                                    requested: false,
-                                    effective: false,
-                                    result: Ok(()),
-                                },
-                            )
-                            .is_err()
-                            {
-                                break 'broker;
-                            }
+                        }
+                        pending_policy_ack = Some(PendingPolicyAcknowledgement {
+                            id,
+                            requested: enabled,
+                            change,
+                            remaining_cleanups,
+                            cleanup_failure: None,
+                            wait_for_idle: !enabled,
+                        });
+                        if dispatch_next(&worker, &mut mappings, &mut queue, &mut active).is_err() {
+                            break 'broker;
+                        }
+                        if finish_policy_acknowledgement(
+                            &mut stream,
+                            &mut mappings,
+                            &mut pending_policy_ack,
+                            &queue,
+                            &active,
+                        )
+                        .is_err()
+                        {
+                            break 'broker;
                         }
                     }
                     ClientMessage::Forward { id, spec }
                         if matches!(state, BrokerState::Disabled | BrokerState::Active)
                             && spec.is_valid() =>
                     {
-                        if state == BrokerState::Disabled {
-                            if write_mapping_settlement(
-                                &mut stream,
-                                false,
-                                MappingSettlement::failed(id, ForwardFailure::Disabled),
-                            )
-                            .is_err()
-                            {
-                                break 'broker;
-                            }
-                            continue;
-                        }
-                        let at_limit = mappings.waiter_count() >= MAX_PENDING_FORWARD_REQUESTS;
-                        let request =
-                            mappings.request_scalar(id, spec.remote_address, spec.remote_port);
-                        if at_limit && matches!(request, MappingRequest::Pending { .. }) {
-                            let _ = mappings.cancel_waiter(id);
-                            if write_mapping_settlement(
-                                &mut stream,
-                                false,
-                                MappingSettlement::failed(id, ForwardFailure::TooManyRequests),
-                            )
-                            .is_err()
-                            {
-                                break 'broker;
-                            }
-                            continue;
-                        }
-                        if handle_mapping_request(
+                        if handle_mapping_dispatch(
                             &worker,
                             &mut stream,
                             &mut mappings,
                             &mut queue,
                             &mut active,
-                            false,
-                            request,
+                            state,
+                            id,
+                            MappingKind::Scalar {
+                                address: spec.remote_address,
+                                remote_port: spec.remote_port,
+                            },
                         )
                         .is_err()
                         {
@@ -847,41 +1062,15 @@ fn run_broker(
                         if matches!(state, BrokerState::Disabled | BrokerState::Active)
                             && remote_port != 0 =>
                     {
-                        if state == BrokerState::Disabled {
-                            if write_mapping_settlement(
-                                &mut stream,
-                                true,
-                                MappingSettlement::failed(id, ForwardFailure::Disabled),
-                            )
-                            .is_err()
-                            {
-                                break 'broker;
-                            }
-                            continue;
-                        }
-                        let at_limit = mappings.waiter_count() >= MAX_PENDING_FORWARD_REQUESTS;
-                        let request = mappings.request_localhost(id, remote_port);
-                        if at_limit && matches!(request, MappingRequest::Pending { .. }) {
-                            let _ = mappings.cancel_waiter(id);
-                            if write_mapping_settlement(
-                                &mut stream,
-                                true,
-                                MappingSettlement::failed(id, ForwardFailure::TooManyRequests),
-                            )
-                            .is_err()
-                            {
-                                break 'broker;
-                            }
-                            continue;
-                        }
-                        if handle_mapping_request(
+                        if handle_mapping_dispatch(
                             &worker,
                             &mut stream,
                             &mut mappings,
                             &mut queue,
                             &mut active,
-                            true,
-                            request,
+                            state,
+                            id,
+                            MappingKind::Localhost { remote_port },
                         )
                         .is_err()
                         {
@@ -937,7 +1126,53 @@ fn cleanup_job(attempt: MappingAttempt) -> QueuedJob {
             id: attempt.controller_id(),
             operation: attempt.cancellation(),
         },
-        kind: QueuedJobKind::Cleanup,
+        kind: QueuedJobKind::Cleanup(CleanupOwner::BestEffort),
+    }
+}
+
+fn policy_attempt_cleanup_job(attempt: MappingAttempt, policy_id: CorrelationId) -> QueuedJob {
+    QueuedJob {
+        job: WorkerJob {
+            id: policy_id,
+            operation: attempt.cancellation(),
+        },
+        kind: QueuedJobKind::Cleanup(CleanupOwner::Policy(policy_id)),
+    }
+}
+
+fn replacement_cleanup_job(cancellation: MappingCancellation) -> QueuedJob {
+    QueuedJob {
+        job: WorkerJob {
+            id: cancellation.controller_id(),
+            operation: cancellation.operation(),
+        },
+        kind: QueuedJobKind::Cleanup(CleanupOwner::BestEffort),
+    }
+}
+
+fn policy_cleanup_job(cancellation: MappingCancellation) -> QueuedJob {
+    QueuedJob {
+        job: WorkerJob {
+            id: cancellation.controller_id(),
+            operation: cancellation.operation(),
+        },
+        kind: QueuedJobKind::Cleanup(CleanupOwner::Policy(cancellation.controller_id())),
+    }
+}
+
+fn cleanup_failure(result: ControlResult) -> Option<ForwardFailure> {
+    match result {
+        ControlResult::Succeeded | ControlResult::PairCancellationSucceeded => None,
+        ControlResult::TimedOut | ControlResult::PairFirstTimedOut => {
+            Some(ForwardFailure::CommandTimedOut)
+        }
+        ControlResult::BindFailed
+        | ControlResult::Rejected
+        | ControlResult::PairSucceeded
+        | ControlResult::PairFirstBindFailed
+        | ControlResult::PairFirstFailed
+        | ControlResult::PairSecondFailed
+        | ControlResult::PairCancellationFailed => Some(ForwardFailure::CommandRejected),
     }
 }
 
@@ -954,6 +1189,28 @@ fn mapping_control_result(result: ControlResult) -> Option<MappingControlResult>
         ControlResult::PairSecondFailed => Some(MappingControlResult::PairSecondFailed),
         ControlResult::PairCancellationSucceeded | ControlResult::PairCancellationFailed => None,
     }
+}
+
+fn handle_mapping_dispatch(
+    worker: &ControlWorker,
+    stream: &mut UnixStream,
+    mappings: &mut MappingRegistry,
+    queue: &mut VecDeque<QueuedJob>,
+    active: &mut Option<QueuedJob>,
+    state: BrokerState,
+    id: CorrelationId,
+    kind: MappingKind,
+) -> io::Result<()> {
+    let localhost = kind.is_localhost();
+    if state == BrokerState::Disabled {
+        return write_mapping_settlement(
+            stream,
+            localhost,
+            MappingSettlement::failed(id, ForwardFailure::Disabled),
+        );
+    }
+    let request = kind.request(mappings, id);
+    handle_mapping_request(worker, stream, mappings, queue, active, localhost, request)
 }
 
 fn handle_mapping_request(
@@ -975,6 +1232,14 @@ fn handle_mapping_request(
                 dispatch_next(worker, mappings, queue, active)?;
             }
             Ok(())
+        }
+        MappingRequest::Replacing {
+            attempt,
+            cancellation,
+        } => {
+            queue.push_back(replacement_cleanup_job(cancellation));
+            queue.push_back(mapping_job(attempt));
+            dispatch_next(worker, mappings, queue, active)
         }
     }
 }
@@ -1020,7 +1285,182 @@ fn dispatch_next(
 }
 
 #[cfg(test)]
+struct HarnessRunner {
+    operations: Mutex<Vec<String>>,
+    block_first: AtomicBool,
+    started: Option<mpsc::SyncSender<()>>,
+    release: Option<Mutex<mpsc::Receiver<()>>>,
+}
+
+#[cfg(test)]
+impl CommandRunner for HarnessRunner {
+    fn run(
+        &self,
+        invocation: &super::worker::ControlInvocation,
+        _timeout: Duration,
+    ) -> ControlResult {
+        let operation = invocation
+            .args
+            .windows(2)
+            .find_map(|args| (args[0] == "-O").then(|| args[1].clone()))
+            .expect("control operation");
+        self.operations
+            .lock()
+            .expect("harness operations")
+            .push(operation);
+        if self.block_first.swap(false, Ordering::AcqRel) {
+            if let Some(started) = &self.started {
+                started.send(()).expect("report blocked command");
+            }
+            if let Some(release) = &self.release {
+                release
+                    .lock()
+                    .expect("release receiver")
+                    .recv()
+                    .expect("release blocked command");
+            }
+        }
+        ControlResult::Succeeded
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct ForwardingBrokerTestHarness {
+    broker: Option<BrokerServer>,
+    controller: Arc<super::controller::NumericForwardingController>,
+    runner: Arc<HarnessRunner>,
+    started: Option<mpsc::Receiver<()>>,
+    release: Option<mpsc::SyncSender<()>>,
+}
+
+#[cfg(test)]
+impl ForwardingBrokerTestHarness {
+    pub(crate) fn blocked(saved_mapping_limit: crate::config::SavedPortForwardLimit) -> Self {
+        let (started_sender, started) = mpsc::sync_channel(1);
+        let (release, release_receiver) = mpsc::sync_channel(1);
+        Self::start(
+            saved_mapping_limit,
+            HarnessRunner {
+                operations: Mutex::new(Vec::new()),
+                block_first: AtomicBool::new(true),
+                started: Some(started_sender),
+                release: Some(Mutex::new(release_receiver)),
+            },
+            Some(started),
+            Some(release),
+        )
+    }
+
+    pub(crate) fn succeeding(saved_mapping_limit: crate::config::SavedPortForwardLimit) -> Self {
+        Self::start(
+            saved_mapping_limit,
+            HarnessRunner {
+                operations: Mutex::new(Vec::new()),
+                block_first: AtomicBool::new(false),
+                started: None,
+                release: None,
+            },
+            None,
+            None,
+        )
+    }
+
+    fn start(
+        saved_mapping_limit: crate::config::SavedPortForwardLimit,
+        runner: HarnessRunner,
+        started: Option<mpsc::Receiver<()>>,
+        release: Option<mpsc::SyncSender<()>>,
+    ) -> Self {
+        let runner = Arc::new(runner);
+        let (parent, child) = UnixStream::pair().expect("broker harness pair");
+        let broker = BrokerServer::start_with_runner(
+            parent,
+            crate::platform::InheritedPeerIdentity::current_process(),
+            ControlAuthority::new(
+                "test-target".to_owned(),
+                std::path::PathBuf::from("/test/control"),
+            ),
+            runner.clone(),
+            Duration::from_secs(10),
+        )
+        .expect("broker harness server");
+        let client = ForwardingClient::from_stream(
+            child,
+            true,
+            saved_mapping_limit,
+            crate::platform::InheritedPeerIdentity::current_process(),
+        )
+        .expect("broker harness client");
+        Self {
+            broker: Some(broker),
+            controller: Arc::new(super::controller::NumericForwardingController::new(client)),
+            runner,
+            started,
+            release,
+        }
+    }
+
+    pub(crate) fn controller(&self) -> Arc<dyn crate::external_open::ForwardingController> {
+        self.controller.clone()
+    }
+
+    pub(crate) fn wait_until_blocked(&self) {
+        self.started
+            .as_ref()
+            .expect("blocked harness")
+            .recv()
+            .expect("blocked command started");
+    }
+
+    pub(crate) fn release_blocked(&mut self) {
+        if let Some(release) = self.release.take() {
+            release.send(()).expect("release blocked command");
+        }
+    }
+
+    pub(crate) fn operations(&self) -> Vec<String> {
+        self.runner
+            .operations
+            .lock()
+            .expect("harness operations")
+            .clone()
+    }
+
+    pub(crate) fn operation_count(&self, expected: &str) -> usize {
+        self.runner
+            .operations
+            .lock()
+            .expect("harness operations")
+            .iter()
+            .filter(|operation| operation.as_str() == expected)
+            .count()
+    }
+
+    pub(crate) fn total_operations(&self) -> usize {
+        self.runner
+            .operations
+            .lock()
+            .expect("harness operations")
+            .len()
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForwardingBrokerTestHarness {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        self.broker.take();
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    fn saved_limit(value: u8) -> crate::config::SavedPortForwardLimit {
+        crate::config::SavedPortForwardLimit::new(value).expect("valid saved mapping limit")
+    }
+
     use super::*;
     use crate::remote::forwarding::protocol::{LoopbackAddress, BROKER_PROTOCOL_VERSION};
     use crate::remote::forwarding::transport::AuthenticatedFrameReader;
@@ -1040,6 +1480,43 @@ mod tests {
         operations: Mutex<Vec<String>>,
         results: Mutex<VecDeque<ControlResult>>,
         delay: Duration,
+    }
+
+    struct GateRunner {
+        first: AtomicBool,
+        started: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    struct SteppedCommand {
+        invocation: ControlInvocation,
+        result: mpsc::SyncSender<ControlResult>,
+    }
+
+    impl SteppedCommand {
+        fn operation(&self) -> &str {
+            self.invocation
+                .args
+                .windows(2)
+                .find_map(|args| (args[0] == "-O").then_some(args[1].as_str()))
+                .expect("control operation")
+        }
+
+        fn forward_value(&self) -> &str {
+            self.invocation
+                .args
+                .windows(2)
+                .find_map(|args| (args[0] == "-L").then_some(args[1].as_str()))
+                .expect("forward value")
+        }
+
+        fn settle(self, result: ControlResult) {
+            self.result.send(result).expect("settle stepped command");
+        }
+    }
+
+    struct SteppedRunner {
+        commands: mpsc::Sender<SteppedCommand>,
     }
 
     impl RecordingRunner {
@@ -1073,11 +1550,105 @@ mod tests {
         }
     }
 
+    impl CommandRunner for GateRunner {
+        fn run(&self, _invocation: &ControlInvocation, _timeout: Duration) -> ControlResult {
+            if self.first.swap(false, Ordering::AcqRel) {
+                let _ = self.started.send(());
+                let _ = self.release.lock().expect("release gate").recv();
+            }
+            ControlResult::Succeeded
+        }
+    }
+
     impl CommandRunner for CountingRunner {
         fn run(&self, _invocation: &ControlInvocation, _timeout: Duration) -> ControlResult {
             self.calls.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(self.delay);
             ControlResult::Succeeded
+        }
+    }
+
+    impl CommandRunner for SteppedRunner {
+        fn run(&self, invocation: &ControlInvocation, _timeout: Duration) -> ControlResult {
+            let (result, receiver) = mpsc::sync_channel(1);
+            if self
+                .commands
+                .send(SteppedCommand {
+                    invocation: invocation.clone(),
+                    result,
+                })
+                .is_err()
+            {
+                return ControlResult::Rejected;
+            }
+            receiver.recv().unwrap_or(ControlResult::Rejected)
+        }
+    }
+
+    fn stepped_broker(
+        saved_mapping_limit: crate::config::SavedPortForwardLimit,
+    ) -> (
+        BrokerServer,
+        ForwardingClient,
+        mpsc::Receiver<SteppedCommand>,
+    ) {
+        let (commands, receiver) = mpsc::channel();
+        let (parent, child) = UnixStream::pair().expect("broker pair");
+        let broker = BrokerServer::start_with_runner(
+            parent,
+            crate::platform::InheritedPeerIdentity::current_process(),
+            authority(),
+            Arc::new(SteppedRunner { commands }),
+            Duration::from_secs(10),
+        )
+        .expect("broker server");
+        let client = ForwardingClient::from_stream(
+            child,
+            true,
+            saved_mapping_limit,
+            crate::platform::InheritedPeerIdentity::current_process(),
+        )
+        .expect("broker client");
+        (broker, client, receiver)
+    }
+
+    fn next_command(receiver: &mpsc::Receiver<SteppedCommand>) -> SteppedCommand {
+        receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("next stepped command")
+    }
+
+    fn wait_for_policy(
+        call: &mut PolicyCall,
+    ) -> (
+        bool,
+        crate::config::SavedPortForwardLimit,
+        Result<(), ForwardFailure>,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(settlement) = call.try_wait() {
+                return settlement;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "policy call timed out"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn wait_for_mapping(call: &mut MappingCall) -> Result<u16, ForwardFailure> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(settlement) = call.try_wait() {
+                return settlement;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "mapping call timed out"
+            );
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -1096,6 +1667,38 @@ mod tests {
             remote_address: LoopbackAddress::Ipv4([127, 0, 0, 1]),
             remote_port,
         }
+    }
+
+    fn read_broker_client_message(stream: &mut UnixStream) -> ClientMessage {
+        let payload = protocol::read_payload(stream).expect("client frame");
+        protocol::decode_message(&payload).expect("client message")
+    }
+
+    fn acknowledge_manual_handshake(stream: &mut UnixStream) {
+        let ClientMessage::Hello { id, version } = read_broker_client_message(stream) else {
+            panic!("hello");
+        };
+        protocol::write_message(stream, &ServerMessage::HelloAcknowledged { id, version })
+            .expect("hello acknowledgement");
+        let ClientMessage::AssertPolicy {
+            id,
+            enabled,
+            saved_mapping_limit,
+        } = read_broker_client_message(stream)
+        else {
+            panic!("initial policy");
+        };
+        protocol::write_message(
+            stream,
+            &ServerMessage::PolicyAcknowledged {
+                id,
+                requested: enabled,
+                effective: enabled,
+                saved_mapping_limit,
+                result: Ok(()),
+            },
+        )
+        .expect("initial policy acknowledgement");
     }
 
     fn authority() -> ControlAuthority {
@@ -1138,6 +1741,576 @@ mod tests {
         assert!(client.is_active());
         assert_eq!(settle_forward(&client, spec()), Ok(8080));
         assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn invalid_disconnected_mismatched_and_duplicate_policy_acks_retain_validated_limit() {
+        enum ManualOutcome {
+            Disconnect,
+            Mismatch,
+            InvalidLimit(u8),
+            Duplicate,
+            ErrorWithRequestedLimit,
+        }
+
+        for (outcome, expected_effective, expected_failure) in [
+            (
+                ManualOutcome::Disconnect,
+                false,
+                ForwardFailure::CapabilityClosed,
+            ),
+            (
+                ManualOutcome::Mismatch,
+                true,
+                ForwardFailure::CapabilityClosed,
+            ),
+            (
+                ManualOutcome::InvalidLimit(0),
+                true,
+                ForwardFailure::CapabilityClosed,
+            ),
+            (
+                ManualOutcome::InvalidLimit(65),
+                true,
+                ForwardFailure::CapabilityClosed,
+            ),
+            (
+                ManualOutcome::Duplicate,
+                false,
+                ForwardFailure::CapabilityClosed,
+            ),
+            (
+                ManualOutcome::ErrorWithRequestedLimit,
+                true,
+                ForwardFailure::CommandRejected,
+            ),
+        ] {
+            let (mut parent, child) = UnixStream::pair().expect("broker pair");
+            let server = std::thread::spawn(move || {
+                acknowledge_manual_handshake(&mut parent);
+                let ClientMessage::AssertPolicy {
+                    id,
+                    enabled,
+                    saved_mapping_limit,
+                } = read_broker_client_message(&mut parent)
+                else {
+                    panic!("live policy");
+                };
+                match outcome {
+                    ManualOutcome::Disconnect => {}
+                    ManualOutcome::Mismatch => {
+                        protocol::write_message(
+                            &mut parent,
+                            &ServerMessage::PolicyAcknowledged {
+                                id,
+                                requested: enabled,
+                                effective: enabled,
+                                saved_mapping_limit: saved_mapping_limit - 1,
+                                result: Ok(()),
+                            },
+                        )
+                        .expect("mismatched acknowledgement");
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    ManualOutcome::InvalidLimit(saved_mapping_limit) => {
+                        protocol::write_message(
+                            &mut parent,
+                            &ServerMessage::PolicyAcknowledged {
+                                id,
+                                requested: enabled,
+                                effective: enabled,
+                                saved_mapping_limit,
+                                result: Ok(()),
+                            },
+                        )
+                        .expect("invalid-limit acknowledgement");
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    ManualOutcome::Duplicate => {
+                        let acknowledgement = ServerMessage::PolicyAcknowledged {
+                            id,
+                            requested: enabled,
+                            effective: enabled,
+                            saved_mapping_limit,
+                            result: Ok(()),
+                        };
+                        protocol::write_message(&mut parent, &acknowledgement)
+                            .expect("first acknowledgement");
+                        protocol::write_message(&mut parent, &acknowledgement)
+                            .expect("duplicate acknowledgement");
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    ManualOutcome::ErrorWithRequestedLimit => {
+                        protocol::write_message(
+                            &mut parent,
+                            &ServerMessage::PolicyAcknowledged {
+                                id,
+                                requested: enabled,
+                                effective: enabled,
+                                saved_mapping_limit,
+                                result: Err(ForwardFailure::CommandRejected),
+                            },
+                        )
+                        .expect("error acknowledgement");
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            });
+            let client =
+                ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
+            let mut call = client
+                .begin_assert_policy(true, saved_limit(64))
+                .expect("live policy call");
+            let settlement = loop {
+                if let Some(settlement) = call.try_wait() {
+                    break settlement;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(
+                settlement,
+                (
+                    expected_effective,
+                    crate::config::SavedPortForwardLimit::DEFAULT,
+                    Err(expected_failure),
+                )
+            );
+            server.join().expect("manual broker");
+        }
+    }
+
+    #[test]
+    fn acknowledged_live_limits_apply_immediately_with_ordered_best_effort_replacement() {
+        let runner = Arc::new(RecordingRunner::new([
+            ControlResult::Succeeded,
+            ControlResult::Succeeded,
+            ControlResult::Succeeded,
+            ControlResult::TimedOut,
+            ControlResult::Succeeded,
+            ControlResult::Succeeded,
+        ]));
+        let (parent, child) = UnixStream::pair().expect("broker pair");
+        let _broker = BrokerServer::start_with_runner(
+            parent,
+            crate::platform::InheritedPeerIdentity::current_process(),
+            authority(),
+            runner.clone(),
+            Duration::from_secs(10),
+        )
+        .expect("broker server");
+        let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
+
+        assert_eq!(settle_forward(&client, spec_for_port(8_000)), Ok(8_000));
+        assert_eq!(settle_forward(&client, spec_for_port(8_001)), Ok(8_001));
+        assert_eq!(settle_forward(&client, spec_for_port(8_000)), Ok(8_000));
+        client
+            .assert_policy_with_limit(true, saved_limit(1))
+            .expect("decrease acknowledged");
+        assert_eq!(settle_forward(&client, spec_for_port(8_002)), Ok(8_002));
+        client
+            .assert_policy_with_limit(true, saved_limit(2))
+            .expect("increase acknowledged");
+        assert_eq!(settle_forward(&client, spec_for_port(8_003)), Ok(8_003));
+
+        assert_eq!(
+            *runner.operations.lock().expect("operations"),
+            vec!["forward", "forward", "cancel", "cancel", "forward", "forward"]
+        );
+    }
+
+    #[test]
+    fn failed_limit_cleanup_is_not_acknowledged_and_retains_prior_limit() {
+        let runner = Arc::new(RecordingRunner::new([
+            ControlResult::Succeeded,
+            ControlResult::Succeeded,
+            ControlResult::Rejected,
+            ControlResult::Succeeded,
+        ]));
+        let (parent, child) = UnixStream::pair().expect("broker pair");
+        let _broker = BrokerServer::start_with_runner(
+            parent,
+            crate::platform::InheritedPeerIdentity::current_process(),
+            authority(),
+            runner.clone(),
+            Duration::from_secs(10),
+        )
+        .expect("broker server");
+        let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
+        client
+            .assert_policy_with_limit(true, saved_limit(2))
+            .expect("initial limit");
+        assert_eq!(settle_forward(&client, spec_for_port(8_000)), Ok(8_000));
+        assert_eq!(settle_forward(&client, spec_for_port(8_001)), Ok(8_001));
+
+        assert_eq!(
+            client
+                .begin_assert_policy(true, saved_limit(1))
+                .expect("decrease call")
+                .wait()
+                .expect("typed policy acknowledgement"),
+            (true, saved_limit(2), Err(ForwardFailure::CommandRejected))
+        );
+        assert_eq!(settle_forward(&client, spec_for_port(8_002)), Ok(8_002));
+        assert_eq!(
+            *runner.operations.lock().expect("operations"),
+            vec!["forward", "forward", "cancel", "forward"]
+        );
+    }
+
+    #[test]
+    fn timed_out_limit_cleanup_retains_acknowledged_limit() {
+        let runner = Arc::new(RecordingRunner::new([
+            ControlResult::Succeeded,
+            ControlResult::Succeeded,
+            ControlResult::TimedOut,
+            ControlResult::Succeeded,
+        ]));
+        let (parent, child) = UnixStream::pair().expect("broker pair");
+        let _broker = BrokerServer::start_with_runner(
+            parent,
+            crate::platform::InheritedPeerIdentity::current_process(),
+            authority(),
+            runner,
+            Duration::from_secs(10),
+        )
+        .expect("broker server");
+        let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
+        client
+            .assert_policy_with_limit(true, saved_limit(2))
+            .expect("initial limit");
+        assert_eq!(settle_forward(&client, spec_for_port(8_000)), Ok(8_000));
+        assert_eq!(settle_forward(&client, spec_for_port(8_001)), Ok(8_001));
+        assert_eq!(
+            client
+                .begin_assert_policy(true, saved_limit(1))
+                .expect("decrease call")
+                .wait()
+                .expect("typed acknowledgement"),
+            (true, saved_limit(2), Err(ForwardFailure::CommandTimedOut))
+        );
+        assert_eq!(settle_forward(&client, spec_for_port(8_002)), Ok(8_002));
+    }
+
+    #[test]
+    fn localhost_lru_replacement_cancels_ipv4_then_ipv6_despite_first_failure() {
+        let runner = Arc::new(RecordingRunner::new([
+            ControlResult::Succeeded,
+            ControlResult::Succeeded,
+            ControlResult::Rejected,
+            ControlResult::TimedOut,
+            ControlResult::Succeeded,
+        ]));
+        let (parent, child) = UnixStream::pair().expect("broker pair");
+        let _broker = BrokerServer::start_with_runner(
+            parent,
+            crate::platform::InheritedPeerIdentity::current_process(),
+            authority(),
+            runner.clone(),
+            Duration::from_secs(10),
+        )
+        .expect("broker server");
+        let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
+        client
+            .assert_policy_with_limit(true, saved_limit(1))
+            .expect("single saved mapping");
+
+        assert_eq!(
+            client.begin_localhost(8_080).expect("pair").wait(),
+            Ok(8_080)
+        );
+        assert_eq!(settle_forward(&client, spec_for_port(8_081)), Ok(8_081));
+        assert_eq!(
+            *runner.operations.lock().expect("operations"),
+            vec!["forward", "forward", "cancel", "cancel", "forward"]
+        );
+    }
+
+    #[test]
+    fn socket_broker_enforces_exact_forward_and_waiter_caps_without_slot_leaks() {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let runner = Arc::new(GateRunner {
+            first: AtomicBool::new(true),
+            started: started_tx,
+            release: Mutex::new(release_rx),
+        });
+        let (parent, child) = UnixStream::pair().expect("broker pair");
+        let _broker = BrokerServer::start_with_runner(
+            parent,
+            crate::platform::InheritedPeerIdentity::current_process(),
+            authority(),
+            runner,
+            Duration::from_secs(10),
+        )
+        .expect("broker server");
+        let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
+        client
+            .assert_policy_with_limit(true, saved_limit(64))
+            .expect("maximum saved limit");
+        let mut active = vec![client.begin_forward(spec_for_port(8_000)).expect("first")];
+        started_rx.recv().expect("first command started");
+        active.extend((1..32).map(|offset| {
+            client
+                .begin_forward(spec_for_port(8_000 + offset))
+                .expect("within request cap")
+        }));
+        assert_eq!(
+            client
+                .begin_forward(spec_for_port(9_000))
+                .expect("typed request rejection")
+                .wait(),
+            Err(ForwardFailure::TooManyRequests)
+        );
+        release_tx.send(()).expect("release worker");
+        for call in active {
+            assert!(call.wait().is_ok());
+        }
+
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let runner = Arc::new(GateRunner {
+            first: AtomicBool::new(true),
+            started: started_tx,
+            release: Mutex::new(release_rx),
+        });
+        let (parent, child) = UnixStream::pair().expect("waiter broker pair");
+        let _waiter_broker = BrokerServer::start_with_runner(
+            parent,
+            crate::platform::InheritedPeerIdentity::current_process(),
+            authority(),
+            runner,
+            Duration::from_secs(10),
+        )
+        .expect("waiter broker");
+        let waiter_client =
+            ForwardingClient::from_stream_for_test(child, true).expect("waiter client");
+        let mut waiters = vec![waiter_client.begin_forward(spec()).expect("owner")];
+        started_rx.recv().expect("mapping command started");
+        waiters.extend((1..8).map(|_| waiter_client.begin_forward(spec()).expect("waiter")));
+        assert_eq!(
+            waiter_client
+                .begin_forward(spec())
+                .expect("typed waiter rejection")
+                .wait(),
+            Err(ForwardFailure::TooManyWaiters)
+        );
+        release_tx.send(()).expect("release waiter worker");
+        for waiter in waiters {
+            assert_eq!(waiter.wait(), Ok(8_080));
+        }
+    }
+
+    #[test]
+    fn mixed_ready_and_creating_decrease_converges_before_one_acknowledgement() {
+        let (_broker, client, commands) = stepped_broker(saved_limit(3));
+
+        let old_ready = client
+            .begin_forward(spec_for_port(8_000))
+            .expect("old ready mapping");
+        next_command(&commands).settle(ControlResult::Succeeded);
+        assert_eq!(old_ready.wait(), Ok(8_000));
+
+        let first_creating = client
+            .begin_forward(spec_for_port(8_001))
+            .expect("first creating mapping");
+        let first_forward = next_command(&commands);
+        assert_eq!(first_forward.operation(), "forward");
+        assert!(first_forward.forward_value().contains(":8001:"));
+        let second_creating = client
+            .begin_forward(spec_for_port(8_002))
+            .expect("queued creating mapping");
+        let mut policy = client
+            .begin_assert_policy(true, saved_limit(1))
+            .expect("decrease policy");
+        let mut distinct = client
+            .begin_forward(spec_for_port(8_003))
+            .expect("typed distinct rejection");
+        let coalesced_second = client
+            .begin_forward(spec_for_port(8_002))
+            .expect("coalesced creating request");
+        assert_eq!(
+            wait_for_mapping(&mut distinct),
+            Err(ForwardFailure::TooManyRequests)
+        );
+        assert_eq!(policy.try_wait(), None);
+
+        first_forward.settle(ControlResult::Succeeded);
+        let completed_cleanup = next_command(&commands);
+        assert_eq!(completed_cleanup.operation(), "cancel");
+        assert!(completed_cleanup.forward_value().contains(":8001:"));
+        assert_eq!(
+            first_creating.wait(),
+            Err(ForwardFailure::CapacityExhausted)
+        );
+        assert_eq!(policy.try_wait(), None);
+        completed_cleanup.settle(ControlResult::Succeeded);
+
+        let second_forward = next_command(&commands);
+        assert_eq!(second_forward.operation(), "forward");
+        assert!(second_forward.forward_value().contains(":8002:"));
+        assert_eq!(policy.try_wait(), None);
+        second_forward.settle(ControlResult::Succeeded);
+        assert_eq!(second_creating.wait(), Ok(8_002));
+        assert_eq!(coalesced_second.wait(), Ok(8_002));
+
+        let old_ready_cleanup = next_command(&commands);
+        assert_eq!(old_ready_cleanup.operation(), "cancel");
+        assert!(old_ready_cleanup.forward_value().contains(":8000:"));
+        assert_eq!(policy.try_wait(), None);
+        old_ready_cleanup.settle(ControlResult::Succeeded);
+
+        assert_eq!(wait_for_policy(&mut policy), (true, saved_limit(1), Ok(())));
+        assert_eq!(settle_forward(&client, spec_for_port(8_002)), Ok(8_002));
+        let mut increase = client
+            .begin_assert_policy(true, saved_limit(2))
+            .expect("subsequent policy call");
+        assert_eq!(
+            wait_for_policy(&mut increase),
+            (true, saved_limit(2), Ok(()))
+        );
+        assert!(commands.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[test]
+    fn mixed_decrease_cleanup_failure_retains_old_limit_after_exact_settlement() {
+        let (_broker, client, commands) = stepped_broker(saved_limit(3));
+
+        let old_ready = client
+            .begin_forward(spec_for_port(8_000))
+            .expect("old ready mapping");
+        next_command(&commands).settle(ControlResult::Succeeded);
+        assert_eq!(old_ready.wait(), Ok(8_000));
+
+        let first_creating = client
+            .begin_forward(spec_for_port(8_001))
+            .expect("first creating mapping");
+        let first_forward = next_command(&commands);
+        let second_creating = client
+            .begin_forward(spec_for_port(8_002))
+            .expect("queued creating mapping");
+        let mut policy = client
+            .begin_assert_policy(true, saved_limit(1))
+            .expect("decrease policy");
+        let mut distinct = client
+            .begin_forward(spec_for_port(8_003))
+            .expect("typed distinct rejection");
+        assert_eq!(
+            wait_for_mapping(&mut distinct),
+            Err(ForwardFailure::TooManyRequests)
+        );
+
+        first_forward.settle(ControlResult::Succeeded);
+        let completed_cleanup = next_command(&commands);
+        assert_eq!(completed_cleanup.operation(), "cancel");
+        assert!(completed_cleanup.forward_value().contains(":8001:"));
+        assert_eq!(
+            first_creating.wait(),
+            Err(ForwardFailure::CapacityExhausted)
+        );
+        completed_cleanup.settle(ControlResult::Rejected);
+        assert_eq!(policy.try_wait(), None);
+
+        next_command(&commands).settle(ControlResult::Succeeded);
+        assert_eq!(second_creating.wait(), Ok(8_002));
+        let old_ready_cleanup = next_command(&commands);
+        assert_eq!(old_ready_cleanup.operation(), "cancel");
+        assert!(old_ready_cleanup.forward_value().contains(":8000:"));
+        old_ready_cleanup.settle(ControlResult::Succeeded);
+
+        assert_eq!(
+            wait_for_policy(&mut policy),
+            (true, saved_limit(3), Err(ForwardFailure::CommandRejected),)
+        );
+        let new_mapping = client
+            .begin_forward(spec_for_port(8_003))
+            .expect("old limit admits distinct work");
+        next_command(&commands).settle(ControlResult::Succeeded);
+        assert_eq!(new_mapping.wait(), Ok(8_003));
+        assert!(commands.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[test]
+    fn pending_decrease_allows_retained_ready_reuse_without_new_work() {
+        let (_broker, client, commands) = stepped_broker(saved_limit(3));
+
+        for port in [8_000, 8_001] {
+            let ready = client
+                .begin_forward(spec_for_port(port))
+                .expect("ready mapping");
+            next_command(&commands).settle(ControlResult::Succeeded);
+            assert_eq!(ready.wait(), Ok(port));
+        }
+        assert_eq!(settle_forward(&client, spec_for_port(8_001)), Ok(8_001));
+
+        let creating = client
+            .begin_forward(spec_for_port(8_002))
+            .expect("creating mapping");
+        let creating_command = next_command(&commands);
+        let mut policy = client
+            .begin_assert_policy(true, saved_limit(2))
+            .expect("decrease policy");
+        let retained_reuse = client
+            .begin_forward(spec_for_port(8_001))
+            .expect("retained ready reuse");
+        assert_eq!(retained_reuse.wait(), Ok(8_001));
+        assert_eq!(policy.try_wait(), None);
+
+        creating_command.settle(ControlResult::Succeeded);
+        assert_eq!(creating.wait(), Ok(8_002));
+        let old_ready_cleanup = next_command(&commands);
+        assert_eq!(old_ready_cleanup.operation(), "cancel");
+        assert!(old_ready_cleanup.forward_value().contains(":8000:"));
+        assert_eq!(policy.try_wait(), None);
+        old_ready_cleanup.settle(ControlResult::Succeeded);
+
+        assert_eq!(wait_for_policy(&mut policy), (true, saved_limit(2), Ok(())));
+        assert_eq!(settle_forward(&client, spec_for_port(8_001)), Ok(8_001));
+        assert_eq!(settle_forward(&client, spec_for_port(8_002)), Ok(8_002));
+        assert!(commands.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[test]
+    fn over_limit_settlement_reports_decrease_owned_self_cleanup_failure() {
+        let runner = Arc::new(RecordingRunner::with_delay(
+            [
+                ControlResult::Succeeded,
+                ControlResult::Rejected,
+                ControlResult::Succeeded,
+                ControlResult::Succeeded,
+            ],
+            Duration::from_millis(40),
+        ));
+        let (parent, child) = UnixStream::pair().expect("broker pair");
+        let _broker = BrokerServer::start_with_runner(
+            parent,
+            crate::platform::InheritedPeerIdentity::current_process(),
+            authority(),
+            runner.clone(),
+            Duration::from_secs(10),
+        )
+        .expect("broker server");
+        let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
+        client
+            .assert_policy_with_limit(true, saved_limit(3))
+            .expect("initial limit");
+        let first = client.begin_forward(spec_for_port(8_000)).expect("first");
+        let second = client.begin_forward(spec_for_port(8_001)).expect("second");
+        let third = client.begin_forward(spec_for_port(8_002)).expect("third");
+        let mut policy = client
+            .begin_assert_policy(true, saved_limit(2))
+            .expect("all-creating decrease");
+
+        assert_eq!(first.wait(), Err(ForwardFailure::CapacityExhausted));
+        assert_eq!(second.wait(), Ok(8_001));
+        assert_eq!(third.wait(), Ok(8_002));
+        assert_eq!(
+            wait_for_policy(&mut policy),
+            (true, saved_limit(3), Err(ForwardFailure::CommandRejected),)
+        );
+        assert_eq!(
+            *runner.operations.lock().expect("operations"),
+            vec!["forward", "cancel", "forward", "forward"]
+        );
     }
 
     #[test]
@@ -1522,6 +2695,7 @@ mod tests {
             &ClientMessage::AssertPolicy {
                 id: id2,
                 enabled: true,
+                saved_mapping_limit: crate::config::SavedPortForwardLimit::DEFAULT.get(),
             },
         )
         .expect("policy");
@@ -1567,6 +2741,7 @@ mod tests {
             ClientMessage::AssertPolicy {
                 id: CorrelationId::new(2).expect("id"),
                 enabled: true,
+                saved_mapping_limit: crate::config::SavedPortForwardLimit::DEFAULT.get(),
             },
         ] {
             protocol::write_message(&mut child, &message).expect("handshake message");

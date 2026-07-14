@@ -202,7 +202,7 @@ pub struct HeadlessServer {
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
     client_projections: crate::server::client_projection::ClientProjections,
-    external_open_requests: crate::server::external_open::ExternalOpenRequests,
+    external_open_attachments: crate::server::external_open::ExternalOpenAttachments,
     external_open_clock: crate::server::monotonic_clock::MonotonicClock,
     #[cfg(unix)]
     next_client_id: u64,
@@ -402,7 +402,8 @@ impl HeadlessServer {
             client_socket_identity,
             clients: HashMap::new(),
             client_projections: crate::server::client_projection::ClientProjections::default(),
-            external_open_requests: crate::server::external_open::ExternalOpenRequests::default(),
+            external_open_attachments:
+                crate::server::external_open::ExternalOpenAttachments::default(),
             external_open_clock: crate::server::monotonic_clock::MonotonicClock::default(),
             #[cfg(unix)]
             next_client_id: 1,
@@ -564,7 +565,7 @@ impl HeadlessServer {
                     needs_render,
                     self.has_app_client(),
                 ),
-                self.external_open_requests.next_deadline(),
+                self.external_open_attachments.next_deadline(),
                 self.next_client_notice_deadline(),
             ]
             .into_iter()
@@ -1257,13 +1258,17 @@ impl HeadlessServer {
         self.app_client_count() > 0
     }
 
-    fn remove_client(&mut self, client_id: u64) -> bool {
-        let was_foreground = self.foreground_client_id == Some(client_id);
-        for closed in self.external_open_requests.connection_lost(client_id) {
+    fn detach_external_open_attachment(&mut self, client_id: u64) {
+        for closed in self.external_open_attachments.disconnect(client_id) {
             self.report_external_open_transition(
                 crate::server::external_open::ExternalOpenTransition::Closed(closed),
             );
         }
+    }
+
+    fn remove_client(&mut self, client_id: u64) -> bool {
+        let was_foreground = self.foreground_client_id == Some(client_id);
+        self.detach_external_open_attachment(client_id);
         self.send_client_graphics_cleanup(client_id);
         self.client_projections.disconnect(client_id);
         let removed = self.clients.remove(&client_id);
@@ -1531,6 +1536,8 @@ impl HeadlessServer {
         };
 
         let stamp = self.allocate_activity_stamp();
+        self.detach_external_open_attachment(client_id);
+        self.client_projections.disconnect(client_id);
         let Some(client) = self.clients.get_mut(&client_id) else {
             return false;
         };
@@ -2597,11 +2604,33 @@ impl HeadlessServer {
                             }
                         }
                         Some(crate::protocol::ExternalOpenPolicy::Enabled) => {
-                            let Some(dispatch) =
-                                self.external_open_requests.start(client_id, accepted_at)
-                            else {
-                                warn!("external-open request id space exhausted");
-                                continue;
+                            let dispatch = match self
+                                .external_open_attachments
+                                .start(client_id, accepted_at)
+                            {
+                                Ok(dispatch) => dispatch,
+                                Err(crate::server::external_open::ExternalOpenAdmissionError::NotAuthorized) => {
+                                    continue;
+                                }
+                                Err(crate::server::external_open::ExternalOpenAdmissionError::TooManyInProgress) => {
+                                    let outcome = crate::server::external_open::ExternalOpenTerminalOutcome::PreparationFailed(
+                                        crate::protocol::ExternalOpenPreparationFailure::TooManyOpensInProgress,
+                                    );
+                                    if let Some(message) = outcome.notice_message() {
+                                        let _ = self.client_projections.apply(
+                                            client_id,
+                                            crate::server::client_projection::ClientProjectionAction::ShowNotice {
+                                                message,
+                                                now: accepted_at,
+                                            },
+                                        );
+                                    }
+                                    continue;
+                                }
+                                Err(crate::server::external_open::ExternalOpenAdmissionError::RequestIdsExhausted) => {
+                                    warn!("external-open request id space exhausted");
+                                    continue;
+                                }
                             };
                             let prepare =
                                 Self::frame_server_message(&ServerMessage::ExternalOpenPrepare {
@@ -2623,7 +2652,7 @@ impl HeadlessServer {
                                 .is_some_and(|(framed, writer)| writer.send(framed).is_ok());
                             if !delivered {
                                 let transition = self
-                                    .external_open_requests
+                                    .external_open_attachments
                                     .delivery_failed(client_id, dispatch.request_id());
                                 self.report_external_open_transition(transition);
                                 self.remove_client_and_resize_if_needed(client_id);
@@ -2706,7 +2735,7 @@ impl HeadlessServer {
         }
 
         let closed = self
-            .external_open_requests
+            .external_open_attachments
             .cancel_preparing_for_client(client_id);
         for closed in closed {
             self.send_to_client(
@@ -2737,7 +2766,7 @@ impl HeadlessServer {
                 .flatten()
         });
         let transition =
-            self.external_open_requests
+            self.external_open_attachments
                 .ready(client_id, request_id, target, now, |_| {
                     commit
                         .ok()
@@ -2789,6 +2818,7 @@ impl HeadlessServer {
                 render_encoding,
                 direct_attach_requested,
                 external_open_policy,
+                external_open_attachment_id,
             } => {
                 if self.handoff_in_progress {
                     if let Ok(message) =
@@ -2833,8 +2863,18 @@ impl HeadlessServer {
                     ),
                 );
                 if !direct_attach_requested {
-                    if let Some(policy) = external_open_policy {
+                    if let (Some(policy), Some(attachment_id)) =
+                        (external_open_policy, external_open_attachment_id)
+                    {
                         self.client_projections.connect(client_id, policy);
+                        if !self
+                            .external_open_attachments
+                            .connect(client_id, attachment_id)
+                        {
+                            self.client_projections.disconnect(client_id);
+                            self.clients.remove(&client_id);
+                            return false;
+                        }
                     }
                     self.foreground_client_id = Some(client_id);
                 }
@@ -3008,7 +3048,7 @@ impl HeadlessServer {
             } => {
                 let now = self.external_open_clock.now();
                 let transition = self
-                    .external_open_requests
+                    .external_open_attachments
                     .preparation_failed(client_id, request_id, reason, now);
                 self.report_external_open_transition(transition)
             }
@@ -3019,7 +3059,7 @@ impl HeadlessServer {
             } => {
                 let now = self.external_open_clock.now();
                 let transition = self
-                    .external_open_requests
+                    .external_open_attachments
                     .result(client_id, request_id, result, now);
                 self.report_external_open_transition(transition)
             }
@@ -4102,7 +4142,7 @@ impl HeadlessServer {
         let mut changed = false;
 
         let external_open_now = self.external_open_clock.now();
-        let expired = self.external_open_requests.expire_due(external_open_now);
+        let expired = self.external_open_attachments.expire_due(external_open_now);
         for closed in expired {
             if closed.outcome
                 == crate::server::external_open::ExternalOpenTerminalOutcome::TimedOutBeforeCommit
@@ -4712,7 +4752,8 @@ mod tests {
             client_socket_identity,
             clients: HashMap::new(),
             client_projections: crate::server::client_projection::ClientProjections::default(),
-            external_open_requests: crate::server::external_open::ExternalOpenRequests::default(),
+            external_open_attachments:
+                crate::server::external_open::ExternalOpenAttachments::default(),
             external_open_clock: crate::server::monotonic_clock::MonotonicClock::default(),
             #[cfg(unix)]
             next_client_id: 1,
@@ -4742,6 +4783,10 @@ mod tests {
         policy: crate::protocol::ExternalOpenPolicy,
     ) {
         assert!(server.client_projections.connect(client_id, policy));
+        assert!(server.external_open_attachments.connect(
+            client_id,
+            crate::protocol::ExternalOpenAttachmentId::for_test(client_id),
+        ));
     }
 
     fn client_projection_notice(server: &HeadlessServer, client_id: u64) -> Option<&'static str> {
@@ -5054,6 +5099,17 @@ mod tests {
         server: &mut HeadlessServer,
         policy: crate::protocol::ExternalOpenPolicy,
     ) -> (u64, crate::ipc::LocalStream) {
+        let attachment_id =
+            crate::protocol::ExternalOpenAttachmentId::for_test(server.next_client_id);
+        connect_socket_app_client_for_attachment(server, policy, attachment_id)
+    }
+
+    #[cfg(unix)]
+    fn connect_socket_app_client_for_attachment(
+        server: &mut HeadlessServer,
+        policy: crate::protocol::ExternalOpenPolicy,
+        attachment_id: crate::protocol::ExternalOpenAttachmentId,
+    ) -> (u64, crate::ipc::LocalStream) {
         let client_id = server.next_client_id;
         let mut stream = crate::ipc::connect_local_stream(&server.client_socket_path)
             .expect("connect test app client");
@@ -5069,6 +5125,7 @@ mod tests {
                 keybindings: crate::protocol::ClientKeybindings::Server,
                 launch_mode: crate::protocol::ClientLaunchMode::App,
                 external_open_policy: Some(policy),
+                external_open_attachment_id: Some(attachment_id),
             },
         )
         .expect("write test app hello");
@@ -5093,6 +5150,16 @@ mod tests {
         ));
         assert!(server.handle_server_event(connected));
         (client_id, stream)
+    }
+
+    #[cfg(unix)]
+    fn read_external_open_prepare(stream: &mut crate::ipc::LocalStream) -> u64 {
+        match crate::protocol::read_message::<_, ServerMessage>(stream, MAX_FRAME_SIZE)
+            .expect("attachment prepare")
+        {
+            ServerMessage::ExternalOpenPrepare { request_id, .. } => request_id,
+            other => panic!("expected prepare, got {other:?}"),
+        }
     }
 
     #[cfg(unix)]
@@ -5366,6 +5433,189 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn one_server_bounds_external_opens_per_stable_attachment_across_connection_churn() {
+        let mut server = test_headless_server();
+        let attachment_a = crate::protocol::ExternalOpenAttachmentId::for_test(0xAA);
+        let attachment_b = crate::protocol::ExternalOpenAttachmentId::for_test(0xBB);
+        let (a1_id, mut a1) = connect_socket_app_client_for_attachment(
+            &mut server,
+            crate::protocol::ExternalOpenPolicy::Enabled,
+            attachment_a,
+        );
+        let (a2_id, mut a2) = connect_socket_app_client_for_attachment(
+            &mut server,
+            crate::protocol::ExternalOpenPolicy::Enabled,
+            attachment_a,
+        );
+        let (b_id, mut b) = connect_socket_app_client_for_attachment(
+            &mut server,
+            crate::protocol::ExternalOpenPolicy::Enabled,
+            attachment_b,
+        );
+        crate::protocol::write_message(
+            &mut a1,
+            &crate::protocol::ClientMessage::Hello {
+                version: crate::protocol::PROTOCOL_VERSION,
+                cols: 80,
+                rows: 24,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                requested_encoding: RenderEncoding::SemanticFrame,
+                keybindings: crate::protocol::ClientKeybindings::Server,
+                launch_mode: crate::protocol::ClientLaunchMode::App,
+                external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Enabled),
+                external_open_attachment_id: Some(attachment_b),
+            },
+        )
+        .expect("write attachment spoof attempt");
+        crate::protocol::write_message(
+            &mut a1,
+            &crate::protocol::ClientMessage::ExternalOpenPolicyUpdate {
+                policy: crate::protocol::ExternalOpenPolicy::Enabled,
+            },
+        )
+        .expect("write post-spoof policy event");
+        loop {
+            let event = server
+                .server_event_rx
+                .blocking_recv()
+                .expect("post-spoof event");
+            let policy_update = matches!(
+                event,
+                ServerEvent::ExternalOpenPolicyUpdate { client_id, .. } if client_id == a1_id
+            );
+            server.handle_server_event(event);
+            if policy_update {
+                break;
+            }
+        }
+        let accepted_at = Instant::now();
+
+        for index in 0..32_u64 {
+            let (client_id, socket) = if index % 2 == 0 {
+                (a1_id, &mut a1)
+            } else {
+                (a2_id, &mut a2)
+            };
+            server.handle_host_actions(
+                client_id,
+                vec![crate::app::HostAction::OpenExternalUrl {
+                    url: format!("https://attachment-a.test/{index}"),
+                }],
+                accepted_at,
+            );
+            assert_eq!(read_external_open_prepare(socket), index + 1);
+        }
+        server.handle_host_actions(
+            a2_id,
+            vec![crate::app::HostAction::OpenExternalUrl {
+                url: "https://attachment-a.test/rejected-33".to_owned(),
+            }],
+            accepted_at,
+        );
+        assert_client_writer_reaches_barrier_without_prior_message(&server, a2_id, &mut a2);
+
+        for index in 0..32_u64 {
+            server.handle_host_actions(
+                b_id,
+                vec![crate::app::HostAction::OpenExternalUrl {
+                    url: format!("https://attachment-b.test/{index}"),
+                }],
+                accepted_at,
+            );
+            assert_eq!(read_external_open_prepare(&mut b), index + 1);
+        }
+        server.handle_host_actions(
+            b_id,
+            vec![crate::app::HostAction::OpenExternalUrl {
+                url: "https://attachment-b.test/rejected-33".to_owned(),
+            }],
+            accepted_at,
+        );
+        assert_client_writer_reaches_barrier_without_prior_message(&server, b_id, &mut b);
+        assert_eq!(
+            server
+                .external_open_attachments
+                .active_request_count_for_test(attachment_a),
+            32
+        );
+        assert_eq!(
+            server
+                .external_open_attachments
+                .active_request_count_for_test(attachment_b),
+            32
+        );
+
+        drop(a1);
+        loop {
+            let event = server
+                .server_event_rx
+                .blocking_recv()
+                .expect("attachment A disconnect event");
+            let disconnected = matches!(
+                event,
+                ServerEvent::ClientDisconnected { client_id } if client_id == a1_id
+            );
+            server.handle_server_event(event);
+            if disconnected {
+                break;
+            }
+        }
+        assert_eq!(
+            server
+                .external_open_attachments
+                .active_request_count_for_test(attachment_a),
+            16,
+            "disconnect releases each source-owned lifecycle exactly once"
+        );
+        let (a3_id, mut a3) = connect_socket_app_client_for_attachment(
+            &mut server,
+            crate::protocol::ExternalOpenPolicy::Enabled,
+            attachment_a,
+        );
+        for index in 0..16_u64 {
+            server.handle_host_actions(
+                a3_id,
+                vec![crate::app::HostAction::OpenExternalUrl {
+                    url: format!("https://attachment-a.test/reconnected/{index}"),
+                }],
+                accepted_at,
+            );
+            assert_eq!(read_external_open_prepare(&mut a3), 33 + index);
+        }
+        server.handle_host_actions(
+            a3_id,
+            vec![crate::app::HostAction::OpenExternalUrl {
+                url: "https://attachment-a.test/reconnected/rejected".to_owned(),
+            }],
+            accepted_at,
+        );
+        assert_client_writer_reaches_barrier_without_prior_message(&server, a3_id, &mut a3);
+        assert_eq!(
+            server
+                .external_open_attachments
+                .active_request_count_for_test(attachment_a),
+            32
+        );
+
+        server.initiate_shutdown();
+        server.complete_shutdown().expect("complete test shutdown");
+        assert_eq!(
+            server.external_open_attachments.attachment_count_for_test(),
+            0
+        );
+        assert!(
+            !server.remove_client(a1_id),
+            "terminal release is idempotent"
+        );
+        assert_eq!(
+            server.external_open_attachments.attachment_count_for_test(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn preparation_failure_notice_renders_only_on_initiating_socket_after_focus_change() {
         let mut server = test_headless_server();
         let (source_id, mut source) =
@@ -5608,10 +5858,10 @@ mod tests {
         for (reason, expected) in preparation_cases {
             let accepted_at = Instant::now();
             let dispatch = server
-                .external_open_requests
+                .external_open_attachments
                 .start(source_id, accepted_at)
                 .expect("preparation case request");
-            let transition = server.external_open_requests.preparation_failed(
+            let transition = server.external_open_attachments.preparation_failed(
                 source_id,
                 dispatch.request_id(),
                 reason,
@@ -5625,11 +5875,11 @@ mod tests {
 
         let accepted_at = Instant::now();
         let delivery = server
-            .external_open_requests
+            .external_open_attachments
             .start(source_id, accepted_at)
             .expect("delivery request");
         let transition = server
-            .external_open_requests
+            .external_open_attachments
             .delivery_failed(source_id, delivery.request_id());
         assert!(server.report_external_open_transition(transition));
         assert_source_notice(
@@ -5655,11 +5905,11 @@ mod tests {
         ] {
             let accepted_at = Instant::now();
             let dispatch = server
-                .external_open_requests
+                .external_open_attachments
                 .start(source_id, accepted_at)
                 .expect("committed result request");
             assert_eq!(
-                server.external_open_requests.ready(
+                server.external_open_attachments.ready(
                     source_id,
                     dispatch.request_id(),
                     crate::protocol::ExternalOpenTarget::Direct,
@@ -5668,7 +5918,7 @@ mod tests {
                 ),
                 ExternalOpenTransition::Committed
             );
-            let transition = server.external_open_requests.result(
+            let transition = server.external_open_attachments.result(
                 source_id,
                 dispatch.request_id(),
                 result,
@@ -5681,10 +5931,10 @@ mod tests {
 
         let accepted_at = Instant::now();
         let invalid_before_commit = server
-            .external_open_requests
+            .external_open_attachments
             .start(source_id, accepted_at)
             .expect("invalid pre-commit result request");
-        let transition = server.external_open_requests.result(
+        let transition = server.external_open_attachments.result(
             source_id,
             invalid_before_commit.request_id(),
             crate::protocol::ExternalOpenResult::OpenedDirectly,
@@ -5702,11 +5952,11 @@ mod tests {
 
         let accepted_at = Instant::now();
         let timed_out = server
-            .external_open_requests
+            .external_open_attachments
             .start(source_id, accepted_at)
             .expect("pre-commit timeout request");
         let closed = server
-            .external_open_requests
+            .external_open_attachments
             .expire_due(timed_out.deadline())
             .pop()
             .expect("pre-commit timeout");
@@ -5722,11 +5972,11 @@ mod tests {
 
         let accepted_at = Instant::now();
         let committed_unknown = server
-            .external_open_requests
+            .external_open_attachments
             .start(source_id, accepted_at)
             .expect("committed unknown request");
         assert_eq!(
-            server.external_open_requests.ready(
+            server.external_open_attachments.ready(
                 source_id,
                 committed_unknown.request_id(),
                 crate::protocol::ExternalOpenTarget::Direct,
@@ -5736,7 +5986,7 @@ mod tests {
             ExternalOpenTransition::Committed
         );
         let closed = server
-            .external_open_requests
+            .external_open_attachments
             .expire_due(committed_unknown.deadline())
             .pop()
             .expect("committed unknown timeout");
@@ -5764,10 +6014,10 @@ mod tests {
         assert_client_writer_reaches_barrier_without_prior_message(&server, other_id, &mut other);
 
         let first = server
-            .external_open_requests
+            .external_open_attachments
             .start(source_id, Instant::now())
             .expect("replacement first");
-        let first_transition = server.external_open_requests.preparation_failed(
+        let first_transition = server.external_open_attachments.preparation_failed(
             source_id,
             first.request_id(),
             Failure::UnsupportedScheme,
@@ -5775,10 +6025,10 @@ mod tests {
         );
         assert!(server.report_external_open_transition(first_transition));
         let second = server
-            .external_open_requests
+            .external_open_attachments
             .start(source_id, Instant::now())
             .expect("replacement second");
-        let second_transition = server.external_open_requests.preparation_failed(
+        let second_transition = server.external_open_attachments.preparation_failed(
             source_id,
             second.request_id(),
             Failure::ForwardingUnavailable,
@@ -5858,11 +6108,11 @@ mod tests {
         ] {
             let accepted_at = Instant::now();
             let dispatch = server
-                .external_open_requests
+                .external_open_attachments
                 .start(source_id, accepted_at)
                 .expect("successful request");
             assert_eq!(
-                server.external_open_requests.ready(
+                server.external_open_attachments.ready(
                     source_id,
                     dispatch.request_id(),
                     target,
@@ -5871,7 +6121,7 @@ mod tests {
                 ),
                 ExternalOpenTransition::Committed
             );
-            let transition = server.external_open_requests.result(
+            let transition = server.external_open_attachments.result(
                 source_id,
                 dispatch.request_id(),
                 result,
@@ -5884,11 +6134,11 @@ mod tests {
         assert_client_writer_reaches_barrier_without_prior_message(&server, other_id, &mut other);
 
         let cancelled = server
-            .external_open_requests
+            .external_open_attachments
             .start(source_id, Instant::now())
             .expect("cancelled request");
         let closed = server
-            .external_open_requests
+            .external_open_attachments
             .cancel_preparing_for_client(source_id)
             .into_iter()
             .find(|closed| closed.request_id == cancelled.request_id())
@@ -5903,15 +6153,15 @@ mod tests {
         assert_client_writer_reaches_barrier_without_prior_message(&server, other_id, &mut other);
 
         let preparing = server
-            .external_open_requests
+            .external_open_attachments
             .start(source_id, Instant::now())
             .expect("disconnect preparing request");
         let committed = server
-            .external_open_requests
+            .external_open_attachments
             .start(source_id, Instant::now())
             .expect("disconnect committed request");
         assert_eq!(
-            server.external_open_requests.ready(
+            server.external_open_attachments.ready(
                 source_id,
                 committed.request_id(),
                 crate::protocol::ExternalOpenTarget::Direct,
@@ -5936,12 +6186,62 @@ mod tests {
             }
         }
         assert!(!server.clients.contains_key(&source_id));
-        assert!(server.external_open_requests.next_deadline().is_none());
+        assert!(server.external_open_attachments.next_deadline().is_none());
         assert_ne!(preparing.request_id(), committed.request_id());
         assert_client_writer_reaches_barrier_without_prior_message(&server, other_id, &mut other);
 
         drop(other);
         server.remove_all_clients();
+    }
+
+    #[test]
+    fn external_open_source_cap_rejects_the_33rd_without_prepare_authority() {
+        let mut server = test_headless_server();
+        let (source_writer, source_rx, _source_render_rx) = test_client_writer();
+        let (other_writer, other_rx, _other_render_rx) = test_client_writer();
+        for (client_id, writer) in [(1, source_writer), (2, other_writer)] {
+            server.clients.insert(
+                client_id,
+                ClientConnection::new(
+                    (80, 24),
+                    crate::kitty_graphics::HostCellSize::default(),
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    client_id,
+                    RenderEncoding::SemanticFrame,
+                    Some(writer),
+                ),
+            );
+            connect_client_projection(
+                &mut server,
+                client_id,
+                crate::protocol::ExternalOpenPolicy::Enabled,
+            );
+        }
+        let actions = (0..33)
+            .map(|_| crate::app::HostAction::OpenExternalUrl {
+                url: "https://example.com/private".to_owned(),
+            })
+            .collect();
+
+        server.handle_host_actions(1, actions, Instant::now());
+
+        let mut ids = std::collections::BTreeSet::new();
+        for _ in 0..32 {
+            let ServerMessage::ExternalOpenPrepare { request_id, .. } =
+                read_server_message(source_rx.recv().expect("admitted prepare"))
+            else {
+                panic!("expected prepare");
+            };
+            assert!(ids.insert(request_id));
+        }
+        assert!(source_rx.try_recv().is_err());
+        assert!(other_rx.try_recv().is_err());
+        assert_eq!(
+            client_projection_notice(&server, 1),
+            Some("Couldn’t open link · too many links are opening")
+        );
+        assert_eq!(client_projection_notice(&server, 2), None);
     }
 
     #[test]
@@ -6013,7 +6313,7 @@ mod tests {
             request_id,
             result: crate::protocol::ExternalOpenResult::OpenedDirectly,
         });
-        assert_eq!(server.external_open_requests.next_deadline(), None);
+        assert_eq!(server.external_open_attachments.next_deadline(), None);
         assert_eq!(client_projection_notice(&server, 1), None);
         assert!(other_rx.try_recv().is_err());
 
@@ -6578,7 +6878,7 @@ mod tests {
         };
         let deadline = accepted_at + Duration::from_secs(10);
         assert_eq!(
-            server.external_open_requests.next_deadline(),
+            server.external_open_attachments.next_deadline(),
             Some(deadline)
         );
 
@@ -6596,7 +6896,7 @@ mod tests {
             ),
             ServerMessage::ExternalOpenCancel { request_id }
         );
-        assert_eq!(server.external_open_requests.next_deadline(), None);
+        assert_eq!(server.external_open_attachments.next_deadline(), None);
 
         server.handle_scheduled_tasks_headless(deadline, false);
         assert!(control_rx.try_recv().is_err());
@@ -6697,6 +6997,9 @@ new_tab = "prefix+t"
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
+            external_open_attachment_id: Some(crate::protocol::ExternalOpenAttachmentId::for_test(
+                1
+            )),
             writer: writer_a,
         }));
         assert_eq!(
@@ -6722,6 +7025,9 @@ new_tab = "prefix+t"
             keybindings: None,
             direct_attach_requested: false,
             external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
+            external_open_attachment_id: Some(crate::protocol::ExternalOpenAttachmentId::for_test(
+                1
+            )),
             writer: writer_b,
         }));
         assert_eq!(
@@ -6763,6 +7069,9 @@ new_tab = "prefix+t"
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
+            external_open_attachment_id: Some(crate::protocol::ExternalOpenAttachmentId::for_test(
+                1
+            )),
             writer: writer_a,
         }));
         assert_eq!(server.app.state.config_diagnostic, without_keybindings);
@@ -6777,6 +7086,9 @@ new_tab = "prefix+t"
             keybindings: None,
             direct_attach_requested: false,
             external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
+            external_open_attachment_id: Some(crate::protocol::ExternalOpenAttachmentId::for_test(
+                1
+            )),
             writer: writer_b,
         }));
         assert_eq!(
@@ -6821,6 +7133,9 @@ next_tab = ""
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
+            external_open_attachment_id: Some(crate::protocol::ExternalOpenAttachmentId::for_test(
+                1
+            )),
             writer,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -6897,6 +7212,9 @@ next_tab = ""
             keybindings: Some(Box::new(local_config.live_keybinds().unwrap())),
             direct_attach_requested: false,
             external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
+            external_open_attachment_id: Some(crate::protocol::ExternalOpenAttachmentId::for_test(
+                1
+            )),
             writer: writer_a,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -6918,6 +7236,9 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: false,
             external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
+            external_open_attachment_id: Some(crate::protocol::ExternalOpenAttachmentId::for_test(
+                1
+            )),
             writer: writer_b,
         }));
         assert_eq!(
@@ -6953,6 +7274,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             external_open_policy: None,
+            external_open_attachment_id: None,
             writer,
         }));
         assert!(server.clients.contains_key(&7));
@@ -7019,6 +7341,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             external_open_policy: None,
+            external_open_attachment_id: None,
             writer,
         }));
         control_rx
@@ -7322,6 +7645,9 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: false,
             external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
+            external_open_attachment_id: Some(crate::protocol::ExternalOpenAttachmentId::for_test(
+                1
+            )),
             writer,
         }));
 
@@ -7357,6 +7683,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             external_open_policy: None,
+            external_open_attachment_id: None,
             writer,
         }));
 
@@ -7391,6 +7718,9 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: false,
             external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
+            external_open_attachment_id: Some(crate::protocol::ExternalOpenAttachmentId::for_test(
+                1
+            )),
             writer,
         }));
         assert!(server.has_app_client());
@@ -7437,6 +7767,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             external_open_policy: None,
+            external_open_attachment_id: None,
             writer,
         }));
         assert!(
@@ -9002,6 +9333,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             external_open_policy: None,
+            external_open_attachment_id: None,
             writer,
         }));
         assert!(

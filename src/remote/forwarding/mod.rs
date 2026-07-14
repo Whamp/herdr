@@ -24,6 +24,8 @@ pub(crate) const FORWARDING_STATUS_MANAGED_SSH_REQUIRED: &str = "managed_ssh_req
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) const FORWARDING_STATUS_UNAVAILABLE: &str = "forwarding_unavailable";
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) use broker::ForwardingBrokerTestHarness;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use controller::NumericForwardingController;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

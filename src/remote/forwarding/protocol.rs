@@ -5,7 +5,7 @@ use std::num::NonZeroU64;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-pub(super) const BROKER_PROTOCOL_VERSION: u16 = 4;
+pub(super) const BROKER_PROTOCOL_VERSION: u16 = 5;
 pub(super) const MAX_PAYLOAD_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -82,6 +82,7 @@ pub(super) enum ClientMessage {
     AssertPolicy {
         id: CorrelationId,
         enabled: bool,
+        saved_mapping_limit: u8,
     },
     Forward {
         id: CorrelationId,
@@ -113,6 +114,8 @@ pub(crate) enum ForwardFailure {
     Disabled,
     Cancelled,
     TooManyRequests,
+    TooManyWaiters,
+    CapacityExhausted,
     AlreadyOwned,
     BindFailed,
     CommandRejected,
@@ -131,6 +134,7 @@ pub(super) enum ServerMessage {
         id: CorrelationId,
         requested: bool,
         effective: bool,
+        saved_mapping_limit: u8,
         result: Result<(), ForwardFailure>,
     },
     ForwardSettled {
@@ -280,6 +284,35 @@ mod tests {
             .expect("decode settlement"),
             settlement
         );
+    }
+
+    #[test]
+    fn saved_mapping_limit_wire_boundaries_round_trip_before_checked_reconstruction() {
+        for raw_limit in [1_u8, 64] {
+            let message = ClientMessage::AssertPolicy {
+                id: CorrelationId::new(u64::from(raw_limit)).expect("id"),
+                enabled: true,
+                saved_mapping_limit: raw_limit,
+            };
+            let decoded = decode_message::<ClientMessage>(
+                &encode_message(&message).expect("encode policy assertion"),
+            )
+            .expect("decode policy assertion");
+            let ClientMessage::AssertPolicy {
+                saved_mapping_limit,
+                ..
+            } = decoded
+            else {
+                panic!("expected policy assertion");
+            };
+            assert_eq!(
+                crate::config::SavedPortForwardLimit::new(saved_mapping_limit)
+                    .map(crate::config::SavedPortForwardLimit::get),
+                Some(raw_limit)
+            );
+        }
+        assert_eq!(crate::config::SavedPortForwardLimit::new(0), None);
+        assert_eq!(crate::config::SavedPortForwardLimit::new(65), None);
     }
 
     #[test]

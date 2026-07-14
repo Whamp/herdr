@@ -15,6 +15,8 @@ pub(crate) enum LoopbackTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ForwardingPreparationError {
     TooManyRequests,
+    TooManyWaiters,
+    CapacityExhausted,
     BindExhausted,
     CommandRejected,
     CommandTimedOut,
@@ -32,6 +34,8 @@ pub(crate) trait ForwardingPreparation: Send {
 pub(crate) struct ForwardingPolicySettlement {
     pub(crate) requested: bool,
     pub(crate) effective: bool,
+    pub(crate) requested_saved_mapping_limit: crate::config::SavedPortForwardLimit,
+    pub(crate) effective_saved_mapping_limit: crate::config::SavedPortForwardLimit,
     pub(crate) result: Result<(), ForwardingPreparationError>,
 }
 
@@ -51,6 +55,7 @@ pub(crate) trait ForwardingController: Send + Sync {
     fn begin_set_enabled(
         &self,
         enabled: bool,
+        saved_mapping_limit: crate::config::SavedPortForwardLimit,
     ) -> Result<Box<dyn ForwardingPolicyChange>, ForwardingPreparationError>;
 }
 
@@ -87,9 +92,12 @@ impl ExternalOpenForwarding {
     pub(crate) fn begin_set_enabled(
         &self,
         enabled: bool,
+        saved_mapping_limit: crate::config::SavedPortForwardLimit,
     ) -> Result<Option<Box<dyn ForwardingPolicyChange>>, ForwardingPreparationError> {
         match self {
-            Self::Available(controller) => controller.begin_set_enabled(enabled).map(Some),
+            Self::Available(controller) => controller
+                .begin_set_enabled(enabled, saved_mapping_limit)
+                .map(Some),
             Self::ManagedSshRequired | Self::Unavailable => Ok(None),
         }
     }
@@ -99,6 +107,8 @@ impl From<ForwardingPreparationError> for crate::protocol::ExternalOpenPreparati
     fn from(error: ForwardingPreparationError) -> Self {
         match error {
             ForwardingPreparationError::TooManyRequests => Self::TooManyForwardRequests,
+            ForwardingPreparationError::TooManyWaiters => Self::TooManyMappingWaiters,
+            ForwardingPreparationError::CapacityExhausted => Self::ForwardCapacityExhausted,
             ForwardingPreparationError::BindExhausted => Self::ForwardBindExhausted,
             ForwardingPreparationError::CommandRejected => Self::ForwardCommandRejected,
             ForwardingPreparationError::CommandTimedOut => Self::ForwardCommandTimedOut,
@@ -429,6 +439,14 @@ mod tests {
             (
                 ForwardingPreparationError::TooManyRequests,
                 crate::protocol::ExternalOpenPreparationFailure::TooManyForwardRequests,
+            ),
+            (
+                ForwardingPreparationError::TooManyWaiters,
+                crate::protocol::ExternalOpenPreparationFailure::TooManyMappingWaiters,
+            ),
+            (
+                ForwardingPreparationError::CapacityExhausted,
+                crate::protocol::ExternalOpenPreparationFailure::ForwardCapacityExhausted,
             ),
             (
                 ForwardingPreparationError::BindExhausted,

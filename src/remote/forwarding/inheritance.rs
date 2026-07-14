@@ -66,10 +66,11 @@ impl PendingBroker {
 
 pub(crate) fn adopt_external_open_forwarding(
     initial_policy: bool,
+    initial_saved_mapping_limit: crate::config::SavedPortForwardLimit,
 ) -> io::Result<crate::external_open::ExternalOpenForwarding> {
     let status = std::env::var(FORWARDING_LAUNCH_STATUS_ENV).ok();
     std::env::remove_var(FORWARDING_LAUNCH_STATUS_ENV);
-    let client = adopt_inherited_capability(initial_policy)?;
+    let client = adopt_inherited_capability(initial_policy, initial_saved_mapping_limit)?;
     match (client, status.as_deref()) {
         (Some(client), Some(FORWARDING_STATUS_AVAILABLE) | None) => {
             Ok(crate::external_open::ExternalOpenForwarding::available(
@@ -89,7 +90,10 @@ pub(crate) fn adopt_external_open_forwarding(
     }
 }
 
-fn adopt_inherited_capability(initial_policy: bool) -> io::Result<Option<ForwardingClient>> {
+fn adopt_inherited_capability(
+    initial_policy: bool,
+    initial_saved_mapping_limit: crate::config::SavedPortForwardLimit,
+) -> io::Result<Option<ForwardingClient>> {
     let Some(raw_descriptor) = std::env::var_os(INHERITED_BROKER_FD_ENV) else {
         return Ok(None);
     };
@@ -120,6 +124,7 @@ fn adopt_inherited_capability(initial_policy: bool) -> io::Result<Option<Forward
     ForwardingClient::from_stream(
         stream,
         initial_policy,
+        initial_saved_mapping_limit,
         crate::platform::InheritedPeerIdentity::parent(),
     )
     .map(Some)
@@ -143,9 +148,10 @@ mod tests {
             return;
         }
 
-        let client = adopt_inherited_capability(false)
-            .expect("adopt inherited capability")
-            .expect("capability present");
+        let client =
+            adopt_inherited_capability(false, crate::config::SavedPortForwardLimit::DEFAULT)
+                .expect("adopt inherited capability")
+                .expect("capability present");
         assert!(!client.is_active());
         assert!(std::env::var_os(INHERITED_BROKER_FD_ENV).is_none());
         assert!(descriptor_is_cloexec(client.raw_descriptor_for_test()).expect("descriptor flags"));

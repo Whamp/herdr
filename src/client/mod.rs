@@ -90,6 +90,7 @@ struct ClientLoopConfig {
     kitty_graphics_enabled: bool,
     mouse_capture_active: bool,
     external_open_policy: crate::protocol::ExternalOpenPolicy,
+    saved_mapping_limit: crate::config::SavedPortForwardLimit,
     external_open_forwarding: crate::external_open::ExternalOpenForwarding,
     #[cfg(unix)]
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
@@ -765,6 +766,7 @@ fn client_hello(
     requested_encoding: RenderEncoding,
     connection_kind: ClientConnectionKind,
     external_open_policy: crate::protocol::ExternalOpenPolicy,
+    external_open_attachment_id: Option<crate::protocol::ExternalOpenAttachmentId>,
 ) -> ClientMessage {
     ClientMessage::Hello {
         version: PROTOCOL_VERSION,
@@ -776,6 +778,10 @@ fn client_hello(
         keybindings: requested_keybindings(),
         launch_mode: connection_kind.launch_mode(),
         external_open_policy: connection_kind.advertised_external_open_policy(external_open_policy),
+        external_open_attachment_id: connection_kind
+            .is_full_app()
+            .then_some(external_open_attachment_id)
+            .flatten(),
     }
 }
 
@@ -792,6 +798,7 @@ fn do_handshake(
     requested_encoding: RenderEncoding,
     connection_kind: ClientConnectionKind,
     external_open_policy: crate::protocol::ExternalOpenPolicy,
+    external_open_attachment_id: Option<crate::protocol::ExternalOpenAttachmentId>,
 ) -> Result<RenderEncoding, ClientError> {
     stream
         .set_nonblocking(false)
@@ -806,6 +813,7 @@ fn do_handshake(
         requested_encoding,
         connection_kind,
         external_open_policy,
+        external_open_attachment_id,
     );
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -992,6 +1000,7 @@ fn connect_terminal_session_stream(
         RenderEncoding::TerminalAnsi,
         connection_kind,
         crate::protocol::ExternalOpenPolicy::Disabled,
+        None,
     ) {
         Ok(RenderEncoding::TerminalAnsi) => {}
         Ok(encoding) => {
@@ -1195,9 +1204,17 @@ fn run_client_with_mode(
     } else {
         crate::protocol::ExternalOpenPolicy::Disabled
     };
+    let saved_mapping_limit = loaded_config.config.remote.saved_port_forward_limit;
+    let external_open_attachment_id = if connection_kind.is_full_app() {
+        Some(crate::remote::take_external_open_attachment_id()?)
+    } else {
+        std::env::remove_var(crate::remote::EXTERNAL_OPEN_ATTACHMENT_ENV_VAR);
+        None
+    };
     let external_open_forwarding = if connection_kind.is_full_app() {
         crate::platform::adopt_inherited_forwarding_capability(
             external_open_policy == crate::protocol::ExternalOpenPolicy::Enabled,
+            saved_mapping_limit,
         )?
     } else {
         crate::external_open::ExternalOpenForwarding::Unavailable
@@ -1215,6 +1232,7 @@ fn run_client_with_mode(
         kitty_graphics_enabled,
         mouse_capture_active: mouse_capture,
         external_open_policy,
+        saved_mapping_limit,
         external_open_forwarding,
         #[cfg(unix)]
         remote_image_paste_key,
@@ -1249,6 +1267,7 @@ fn run_client_with_mode(
         requested_encoding,
         connection_kind,
         external_open_policy,
+        external_open_attachment_id,
     ) {
         Ok(encoding) => encoding,
         Err(err) => {
@@ -1453,6 +1472,7 @@ async fn run_client_loop(
         } else {
             crate::protocol::ExternalOpenPolicy::Disabled
         },
+        config.saved_mapping_limit,
         config.external_open_forwarding,
     );
 
@@ -1664,11 +1684,11 @@ async fn run_client_loop(
                         #[cfg(unix)]
                         &mut state.remote_image_paste_key,
                     );
-                    let policy_messages = if let Some(policy) = reloaded_policy {
+                    let policy_messages = if let Some(reloaded) = reloaded_policy {
                         confirmed_external_open_policy_update(
                             config.connection_kind,
                             &mut external_open,
-                            policy,
+                            reloaded,
                         )
                     } else if config.connection_kind.is_full_app() {
                         vec![ClientMessage::ExternalOpenPolicyReloadFailed {
@@ -1905,13 +1925,25 @@ fn mutate_external_open_policy(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExternalOpenConfigReload {
+    policy: Option<crate::protocol::ExternalOpenPolicy>,
+    saved_mapping_limit: Option<crate::config::SavedPortForwardLimit>,
+}
+
 fn confirmed_external_open_policy_update(
     connection_kind: ClientConnectionKind,
     external_open: &mut external_open::ClientExternalOpen,
-    policy: crate::protocol::ExternalOpenPolicy,
+    reloaded: ExternalOpenConfigReload,
 ) -> Vec<ClientMessage> {
     if connection_kind.is_full_app() {
-        external_open.begin_policy_reload(policy)
+        let report_section_failure =
+            reloaded.policy.is_none() || reloaded.saved_mapping_limit.is_none();
+        let policy = reloaded.policy.unwrap_or_else(|| external_open.policy());
+        let saved_mapping_limit = reloaded
+            .saved_mapping_limit
+            .unwrap_or_else(|| external_open.saved_mapping_limit());
+        external_open.begin_policy_reload(policy, saved_mapping_limit, report_section_failure)
     } else {
         Vec::new()
     }
@@ -1925,7 +1957,7 @@ fn reload_local_client_config(
         crossterm::event::KeyCode,
         crossterm::event::KeyModifiers,
     )>,
-) -> Option<crate::protocol::ExternalOpenPolicy> {
+) -> Option<ExternalOpenConfigReload> {
     match crate::config::load_live_config() {
         Ok(loaded) => {
             for diagnostic in loaded.config.ui.sound.diagnostics() {
@@ -1941,14 +1973,22 @@ fn reload_local_client_config(
                 *remote_image_paste_key = loaded_remote_image_paste_key;
             }
             debug!("reloaded local client config");
-            (!loaded
-                .invalid_sections
-                .iter()
-                .any(|section| section == "experimental"))
-            .then_some(if loaded.config.experimental.open_remote_links_on_client {
-                crate::protocol::ExternalOpenPolicy::Enabled
-            } else {
-                crate::protocol::ExternalOpenPolicy::Disabled
+            let invalid_section = |name: &str| {
+                loaded
+                    .invalid_sections
+                    .iter()
+                    .any(|section| section == name)
+            };
+            Some(ExternalOpenConfigReload {
+                policy: (!invalid_section("experimental")).then_some(
+                    if loaded.config.experimental.open_remote_links_on_client {
+                        crate::protocol::ExternalOpenPolicy::Enabled
+                    } else {
+                        crate::protocol::ExternalOpenPolicy::Disabled
+                    },
+                ),
+                saved_mapping_limit: (!invalid_section("remote"))
+                    .then_some(loaded.config.remote.saved_port_forward_limit),
             })
         }
         Err(diagnostics) => {
@@ -2420,6 +2460,8 @@ mod tests {
                 },
                 kind,
                 crate::protocol::ExternalOpenPolicy::Enabled,
+                kind.is_full_app()
+                    .then_some(crate::protocol::ExternalOpenAttachmentId::for_test(1)),
             );
             let mut wire = Vec::new();
             protocol::write_message(&mut wire, &hello).expect("write hello");
@@ -2431,6 +2473,7 @@ mod tests {
                 ClientMessage::Hello {
                     launch_mode,
                     external_open_policy,
+                    external_open_attachment_id,
                     ..
                 } => {
                     assert_eq!(launch_mode, kind.launch_mode(), "kind={kind:?}");
@@ -2439,6 +2482,12 @@ mod tests {
                         kind.advertised_external_open_policy(
                             crate::protocol::ExternalOpenPolicy::Enabled
                         ),
+                        "kind={kind:?}"
+                    );
+                    assert_eq!(
+                        external_open_attachment_id,
+                        kind.is_full_app()
+                            .then_some(crate::protocol::ExternalOpenAttachmentId::for_test(1)),
                         "kind={kind:?}"
                     );
                 }
@@ -3081,7 +3130,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            "[ui]\nredraw_on_focus_gained = false\nhost_cursor = \"drawn\"\n",
+            "[ui]\nredraw_on_focus_gained = false\nhost_cursor = \"drawn\"\n\n[experimental]\nopen_remote_links_on_client = true\n\n[remote]\nsaved_port_forward_limit = 64\n",
         )
         .unwrap();
         let path_string = path.to_string_lossy().to_string();
@@ -3092,7 +3141,7 @@ mod tests {
         #[cfg(unix)]
         let mut remote_image_paste_key = None;
 
-        let _ = reload_local_client_config(
+        let reloaded = reload_local_client_config(
             &mut sound_config,
             &mut redraw_on_focus_gained,
             &mut draw_host_cursor,
@@ -3102,6 +3151,35 @@ mod tests {
 
         assert!(!redraw_on_focus_gained);
         assert!(draw_host_cursor);
+        assert_eq!(
+            reloaded,
+            Some(ExternalOpenConfigReload {
+                policy: Some(crate::protocol::ExternalOpenPolicy::Enabled),
+                saved_mapping_limit: Some(
+                    crate::config::SavedPortForwardLimit::new(64).expect("valid limit")
+                ),
+            })
+        );
+
+        std::fs::write(
+            &path,
+            "[experimental]\nopen_remote_links_on_client = false\n\n[remote]\nmanage_ssh_config = false\nsaved_port_forward_limit = 65\n",
+        )
+        .unwrap();
+        assert_eq!(
+            reload_local_client_config(
+                &mut sound_config,
+                &mut redraw_on_focus_gained,
+                &mut draw_host_cursor,
+                #[cfg(unix)]
+                &mut remote_image_paste_key,
+            ),
+            Some(ExternalOpenConfigReload {
+                policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
+                saved_mapping_limit: None,
+            }),
+            "invalid live remote section must retain only the attachment's remote section"
+        );
         let _ = std::fs::remove_file(path);
     }
 

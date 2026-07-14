@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, num::NonZeroUsize};
 
 use crossterm::event::KeyModifiers;
-use serde::{de, Deserialize, Deserializer, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 use super::{
     ActionKeybinds, BindingConfig, CommandKeybindConfig, IndexedKeybind, Keybinds, SidebarConfig,
@@ -856,18 +856,92 @@ pub struct AdvancedConfig {
     pub scrollback_limit_bytes: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SavedPortForwardLimit(u8);
+
+impl SavedPortForwardLimit {
+    pub const DEFAULT: Self = Self(12);
+    pub const MAX: u8 = 64;
+
+    pub const fn new(value: u8) -> Option<Self> {
+        let count = value as usize;
+        let minimum = Self(1);
+        let maximum = Self(Self::MAX);
+        let meets_minimum = minimum.is_reached_by(count) || minimum.is_exceeded_by(count);
+        let meets_maximum = maximum.admits_count(count) || maximum.is_reached_by(count);
+        if meets_minimum && meets_maximum {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+
+    pub const fn admits_count(self, count: usize) -> bool {
+        count < self.0 as usize
+    }
+
+    pub const fn is_reached_by(self, count: usize) -> bool {
+        count == self.0 as usize
+    }
+
+    pub const fn is_exceeded_by(self, count: usize) -> bool {
+        count > self.0 as usize
+    }
+}
+
+impl Default for SavedPortForwardLimit {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl Serialize for SavedPortForwardLimit {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u8(self.get())
+    }
+}
+
+impl<'de> Deserialize<'de> for SavedPortForwardLimit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        if !(1..=u64::from(Self::MAX)).contains(&value) {
+            return Err(de::Error::custom(
+                "remote.saved_port_forward_limit must be an integer between 1 and 64",
+            ));
+        }
+        let value = u8::try_from(value).map_err(de::Error::custom)?;
+        Self::new(value).ok_or_else(|| {
+            de::Error::custom("remote.saved_port_forward_limit must be an integer between 1 and 64")
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct RemoteConfig {
     /// Add keepalive fallbacks and private connection reuse for `herdr --remote`.
     /// Set false to run plain ssh unchanged. Default: true.
     pub manage_ssh_config: bool,
+    /// Maximum Creating and Ready forwarding mappings retained by one attachment.
+    /// Default: 12. Accepted range: 1 through 64.
+    pub saved_port_forward_limit: SavedPortForwardLimit,
 }
 
 impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
             manage_ssh_config: true,
+            saved_port_forward_limit: SavedPortForwardLimit::default(),
         }
     }
 }
@@ -1658,6 +1732,63 @@ pane_history = true
         let config: Config = toml::from_str(toml).unwrap();
 
         assert!(config.experimental.pane_history);
+    }
+
+    #[test]
+    fn saved_port_forward_limit_defaults_to_12_and_accepts_only_integer_1_through_64() {
+        assert_eq!(Config::default().remote.saved_port_forward_limit.get(), 12);
+        assert_eq!(SavedPortForwardLimit::new(0), None);
+        assert_eq!(
+            SavedPortForwardLimit::new(1).map(SavedPortForwardLimit::get),
+            Some(1)
+        );
+        assert_eq!(
+            SavedPortForwardLimit::new(64).map(SavedPortForwardLimit::get),
+            Some(64)
+        );
+        assert_eq!(SavedPortForwardLimit::new(65), None);
+        for (value, expected) in [("1", 1), ("12", 12), ("64", 64)] {
+            let config: Config =
+                toml::from_str(&format!("[remote]\nsaved_port_forward_limit = {value}\n"))
+                    .expect("valid saved forward limit");
+            assert_eq!(config.remote.saved_port_forward_limit.get(), expected);
+        }
+        for value in [
+            "-1",
+            "0",
+            "65",
+            "255",
+            "18446744073709551616",
+            "1.5",
+            "\"12\"",
+        ] {
+            assert!(
+                toml::from_str::<Config>(&format!(
+                    "[remote]\nsaved_port_forward_limit = {value}\n"
+                ))
+                .is_err(),
+                "{value} must be rejected rather than coerced"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_port_forward_limit_predicates_cover_boundaries_on_every_target() {
+        for (limit, below, equal, above) in [(1, 0, 1, 2), (12, 11, 12, 13), (64, 63, 64, 65)] {
+            let limit = SavedPortForwardLimit::new(limit).expect("valid saved forward limit");
+
+            assert!(limit.admits_count(below));
+            assert!(!limit.admits_count(equal));
+            assert!(!limit.admits_count(above));
+
+            assert!(!limit.is_reached_by(below));
+            assert!(limit.is_reached_by(equal));
+            assert!(!limit.is_reached_by(above));
+
+            assert!(!limit.is_exceeded_by(below));
+            assert!(!limit.is_exceeded_by(equal));
+            assert!(limit.is_exceeded_by(above));
+        }
     }
 
     #[test]
