@@ -17,6 +17,14 @@ pub(crate) struct PolicyMutationResult {
     pub(crate) failure_stage: Option<crate::protocol::ExternalOpenPolicyMutationFailureStage>,
 }
 
+fn is_incomplete_disable_cleanup(result: PolicyMutationResult) -> bool {
+    result.requested_policy == ExternalOpenPolicy::Disabled
+        && result.persisted_policy == Some(ExternalOpenPolicy::Disabled)
+        && result.effective_policy == ExternalOpenPolicy::Disabled
+        && result.failure_stage
+            == Some(crate::protocol::ExternalOpenPolicyMutationFailureStage::Reload)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClientFrameAcknowledgement {
     generation: u64,
@@ -41,6 +49,7 @@ pub(crate) enum ClientProjectionAction {
     },
     ReportReloadFailure {
         effective_policy: ExternalOpenPolicy,
+        cleanup_incomplete: bool,
         now: std::time::Instant,
     },
     ShowNotice {
@@ -166,16 +175,23 @@ impl ClientProjections {
                 let settled = projection.settle_policy_mutation(result, now);
                 ClientProjectionEffect {
                     changed: settled,
-                    confirmed_policy: (settled && result.failure_stage.is_none())
-                        .then_some(result.effective_policy),
+                    confirmed_policy: (settled
+                        && (result.failure_stage.is_none()
+                            || is_incomplete_disable_cleanup(result)))
+                    .then_some(result.effective_policy),
                     mutation_request: None,
                 }
             }
             ClientProjectionAction::ReportReloadFailure {
                 effective_policy,
+                cleanup_incomplete,
                 now,
             } => ClientProjectionEffect {
-                changed: projection.report_reload_failure(effective_policy, now),
+                changed: projection.report_reload_failure(
+                    effective_policy,
+                    cleanup_incomplete,
+                    now,
+                ),
                 ..ClientProjectionEffect::default()
             },
             ClientProjectionAction::ShowNotice { message, now } => ClientProjectionEffect {
@@ -306,8 +322,12 @@ impl ClientProjection {
     }
 
     fn confirm_policy(&mut self, policy: ExternalOpenPolicy) -> bool {
-        if self.pending.is_some() {
-            return false;
+        if let Some(pending) = self.pending {
+            if policy != ExternalOpenPolicy::Disabled
+                || pending.request.requested_policy != ExternalOpenPolicy::Disabled
+            {
+                return false;
+            }
         }
         let changed = self.confirmed_policy != policy;
         self.confirmed_policy = policy;
@@ -442,6 +462,10 @@ impl ClientProjection {
         }
 
         let notice = match result.failure_stage {
+            _ if is_incomplete_disable_cleanup(result) => {
+                self.confirmed_policy = ExternalOpenPolicy::Disabled;
+                Some("Remote link opening turned off · some local forwards couldn’t be removed")
+            }
             None if result.persisted_policy.is_some() => {
                 self.confirmed_policy = result.effective_policy;
                 None
@@ -472,13 +496,21 @@ impl ClientProjection {
     fn report_reload_failure(
         &mut self,
         effective_policy: ExternalOpenPolicy,
+        cleanup_incomplete: bool,
         now: std::time::Instant,
     ) -> bool {
-        if self.confirmed_policy != effective_policy {
+        if self.confirmed_policy != effective_policy
+            || (cleanup_incomplete && effective_policy != ExternalOpenPolicy::Disabled)
+        {
             return false;
         }
+        let message = if cleanup_incomplete {
+            "Remote link opening turned off · some local forwards couldn’t be removed"
+        } else {
+            "Couldn’t reload remote link setting · previous value kept"
+        };
         self.notice = Some(LocalNotice {
-            message: "Couldn’t reload remote link setting · previous value kept",
+            message,
             expires_at: now + std::time::Duration::from_secs(5),
         });
         true
@@ -786,7 +818,7 @@ mod tests {
         let now = std::time::Instant::now();
         let mut projection = ClientProjection::new(ExternalOpenPolicy::Enabled);
 
-        assert!(projection.report_reload_failure(ExternalOpenPolicy::Enabled, now));
+        assert!(projection.report_reload_failure(ExternalOpenPolicy::Enabled, false, now));
 
         assert_eq!(
             projection.view().confirmed_policy(),

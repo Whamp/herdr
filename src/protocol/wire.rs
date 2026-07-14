@@ -521,6 +521,7 @@ pub enum ClientMessage {
     /// Report that an explicit local client-config reload could not refresh this policy.
     ExternalOpenPolicyReloadFailed {
         effective_policy: ExternalOpenPolicy,
+        cleanup_incomplete: bool,
     },
 }
 
@@ -1338,6 +1339,7 @@ mod tests {
         roundtrip_client(
             ClientMessage::ExternalOpenPolicyReloadFailed {
                 effective_policy: ExternalOpenPolicy::Disabled,
+                cleanup_incomplete: true,
             },
             15,
         );

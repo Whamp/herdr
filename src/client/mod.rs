@@ -1693,6 +1693,7 @@ async fn run_client_loop(
                     } else if config.connection_kind.is_full_app() {
                         vec![ClientMessage::ExternalOpenPolicyReloadFailed {
                             effective_policy: external_open.policy(),
+                            cleanup_incomplete: false,
                         }]
                     } else {
                         Vec::new()

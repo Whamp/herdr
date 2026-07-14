@@ -477,6 +477,7 @@ pub(crate) enum ServerEvent {
     ExternalOpenPolicyReloadFailed {
         client_id: u64,
         effective_policy: crate::protocol::ExternalOpenPolicy,
+        cleanup_incomplete: bool,
     },
     /// A full app client completed external-open preparation.
     ExternalOpenReady {
@@ -1051,12 +1052,14 @@ fn client_read_loop(
                 effective_policy,
                 failure_stage,
             },
-            ClientMessage::ExternalOpenPolicyReloadFailed { effective_policy } => {
-                ServerEvent::ExternalOpenPolicyReloadFailed {
-                    client_id,
-                    effective_policy,
-                }
-            }
+            ClientMessage::ExternalOpenPolicyReloadFailed {
+                effective_policy,
+                cleanup_incomplete,
+            } => ServerEvent::ExternalOpenPolicyReloadFailed {
+                client_id,
+                effective_policy,
+                cleanup_incomplete,
+            },
             ClientMessage::Hello { .. } => {
                 // Duplicate Hello — ignore.
                 continue;
