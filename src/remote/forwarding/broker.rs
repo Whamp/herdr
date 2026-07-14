@@ -699,7 +699,10 @@ enum CleanupOwner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueuedJobKind {
     Mapping(MappingAttempt),
-    Cleanup(CleanupOwner),
+    Cleanup {
+        owner: CleanupOwner,
+        local_port: u16,
+    },
 }
 
 struct PendingPolicyAcknowledgement {
@@ -732,7 +735,7 @@ impl BrokerServer {
             stream,
             expected_child,
             authority,
-            Arc::new(super::worker::ProcessCommandRunner),
+            Arc::new(super::worker::ProcessCommandRunner::default()),
             super::worker::CONTROL_COMMAND_TIMEOUT,
         )
     }
@@ -880,6 +883,10 @@ fn run_broker(
             if completed.job.id != result.id || completed.job.operation != result.operation {
                 break 'broker;
             }
+            if result.result == ControlResult::MasterDied {
+                let _ = mappings.master_died();
+                break 'broker;
+            }
 
             match completed.kind {
                 QueuedJobKind::Mapping(attempt) => {
@@ -921,7 +928,7 @@ fn run_broker(
                         }
                     }
                 }
-                QueuedJobKind::Cleanup(owner) => {
+                QueuedJobKind::Cleanup { owner, local_port } => {
                     if let CleanupOwner::Policy(policy_id) = owner {
                         let Some(pending) = pending_policy_ack.as_mut().filter(
                             |pending: &&mut PendingPolicyAcknowledgement| {
@@ -931,8 +938,12 @@ fn run_broker(
                             break 'broker;
                         };
                         pending.remaining_cleanups -= 1;
+                        let failure = cleanup_failure(result.result);
+                        if failure.is_some() {
+                            mappings.quarantine_uncertain(local_port);
+                        }
                         if pending.cleanup_failure.is_none() {
-                            pending.cleanup_failure = cleanup_failure(result.result);
+                            pending.cleanup_failure = failure;
                         }
                     }
                 }
@@ -991,7 +1002,7 @@ fn run_broker(
                             break 'broker;
                         };
                         let change = mappings.begin_saved_limit_change(saved_mapping_limit, id);
-                        let remaining_cleanups = change.cancellations.len();
+                        let mut remaining_cleanups = change.cancellations.len();
                         for cancellation in change.cancellations.iter().copied() {
                             queue.push_back(policy_cleanup_job(cancellation));
                         }
@@ -1001,7 +1012,17 @@ fn run_broker(
                             BrokerState::Disabled
                         };
                         if !enabled {
-                            for revoked in mappings.revoke_creating() {
+                            let ready_cancellations = mappings.revoke_ready(id);
+                            let Some(total_cleanups) =
+                                remaining_cleanups.checked_add(ready_cancellations.len())
+                            else {
+                                break 'broker;
+                            };
+                            remaining_cleanups = total_cleanups;
+                            for cancellation in ready_cancellations {
+                                queue.push_back(policy_cleanup_job(cancellation));
+                            }
+                            for revoked in mappings.revoke_creating(id) {
                                 if write_mapping_settlement(
                                     &mut stream,
                                     revoked.localhost,
@@ -1126,7 +1147,10 @@ fn cleanup_job(attempt: MappingAttempt) -> QueuedJob {
             id: attempt.controller_id(),
             operation: attempt.cancellation(),
         },
-        kind: QueuedJobKind::Cleanup(CleanupOwner::BestEffort),
+        kind: QueuedJobKind::Cleanup {
+            owner: CleanupOwner::BestEffort,
+            local_port: attempt.local_port(),
+        },
     }
 }
 
@@ -1136,7 +1160,10 @@ fn policy_attempt_cleanup_job(attempt: MappingAttempt, policy_id: CorrelationId)
             id: policy_id,
             operation: attempt.cancellation(),
         },
-        kind: QueuedJobKind::Cleanup(CleanupOwner::Policy(policy_id)),
+        kind: QueuedJobKind::Cleanup {
+            owner: CleanupOwner::Policy(policy_id),
+            local_port: attempt.local_port(),
+        },
     }
 }
 
@@ -1146,7 +1173,10 @@ fn replacement_cleanup_job(cancellation: MappingCancellation) -> QueuedJob {
             id: cancellation.controller_id(),
             operation: cancellation.operation(),
         },
-        kind: QueuedJobKind::Cleanup(CleanupOwner::BestEffort),
+        kind: QueuedJobKind::Cleanup {
+            owner: CleanupOwner::BestEffort,
+            local_port: cancellation.local_port(),
+        },
     }
 }
 
@@ -1156,7 +1186,10 @@ fn policy_cleanup_job(cancellation: MappingCancellation) -> QueuedJob {
             id: cancellation.controller_id(),
             operation: cancellation.operation(),
         },
-        kind: QueuedJobKind::Cleanup(CleanupOwner::Policy(cancellation.controller_id())),
+        kind: QueuedJobKind::Cleanup {
+            owner: CleanupOwner::Policy(cancellation.controller_id()),
+            local_port: cancellation.local_port(),
+        },
     }
 }
 
@@ -1173,6 +1206,7 @@ fn cleanup_failure(result: ControlResult) -> Option<ForwardFailure> {
         | ControlResult::PairFirstFailed
         | ControlResult::PairSecondFailed
         | ControlResult::PairCancellationFailed => Some(ForwardFailure::CommandRejected),
+        ControlResult::MasterDied => Some(ForwardFailure::CapabilityClosed),
     }
 }
 
@@ -1187,7 +1221,9 @@ fn mapping_control_result(result: ControlResult) -> Option<MappingControlResult>
         ControlResult::PairFirstFailed => Some(MappingControlResult::PairFirstFailed),
         ControlResult::PairFirstTimedOut => Some(MappingControlResult::PairFirstTimedOut),
         ControlResult::PairSecondFailed => Some(MappingControlResult::PairSecondFailed),
-        ControlResult::PairCancellationSucceeded | ControlResult::PairCancellationFailed => None,
+        ControlResult::PairCancellationSucceeded
+        | ControlResult::PairCancellationFailed
+        | ControlResult::MasterDied => None,
     }
 }
 
@@ -1322,6 +1358,8 @@ impl CommandRunner for HarnessRunner {
         }
         ControlResult::Succeeded
     }
+
+    fn cancel(&self) {}
 }
 
 #[cfg(test)]
@@ -1548,6 +1586,8 @@ mod tests {
                 .pop_front()
                 .expect("queued control result")
         }
+
+        fn cancel(&self) {}
     }
 
     impl CommandRunner for GateRunner {
@@ -1558,6 +1598,8 @@ mod tests {
             }
             ControlResult::Succeeded
         }
+
+        fn cancel(&self) {}
     }
 
     impl CommandRunner for CountingRunner {
@@ -1566,6 +1608,8 @@ mod tests {
             std::thread::sleep(self.delay);
             ControlResult::Succeeded
         }
+
+        fn cancel(&self) {}
     }
 
     impl CommandRunner for SteppedRunner {
@@ -1583,6 +1627,8 @@ mod tests {
             }
             receiver.recv().unwrap_or(ControlResult::Rejected)
         }
+
+        fn cancel(&self) {}
     }
 
     fn stepped_broker(
@@ -2405,8 +2451,12 @@ mod tests {
     }
 
     #[test]
-    fn ready_mapping_remains_owned_without_cleanup_on_disable() {
-        let runner = Arc::new(RecordingRunner::new([ControlResult::Succeeded]));
+    fn disabling_a_ready_scalar_mapping_cancels_it_before_reenable_creates_fresh() {
+        let runner = Arc::new(RecordingRunner::new([
+            ControlResult::Succeeded,
+            ControlResult::Succeeded,
+            ControlResult::Succeeded,
+        ]));
         let (parent, child) = UnixStream::pair().expect("broker pair");
         let _broker = BrokerServer::start_with_runner(
             parent,
@@ -2426,7 +2476,172 @@ mod tests {
 
         assert_eq!(
             *runner.operations.lock().expect("operations"),
-            vec!["forward"]
+            vec!["forward", "cancel", "forward"]
+        );
+    }
+
+    #[test]
+    fn failed_disable_cleanup_quarantines_the_owned_port_across_reenable() {
+        let runner = Arc::new(RecordingRunner::new([
+            ControlResult::Succeeded,
+            ControlResult::Rejected,
+            ControlResult::Succeeded,
+        ]));
+        let (mappings, candidate_calls) = MappingRegistry::for_broker_test([43_123]);
+        let (parent, child) = UnixStream::pair().expect("broker pair");
+        let _broker = BrokerServer::start_with_runner_and_registry(
+            parent,
+            crate::platform::InheritedPeerIdentity::current_process(),
+            authority(),
+            runner.clone(),
+            Duration::from_secs(10),
+            mappings,
+        )
+        .expect("broker server");
+        let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
+
+        assert_eq!(settle_forward(&client, spec()), Ok(8080));
+        let mut disable = client
+            .begin_assert_policy(false, saved_limit(12))
+            .expect("begin disable");
+        assert_eq!(
+            wait_for_policy(&mut disable),
+            (false, saved_limit(12), Err(ForwardFailure::CommandRejected))
+        );
+        client.assert_policy(true).expect("re-enable policy");
+        assert_eq!(settle_forward(&client, spec()), Ok(43_123));
+
+        assert_eq!(candidate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *runner.operations.lock().expect("operations"),
+            vec!["forward", "cancel", "forward"]
+        );
+    }
+
+    #[test]
+    fn fresh_reattachment_remaps_foreign_collision_and_cleans_only_owned_listeners() {
+        struct OwnedListenerRunner {
+            occupied: Mutex<BTreeMap<u16, String>>,
+            operations: Mutex<Vec<(String, String, u16)>>,
+        }
+
+        impl CommandRunner for OwnedListenerRunner {
+            fn run(&self, invocation: &ControlInvocation, _timeout: Duration) -> ControlResult {
+                let control_path = invocation
+                    .args
+                    .windows(2)
+                    .find_map(|args| (args[0] == "-S").then(|| args[1].clone()))
+                    .expect("control path");
+                let operation = invocation
+                    .args
+                    .windows(2)
+                    .find_map(|args| (args[0] == "-O").then(|| args[1].clone()))
+                    .expect("operation");
+                let value = invocation
+                    .args
+                    .windows(2)
+                    .find_map(|args| (args[0] == "-L").then_some(args[1].as_str()))
+                    .expect("forward value");
+                let port = value
+                    .split(':')
+                    .nth(1)
+                    .and_then(|port| port.parse::<u16>().ok())
+                    .expect("scalar local port");
+                self.operations.lock().expect("operations").push((
+                    control_path.clone(),
+                    operation.clone(),
+                    port,
+                ));
+                let mut occupied = self.occupied.lock().expect("occupied listeners");
+                match operation.as_str() {
+                    "forward" if occupied.contains_key(&port) => ControlResult::BindFailed,
+                    "forward" => {
+                        occupied.insert(port, control_path);
+                        ControlResult::Succeeded
+                    }
+                    "cancel" if occupied.get(&port) == Some(&control_path) => {
+                        occupied.remove(&port);
+                        ControlResult::Succeeded
+                    }
+                    "cancel" => ControlResult::Rejected,
+                    _ => ControlResult::Rejected,
+                }
+            }
+
+            fn cancel(&self) {}
+        }
+
+        let runner = Arc::new(OwnedListenerRunner {
+            occupied: Mutex::new(BTreeMap::new()),
+            operations: Mutex::new(Vec::new()),
+        });
+        let start_attachment =
+            |control_path: &str, mappings: MappingRegistry| -> (BrokerServer, ForwardingClient) {
+                let (parent, child) = UnixStream::pair().expect("broker pair");
+                let broker = BrokerServer::start_with_runner_and_registry(
+                    parent,
+                    crate::platform::InheritedPeerIdentity::current_process(),
+                    ControlAuthority::new("example".to_owned(), PathBuf::from(control_path)),
+                    runner.clone(),
+                    Duration::from_secs(10),
+                    mappings,
+                )
+                .expect("broker server");
+                let client =
+                    ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
+                (broker, client)
+            };
+
+        let (old_mappings, _) = MappingRegistry::for_broker_test([]);
+        let (_old_broker, old_client) = start_attachment("/tmp/herdr-old-control", old_mappings);
+        let (new_mappings, candidate_calls) = MappingRegistry::for_broker_test([43_123]);
+        let (_new_broker, new_client) = start_attachment("/tmp/herdr-new-control", new_mappings);
+
+        assert_eq!(settle_forward(&old_client, spec()), Ok(8080));
+        assert_eq!(settle_forward(&new_client, spec()), Ok(43_123));
+        assert_eq!(candidate_calls.load(Ordering::SeqCst), 1);
+        new_client
+            .assert_policy(false)
+            .expect("disable new attachment");
+        assert_eq!(settle_forward(&old_client, spec()), Ok(8080));
+        old_client
+            .assert_policy(false)
+            .expect("disable old attachment");
+
+        assert!(runner
+            .occupied
+            .lock()
+            .expect("occupied listeners")
+            .is_empty());
+        assert_eq!(
+            *runner.operations.lock().expect("operations"),
+            vec![
+                (
+                    "/tmp/herdr-old-control".to_owned(),
+                    "forward".to_owned(),
+                    8080
+                ),
+                (
+                    "/tmp/herdr-new-control".to_owned(),
+                    "forward".to_owned(),
+                    8080
+                ),
+                (
+                    "/tmp/herdr-new-control".to_owned(),
+                    "forward".to_owned(),
+                    43_123,
+                ),
+                (
+                    "/tmp/herdr-new-control".to_owned(),
+                    "cancel".to_owned(),
+                    43_123,
+                ),
+                (
+                    "/tmp/herdr-old-control".to_owned(),
+                    "cancel".to_owned(),
+                    8080
+                ),
+            ]
         );
     }
 
@@ -2596,11 +2811,135 @@ mod tests {
         }
         drop(pair);
 
-        client.assert_policy(false).expect("disable policy");
+        let mut disable = client
+            .begin_assert_policy(false, saved_limit(12))
+            .expect("begin disable");
+        assert_eq!(
+            wait_for_policy(&mut disable),
+            (false, saved_limit(12), Err(ForwardFailure::CommandRejected))
+        );
 
         assert_eq!(
             *runner.operations.lock().expect("operations"),
             vec!["forward", "forward", "cancel", "cancel"]
+        );
+    }
+
+    #[test]
+    fn disabling_during_partial_pair_failure_retries_full_ordered_cleanup() {
+        let (_broker, client, commands) = stepped_broker(saved_limit(12));
+        let mut pair = client.begin_localhost(8080).expect("pair");
+        let ipv4_forward = next_command(&commands);
+        assert_eq!(ipv4_forward.operation(), "forward");
+        assert!(ipv4_forward.forward_value().starts_with("127.0.0.1:"));
+        ipv4_forward.settle(ControlResult::Succeeded);
+        let ipv6_forward = next_command(&commands);
+        assert_eq!(ipv6_forward.operation(), "forward");
+        assert!(ipv6_forward.forward_value().starts_with("[::1]:"));
+
+        let policy_client = client.clone();
+        let disable = std::thread::spawn(move || {
+            policy_client
+                .begin_assert_policy(false, saved_limit(12))
+                .expect("begin disable")
+                .wait()
+        });
+        assert_eq!(wait_for_mapping(&mut pair), Err(ForwardFailure::Cancelled));
+        ipv6_forward.settle(ControlResult::Rejected);
+
+        let rollback = next_command(&commands);
+        assert_eq!(rollback.operation(), "cancel");
+        assert!(rollback.forward_value().starts_with("127.0.0.1:"));
+        rollback.settle(ControlResult::Rejected);
+        let policy_ipv4 = next_command(&commands);
+        assert_eq!(policy_ipv4.operation(), "cancel");
+        assert!(policy_ipv4.forward_value().starts_with("127.0.0.1:"));
+        policy_ipv4.settle(ControlResult::Succeeded);
+        let policy_ipv6 = next_command(&commands);
+        assert_eq!(policy_ipv6.operation(), "cancel");
+        assert!(policy_ipv6.forward_value().starts_with("[::1]:"));
+        policy_ipv6.settle(ControlResult::Rejected);
+
+        assert_eq!(
+            disable
+                .join()
+                .expect("disable thread")
+                .expect("disable acknowledgement"),
+            (false, saved_limit(12), Err(ForwardFailure::CommandRejected))
+        );
+    }
+
+    #[test]
+    fn normal_teardown_closes_pending_work_reaps_control_and_skips_mapping_cancellation() {
+        struct TeardownRunner {
+            calls: AtomicUsize,
+            operations: Mutex<Vec<String>>,
+            started: mpsc::SyncSender<()>,
+            cancelled: AtomicBool,
+            reaped: mpsc::SyncSender<()>,
+        }
+
+        impl CommandRunner for TeardownRunner {
+            fn run(&self, invocation: &ControlInvocation, _timeout: Duration) -> ControlResult {
+                let operation = invocation
+                    .args
+                    .windows(2)
+                    .find_map(|args| (args[0] == "-O").then(|| args[1].clone()))
+                    .expect("operation");
+                self.operations.lock().expect("operations").push(operation);
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return ControlResult::Succeeded;
+                }
+                let _ = self.started.send(());
+                while !self.cancelled.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let _ = self.reaped.send(());
+                ControlResult::Rejected
+            }
+
+            fn cancel(&self) {
+                self.cancelled.store(true, Ordering::Release);
+            }
+        }
+
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (reaped_tx, reaped_rx) = mpsc::sync_channel(1);
+        let runner = Arc::new(TeardownRunner {
+            calls: AtomicUsize::new(0),
+            operations: Mutex::new(Vec::new()),
+            started: started_tx,
+            cancelled: AtomicBool::new(false),
+            reaped: reaped_tx,
+        });
+        let (parent, child) = UnixStream::pair().expect("broker pair");
+        let broker = BrokerServer::start_with_runner(
+            parent,
+            crate::platform::InheritedPeerIdentity::current_process(),
+            authority(),
+            runner.clone(),
+            Duration::from_secs(10),
+        )
+        .expect("broker server");
+        let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
+        assert_eq!(settle_forward(&client, spec_for_port(8080)), Ok(8080));
+        let active = client
+            .begin_forward(spec_for_port(8081))
+            .expect("active mapping");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("control command started");
+
+        let started = std::time::Instant::now();
+        broker.close();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(active.wait(), Err(ForwardFailure::CapabilityClosed));
+        reaped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("control command reaped");
+        assert_eq!(
+            *runner.operations.lock().expect("operations"),
+            vec!["forward", "forward"]
         );
     }
 
@@ -2840,6 +3179,49 @@ mod tests {
     }
 
     #[test]
+    fn disable_skips_queued_mapping_before_runner_invocation_and_settles_once() {
+        let (_broker, client, commands) = stepped_broker(saved_limit(12));
+        let mut active = client
+            .begin_forward(spec_for_port(8080))
+            .expect("active mapping");
+        let active_command = next_command(&commands);
+        assert_eq!(active_command.operation(), "forward");
+        assert!(active_command.forward_value().contains(":8080:"));
+        let mut queued = client
+            .begin_forward(spec_for_port(8081))
+            .expect("queued mapping");
+        let mut disable = client
+            .begin_assert_policy(false, saved_limit(12))
+            .expect("begin disable");
+
+        assert_eq!(
+            wait_for_mapping(&mut active),
+            Err(ForwardFailure::Cancelled)
+        );
+        assert_eq!(
+            wait_for_mapping(&mut queued),
+            Err(ForwardFailure::Cancelled)
+        );
+        active_command.settle(ControlResult::Succeeded);
+
+        let cleanup = next_command(&commands);
+        assert_eq!(cleanup.operation(), "cancel");
+        assert!(cleanup.forward_value().contains(":8080:"));
+        cleanup.settle(ControlResult::Succeeded);
+
+        assert_eq!(
+            wait_for_policy(&mut disable),
+            (false, saved_limit(12), Ok(()))
+        );
+        assert_eq!(disable.try_wait(), None);
+        assert!(matches!(
+            commands.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(!client.is_active());
+    }
+
+    #[test]
     fn disable_acknowledgement_waits_for_in_flight_forward_cleanup() {
         let runner = Arc::new(CountingRunner {
             calls: AtomicUsize::new(0),
@@ -2872,7 +3254,7 @@ mod tests {
     }
 
     #[test]
-    fn in_flight_cancellation_failure_does_not_change_disable_settlement() {
+    fn in_flight_cancellation_failure_reports_incomplete_disable_cleanup() {
         let runner = Arc::new(RecordingRunner::with_delay(
             [ControlResult::Succeeded, ControlResult::Rejected],
             Duration::from_millis(75),
@@ -2892,18 +3274,55 @@ mod tests {
             std::thread::yield_now();
         }
         let policy_client = client.clone();
-        let disable = std::thread::spawn(move || policy_client.assert_policy(false));
+        let disable = std::thread::spawn(move || {
+            policy_client
+                .begin_assert_policy(false, saved_limit(12))
+                .expect("begin disable")
+                .wait()
+        });
 
         assert_eq!(call.wait(), Err(ForwardFailure::Cancelled));
-        disable
-            .join()
-            .expect("disable thread")
-            .expect("disable remains confirmed");
+        assert_eq!(
+            disable
+                .join()
+                .expect("disable thread")
+                .expect("disable acknowledgement"),
+            (false, saved_limit(12), Err(ForwardFailure::CommandRejected))
+        );
         assert!(!client.is_active());
         assert_eq!(
             *runner.operations.lock().expect("operations"),
             vec!["forward", "cancel"]
         );
+    }
+
+    #[test]
+    fn managed_master_death_closes_all_waiters_and_invalidates_ready_reuse() {
+        let (_broker, client, commands) = stepped_broker(saved_limit(12));
+        let mut ready = client.begin_forward(spec()).expect("ready mapping");
+        next_command(&commands).settle(ControlResult::Succeeded);
+        assert_eq!(wait_for_mapping(&mut ready), Ok(8080));
+
+        let mut active = client
+            .begin_forward(spec_for_port(8081))
+            .expect("active mapping");
+        let mut queued = client
+            .begin_localhost(8082)
+            .expect("queued localhost mapping");
+        next_command(&commands).settle(ControlResult::MasterDied);
+
+        assert_eq!(
+            wait_for_mapping(&mut active),
+            Err(ForwardFailure::CapabilityClosed)
+        );
+        assert_eq!(
+            wait_for_mapping(&mut queued),
+            Err(ForwardFailure::CapabilityClosed)
+        );
+        assert!(matches!(
+            client.begin_forward(spec()),
+            Err(ForwardFailure::CapabilityClosed)
+        ));
     }
 
     #[test]

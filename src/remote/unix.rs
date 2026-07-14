@@ -458,6 +458,7 @@ struct ManagedSshOptions {
 
 struct ManagedSshConfig {
     options: ManagedSshOptions,
+    master_exit_requested: bool,
 }
 
 impl Drop for ManagedSshConfig {
@@ -666,14 +667,17 @@ fn remote_install_commit_script(tmp_path: &str, dest_path: &str) -> String {
     )
 }
 
-impl Drop for RemoteSsh {
-    fn drop(&mut self) {
-        if self.managed_config.is_none() {
-            return;
+impl RemoteSsh {
+    fn take_managed_master_exit_command(&mut self) -> Option<Command> {
+        let managed = self.managed_config.as_mut()?;
+        if managed.master_exit_requested {
+            return None;
         }
-
-        let _ = self
-            .base_command()
+        managed.master_exit_requested = true;
+        let options = managed.options.clone();
+        let mut command = Command::new("ssh");
+        apply_managed_ssh_options(&mut command, Some(&options));
+        command
             .arg("-O")
             .arg("exit")
             .arg("-o")
@@ -681,8 +685,16 @@ impl Drop for RemoteSsh {
             .arg(&self.target)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .stderr(Stdio::null());
+        Some(command)
+    }
+}
+
+impl Drop for RemoteSsh {
+    fn drop(&mut self) {
+        if let Some(mut command) = self.take_managed_master_exit_command() {
+            let _ = command.status();
+        }
     }
 }
 
@@ -1933,6 +1945,7 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
             config_path: path,
             control_path,
         },
+        master_exit_requested: false,
     })
 }
 
@@ -2270,6 +2283,21 @@ mod tests {
     }
 
     #[test]
+    fn fresh_managed_attachments_receive_distinct_private_control_paths() {
+        let first = write_managed_ssh_config().expect("first managed attachment");
+        let second = write_managed_ssh_config().expect("second managed attachment");
+
+        assert_ne!(first.options.config_path, second.options.config_path);
+        assert_ne!(first.options.control_path, second.options.control_path);
+        assert_ne!(
+            first.options.control_path.parent(),
+            second.options.control_path.parent()
+        );
+        assert!(fits_unix_socket_path(&first.options.control_path));
+        assert!(fits_unix_socket_path(&second.options.control_path));
+    }
+
+    #[test]
     fn ssh_config_quote_wraps_path_with_spaces() {
         assert_eq!(
             ssh_config_quote("/home/a b/.ssh/config"),
@@ -2305,6 +2333,44 @@ mod tests {
                 "-o".to_string(),
                 "ControlPersist=60".to_string(),
                 "-T".to_string(),
+                "example".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn managed_master_exit_is_immediate_structured_and_requested_exactly_once() {
+        let managed_config = write_managed_ssh_config().expect("write managed config");
+        let config_path = managed_config.options.config_path.clone();
+        let control_path = managed_config.options.control_path.clone();
+        let mut ssh = RemoteSsh {
+            target: "example".to_string(),
+            managed_config: Some(managed_config),
+        };
+
+        let command = ssh
+            .take_managed_master_exit_command()
+            .expect("first master exit");
+        assert!(ssh.take_managed_master_exit_command().is_none());
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "-F".to_string(),
+                config_path.to_string_lossy().into_owned(),
+                "-S".to_string(),
+                control_path.to_string_lossy().into_owned(),
+                "-o".to_string(),
+                "ControlMaster=auto".to_string(),
+                "-o".to_string(),
+                "ControlPersist=60".to_string(),
+                "-O".to_string(),
+                "exit".to_string(),
+                "-o".to_string(),
+                "BatchMode=yes".to_string(),
                 "example".to_string(),
             ]
         );

@@ -176,8 +176,12 @@ impl ClientExternalOpen {
         }
         let prior_effective = self.policy;
         let prior_saved_mapping_limit = self.saved_mapping_limit;
+        let mut immediate_messages = Vec::new();
         if requested == ExternalOpenPolicy::Disabled {
             self.apply_configuration(ExternalOpenPolicy::Disabled, self.saved_mapping_limit);
+            immediate_messages.push(ClientMessage::ExternalOpenPolicyUpdate {
+                policy: ExternalOpenPolicy::Disabled,
+            });
         }
         let enabled = requested == ExternalOpenPolicy::Enabled;
         match self
@@ -193,31 +197,36 @@ impl ClientExternalOpen {
                     reply,
                     operation,
                 });
-                Vec::new()
+                immediate_messages
             }
             Ok(None) if requested_saved_mapping_limit == prior_saved_mapping_limit => {
                 self.apply_configuration(requested, prior_saved_mapping_limit);
-                policy_change_succeeded(reply, requested)
+                immediate_messages.extend(policy_change_succeeded(reply, requested));
+                immediate_messages
             }
             Ok(None) => {
                 self.apply_configuration(requested, prior_saved_mapping_limit);
-                policy_change_without_broker(reply, requested)
+                immediate_messages.extend(policy_change_without_broker(reply, requested));
+                immediate_messages
             }
-            Err(error) => policy_change_settled(
-                reply,
-                requested,
-                requested_saved_mapping_limit,
-                prior_effective,
-                ForwardingPolicySettlement {
-                    requested: enabled,
-                    effective: prior_effective == ExternalOpenPolicy::Enabled,
+            Err(error) => {
+                immediate_messages.extend(policy_change_settled(
+                    reply,
+                    requested,
                     requested_saved_mapping_limit,
-                    effective_saved_mapping_limit: prior_saved_mapping_limit,
-                    result: Err(error),
-                },
-                prior_saved_mapping_limit,
-                |policy, limit| self.apply_configuration(policy, limit),
-            ),
+                    prior_effective,
+                    ForwardingPolicySettlement {
+                        requested: enabled,
+                        effective: prior_effective == ExternalOpenPolicy::Enabled,
+                        requested_saved_mapping_limit,
+                        effective_saved_mapping_limit: prior_saved_mapping_limit,
+                        result: Err(error),
+                    },
+                    prior_saved_mapping_limit,
+                    |policy, limit| self.apply_configuration(policy, limit),
+                ));
+                immediate_messages
+            }
         }
     }
 
@@ -354,6 +363,7 @@ fn policy_change_succeeded(
             if report_section_failure {
                 messages.push(ClientMessage::ExternalOpenPolicyReloadFailed {
                     effective_policy: effective,
+                    cleanup_incomplete: false,
                 });
             }
             messages
@@ -373,6 +383,7 @@ fn policy_change_without_broker(
             ClientMessage::ExternalOpenPolicyUpdate { policy: effective },
             ClientMessage::ExternalOpenPolicyReloadFailed {
                 effective_policy: effective,
+                cleanup_incomplete: false,
             },
         ],
     }
@@ -389,6 +400,24 @@ fn policy_change_failed(
         PendingPolicyReply::Reload { .. } => {
             vec![ClientMessage::ExternalOpenPolicyReloadFailed {
                 effective_policy: effective,
+                cleanup_incomplete: false,
+            }]
+        }
+    }
+}
+
+fn policy_disable_cleanup_incomplete(
+    reply: PendingPolicyReply,
+    effective: ExternalOpenPolicy,
+) -> Vec<ClientMessage> {
+    match reply {
+        PendingPolicyReply::Mutation(result) => {
+            vec![mutation_forwarding_failed(result, effective)]
+        }
+        PendingPolicyReply::Reload { .. } => {
+            vec![ClientMessage::ExternalOpenPolicyReloadFailed {
+                effective_policy: effective,
+                cleanup_incomplete: true,
             }]
         }
     }
@@ -404,13 +433,18 @@ fn policy_change_settled(
     mut apply: impl FnMut(ExternalOpenPolicy, SavedPortForwardLimit),
 ) -> Vec<ClientMessage> {
     if requested == ExternalOpenPolicy::Disabled {
+        let cleanup_incomplete = settlement.result.is_err();
         let acknowledged_limit = !settlement.requested
             && settlement.requested_saved_mapping_limit == requested_saved_mapping_limit
             && settlement.effective_saved_mapping_limit == requested_saved_mapping_limit
             && settlement.result.is_ok();
         if requested_saved_mapping_limit != prior_saved_mapping_limit && !acknowledged_limit {
             apply(ExternalOpenPolicy::Disabled, prior_saved_mapping_limit);
-            return policy_change_failed(reply, ExternalOpenPolicy::Disabled);
+            return if cleanup_incomplete {
+                policy_disable_cleanup_incomplete(reply, ExternalOpenPolicy::Disabled)
+            } else {
+                policy_change_failed(reply, ExternalOpenPolicy::Disabled)
+            };
         }
         let retained_limit = if acknowledged_limit {
             requested_saved_mapping_limit
@@ -418,7 +452,11 @@ fn policy_change_settled(
             prior_saved_mapping_limit
         };
         apply(ExternalOpenPolicy::Disabled, retained_limit);
-        return policy_change_succeeded(reply, ExternalOpenPolicy::Disabled);
+        return if cleanup_incomplete {
+            policy_disable_cleanup_incomplete(reply, ExternalOpenPolicy::Disabled)
+        } else {
+            policy_change_succeeded(reply, ExternalOpenPolicy::Disabled)
+        };
     }
 
     let effective = if settlement.effective {
@@ -719,9 +757,13 @@ mod tests {
             )
             .is_none());
 
-        assert!(external_open
-            .begin_policy_mutation(persisted_mutation(7, ExternalOpenPolicy::Disabled))
-            .is_empty());
+        assert_eq!(
+            external_open
+                .begin_policy_mutation(persisted_mutation(7, ExternalOpenPolicy::Disabled)),
+            vec![ClientMessage::ExternalOpenPolicyUpdate {
+                policy: ExternalOpenPolicy::Disabled,
+            }]
+        );
         let messages = external_open.poll();
 
         assert_eq!(*cancellations.lock().expect("cancellations"), 1);
@@ -789,13 +831,16 @@ mod tests {
             ExternalOpenForwarding::available(controller),
         );
 
-        assert!(external_open
-            .begin_policy_reload(
+        assert_eq!(
+            external_open.begin_policy_reload(
                 ExternalOpenPolicy::Disabled,
                 SavedPortForwardLimit::DEFAULT,
                 true,
-            )
-            .is_empty());
+            ),
+            vec![ClientMessage::ExternalOpenPolicyUpdate {
+                policy: ExternalOpenPolicy::Disabled,
+            }]
+        );
         assert_eq!(
             external_open.poll(),
             vec![
@@ -804,6 +849,7 @@ mod tests {
                 },
                 ClientMessage::ExternalOpenPolicyReloadFailed {
                     effective_policy: ExternalOpenPolicy::Disabled,
+                    cleanup_incomplete: false,
                 },
             ]
         );
@@ -826,6 +872,7 @@ mod tests {
                 },
                 ClientMessage::ExternalOpenPolicyReloadFailed {
                     effective_policy: ExternalOpenPolicy::Enabled,
+                    cleanup_incomplete: false,
                 },
             ]
         );
@@ -941,6 +988,7 @@ mod tests {
                 external_open.poll(),
                 vec![ClientMessage::ExternalOpenPolicyReloadFailed {
                     effective_policy: ExternalOpenPolicy::Enabled,
+                    cleanup_incomplete: false,
                 }]
             );
             assert_eq!(
@@ -951,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_policy_limit_cleanup_failure_retains_prior_limit() {
+    fn reload_disable_cleanup_failure_keeps_off_and_reports_aggregate_cleanup_warning() {
         let controller = Arc::new(FakeForwardingController::with_results([]));
         *controller.policy_result.lock().expect("policy result") =
             Some(ForwardingPolicySettlement {
@@ -967,15 +1015,21 @@ mod tests {
             ExternalOpenForwarding::available(controller),
         );
 
-        assert!(external_open
-            .begin_policy_reload(ExternalOpenPolicy::Disabled, saved_limit(64), false)
-            .is_empty());
+        assert_eq!(
+            external_open
+                .begin_policy_reload(ExternalOpenPolicy::Disabled, saved_limit(64), false,),
+            vec![ClientMessage::ExternalOpenPolicyUpdate {
+                policy: ExternalOpenPolicy::Disabled,
+            }]
+        );
         assert_eq!(
             external_open.poll(),
             vec![ClientMessage::ExternalOpenPolicyReloadFailed {
                 effective_policy: ExternalOpenPolicy::Disabled,
+                cleanup_incomplete: true,
             }]
         );
+        assert_eq!(external_open.policy(), ExternalOpenPolicy::Disabled);
         assert_eq!(
             external_open.saved_mapping_limit(),
             SavedPortForwardLimit::DEFAULT
@@ -983,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_disable_emits_one_truthful_mutation_without_reload_failure() {
+    fn confirmed_disable_keeps_policy_off_and_reports_incomplete_cleanup_once() {
         let controller = Arc::new(FakeForwardingController::with_results([]));
         *controller.policy_result.lock().expect("policy result") =
             Some(ForwardingPolicySettlement {
@@ -999,12 +1053,22 @@ mod tests {
             ExternalOpenForwarding::available(controller),
         );
 
-        assert!(external_open
-            .begin_policy_mutation(persisted_mutation(11, ExternalOpenPolicy::Disabled))
-            .is_empty());
+        assert_eq!(
+            external_open
+                .begin_policy_mutation(persisted_mutation(11, ExternalOpenPolicy::Disabled)),
+            vec![ClientMessage::ExternalOpenPolicyUpdate {
+                policy: ExternalOpenPolicy::Disabled,
+            }]
+        );
         assert_eq!(
             external_open.poll(),
-            vec![persisted_mutation(11, ExternalOpenPolicy::Disabled)]
+            vec![ClientMessage::ExternalOpenPolicyMutationResult {
+                request_id: 11,
+                requested_policy: ExternalOpenPolicy::Disabled,
+                persisted_policy: Some(ExternalOpenPolicy::Disabled),
+                effective_policy: ExternalOpenPolicy::Disabled,
+                failure_stage: Some(ExternalOpenPolicyMutationFailureStage::Reload),
+            }]
         );
         assert_eq!(external_open.policy(), ExternalOpenPolicy::Disabled);
     }
@@ -1116,6 +1180,68 @@ mod tests {
         );
         assert!(external_open.commit(51).is_none());
         assert!(external_open.commit(52).is_none());
+    }
+
+    #[test]
+    fn fresh_attachment_reopens_only_from_original_remote_url_with_a_new_forward() {
+        let original = "http://127.0.0.1:8080/private?token=secret#view";
+        let first_controller = Arc::new(FakeForwardingController::with_results([Some(Ok(
+            NonZeroU16::new(43_123).expect("first local port"),
+        ))]));
+        let mut first = ClientExternalOpen::new(
+            ExternalOpenPolicy::Enabled,
+            SavedPortForwardLimit::DEFAULT,
+            ExternalOpenForwarding::available(first_controller),
+        );
+        assert!(first
+            .prepare(1, original.to_owned(), ExternalOpenPlatform::Linux)
+            .is_none());
+        assert_eq!(first.poll().len(), 1);
+        let first_url = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&first_url);
+        first.commit(1).expect("first commit").execute(|url| {
+            *captured.lock().expect("first URL") = Some(url.to_owned());
+            Ok(())
+        });
+        assert_eq!(
+            first_url.lock().expect("first URL").as_deref(),
+            Some("http://127.0.0.1:43123/private?token=secret#view")
+        );
+        drop(first);
+
+        let second_controller = Arc::new(FakeForwardingController::with_results([Some(Ok(
+            NonZeroU16::new(43_124).expect("second local port"),
+        ))]));
+        let mut second = ClientExternalOpen::new(
+            ExternalOpenPolicy::Enabled,
+            SavedPortForwardLimit::DEFAULT,
+            ExternalOpenForwarding::available(second_controller.clone()),
+        );
+        assert!(second.commit(1).is_none());
+        assert!(second
+            .prepare(2, original.to_owned(), ExternalOpenPlatform::Linux)
+            .is_none());
+        assert_eq!(
+            *second_controller
+                .requests
+                .lock()
+                .expect("second attachment requests"),
+            vec![(
+                crate::external_open::LoopbackTarget::Ipv4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                NonZeroU16::new(8080).expect("remote port"),
+            )]
+        );
+        assert_eq!(second.poll().len(), 1);
+        let second_url = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&second_url);
+        second.commit(2).expect("second commit").execute(|url| {
+            *captured.lock().expect("second URL") = Some(url.to_owned());
+            Ok(())
+        });
+        assert_eq!(
+            second_url.lock().expect("second URL").as_deref(),
+            Some("http://127.0.0.1:43124/private?token=secret#view")
+        );
     }
 
     #[test]

@@ -3016,6 +3016,7 @@ impl HeadlessServer {
             ServerEvent::ExternalOpenPolicyReloadFailed {
                 client_id,
                 effective_policy,
+                cleanup_incomplete,
             } => {
                 let now = self.external_open_clock.now();
                 self.clients
@@ -3028,6 +3029,7 @@ impl HeadlessServer {
                             client_id,
                             crate::server::client_projection::ClientProjectionAction::ReportReloadFailure {
                                 effective_policy,
+                                cleanup_incomplete,
                                 now,
                             },
                         )
@@ -5344,6 +5346,7 @@ mod tests {
             &mut source,
             &crate::protocol::ClientMessage::ExternalOpenPolicyReloadFailed {
                 effective_policy: crate::protocol::ExternalOpenPolicy::Disabled,
+                cleanup_incomplete: false,
             },
         )
         .expect("write source reload failure");
@@ -6488,6 +6491,125 @@ mod tests {
         assert!(confirmed.contains("open remote links on this device [✓]"));
         assert!(!confirmed.contains("saving…"));
         assert_eq!(client_projection_notice(&server, 1), None);
+    }
+
+    #[test]
+    fn incomplete_disable_cleanup_projects_one_exact_source_local_warning() {
+        let mut server = test_headless_server();
+        for client_id in [1, 2] {
+            server.clients.insert(
+                client_id,
+                ClientConnection::new(
+                    (100, 30),
+                    crate::kitty_graphics::HostCellSize::default(),
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    client_id,
+                    RenderEncoding::SemanticFrame,
+                    None,
+                ),
+            );
+            connect_client_projection(
+                &mut server,
+                client_id,
+                crate::protocol::ExternalOpenPolicy::Enabled,
+            );
+        }
+        let request = begin_presented_policy_mutation(&mut server, 1);
+        assert_eq!(
+            request.requested_policy,
+            crate::protocol::ExternalOpenPolicy::Disabled
+        );
+
+        server.handle_server_event(ServerEvent::ExternalOpenPolicyUpdate {
+            client_id: 1,
+            policy: crate::protocol::ExternalOpenPolicy::Disabled,
+        });
+        assert_eq!(
+            server.client_projections.confirmed_policy(1),
+            Some(crate::protocol::ExternalOpenPolicy::Disabled)
+        );
+
+        assert!(
+            server.handle_server_event(ServerEvent::ExternalOpenPolicyMutationResult {
+                client_id: 1,
+                request_id: request.request_id,
+                requested_policy: crate::protocol::ExternalOpenPolicy::Disabled,
+                persisted_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
+                effective_policy: crate::protocol::ExternalOpenPolicy::Disabled,
+                failure_stage: Some(
+                    crate::protocol::ExternalOpenPolicyMutationFailureStage::Reload,
+                ),
+            })
+        );
+
+        let warning = "Remote link opening turned off · some local forwards couldn’t be removed";
+        assert_eq!(client_projection_notice(&server, 1), Some(warning));
+        assert_eq!(client_projection_notice(&server, 2), None);
+        assert_eq!(
+            server.client_projections.confirmed_policy(1),
+            Some(crate::protocol::ExternalOpenPolicy::Disabled)
+        );
+        assert!(!warning.contains("http"));
+        assert!(!warning.chars().any(|character| character.is_ascii_digit()));
+        let deadline = server
+            .next_client_notice_deadline()
+            .expect("aggregate warning deadline");
+        assert!(!server.expire_client_notices(deadline - Duration::from_nanos(1)));
+        assert_eq!(client_projection_notice(&server, 1), Some(warning));
+        assert!(server.expire_client_notices(deadline));
+        assert_eq!(client_projection_notice(&server, 1), None);
+        assert_eq!(client_projection_notice(&server, 2), None);
+    }
+
+    #[test]
+    fn reload_disable_cleanup_failure_projects_exact_source_local_warning() {
+        let mut server = test_headless_server();
+        for client_id in [1, 2] {
+            server.clients.insert(
+                client_id,
+                ClientConnection::new(
+                    (100, 30),
+                    crate::kitty_graphics::HostCellSize::default(),
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    client_id,
+                    RenderEncoding::SemanticFrame,
+                    None,
+                ),
+            );
+            connect_client_projection(
+                &mut server,
+                client_id,
+                crate::protocol::ExternalOpenPolicy::Enabled,
+            );
+        }
+
+        assert!(
+            server.handle_server_event(ServerEvent::ExternalOpenPolicyUpdate {
+                client_id: 1,
+                policy: crate::protocol::ExternalOpenPolicy::Disabled,
+            })
+        );
+        assert!(
+            server.handle_server_event(ServerEvent::ExternalOpenPolicyReloadFailed {
+                client_id: 1,
+                effective_policy: crate::protocol::ExternalOpenPolicy::Disabled,
+                cleanup_incomplete: true,
+            })
+        );
+
+        let warning = "Remote link opening turned off · some local forwards couldn’t be removed";
+        assert_eq!(client_projection_notice(&server, 1), Some(warning));
+        assert_eq!(client_projection_notice(&server, 2), None);
+        assert_eq!(
+            server.client_projections.confirmed_policy(1),
+            Some(crate::protocol::ExternalOpenPolicy::Disabled)
+        );
+        assert_ne!(
+            client_projection_notice(&server, 1),
+            Some("Couldn’t reload remote link setting · previous value kept")
+        );
     }
 
     #[test]

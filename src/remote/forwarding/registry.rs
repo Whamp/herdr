@@ -167,7 +167,6 @@ impl MappingAttempt {
         }
     }
 
-    #[cfg(test)]
     pub(super) const fn local_port(self) -> u16 {
         self.spec.local_port()
     }
@@ -206,6 +205,10 @@ impl MappingCancellation {
 
     pub(super) const fn controller_id(self) -> CorrelationId {
         self.controller_id
+    }
+
+    pub(super) const fn local_port(self) -> u16 {
+        self.spec.local_port()
     }
 }
 
@@ -313,7 +316,7 @@ enum MappingState {
         waiters: BTreeSet<CorrelationId>,
         fallback_attempts: usize,
         started: bool,
-        revoked: bool,
+        revoked_by: Option<CorrelationId>,
         last_requested: RequestOrder,
     },
     Ready {
@@ -503,13 +506,47 @@ impl MappingRegistry {
                 ForwardFailure::CommandRejected,
             ));
         };
-        let spec = ListenerSpec::Scalar(ForwardSpec {
+        let mut spec = ListenerSpec::Scalar(ForwardSpec {
             local_address: address,
             local_port: remote_port,
             remote_address: address,
             remote_port,
         });
-        self.request(id, identity, spec, 0, None)
+        let mut fallback_attempts = 0;
+        let mut reservation = None;
+        if self.is_quarantined(remote_port) {
+            let listener_reservation = match self.lifetime_ledger.reserve(ListenerSlots::SCALAR) {
+                Ok(reservation) => reservation,
+                Err(ListenerReservationError::CapacityExhausted) => {
+                    return MappingRequest::Failed(MappingSettlement::failed(
+                        id,
+                        ForwardFailure::CapacityExhausted,
+                    ));
+                }
+                Err(ListenerReservationError::Invariant(_)) => {
+                    return MappingRequest::Failed(MappingSettlement::failed(
+                        id,
+                        ForwardFailure::CapabilityClosed,
+                    ));
+                }
+            };
+            match self.fresh_attempt(
+                id,
+                identity,
+                &mut fallback_attempts,
+                Some(listener_reservation),
+            ) {
+                Ok(attempt) => {
+                    spec = attempt.spec;
+                    reservation = attempt.listener_reservation;
+                }
+                Err(failure) => {
+                    let _ = self.lifetime_ledger.settle(listener_reservation, 0);
+                    return MappingRequest::Failed(MappingSettlement::failed(id, failure));
+                }
+            }
+        }
+        self.request(id, identity, spec, fallback_attempts, reservation)
     }
 
     pub(super) fn request_localhost(
@@ -719,7 +756,7 @@ impl MappingRegistry {
                 waiters: BTreeSet::from([id]),
                 fallback_attempts,
                 started: false,
-                revoked: false,
+                revoked_by: None,
                 last_requested,
             },
         );
@@ -852,12 +889,17 @@ impl MappingRegistry {
         let Some(MappingState::Creating {
             attempt: current,
             started,
+            revoked_by,
             ..
         }) = self.mappings.get_mut(&attempt.identity)
         else {
             return false;
         };
-        if *current != attempt || attempt.generation != self.generation || !self.master_live {
+        if *current != attempt
+            || attempt.generation != self.generation
+            || !self.master_live
+            || revoked_by.is_some()
+        {
             return false;
         }
         *started = true;
@@ -875,13 +917,40 @@ impl MappingRegistry {
             .sum()
     }
 
-    pub(super) fn revoke_creating(&mut self) -> Vec<RevokedWaiter> {
+    pub(super) fn revoke_ready(
+        &mut self,
+        controller_id: CorrelationId,
+    ) -> Vec<MappingCancellation> {
+        let identities = self
+            .mappings
+            .iter()
+            .filter_map(|(identity, mapping)| {
+                matches!(mapping, MappingState::Ready { .. }).then_some(*identity)
+            })
+            .collect::<Vec<_>>();
+        identities
+            .into_iter()
+            .filter_map(|identity| {
+                let MappingState::Ready { spec, .. } = self.mappings.remove(&identity)? else {
+                    return None;
+                };
+                Some(MappingCancellation {
+                    controller_id,
+                    spec,
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn revoke_creating(&mut self, policy_id: CorrelationId) -> Vec<RevokedWaiter> {
         let mut settlements = Vec::new();
-        for mapping in self.mappings.values_mut() {
+        let mut abandoned = Vec::new();
+        for (identity, mapping) in &mut self.mappings {
             if let MappingState::Creating {
                 attempt,
                 waiters,
-                revoked,
+                started,
+                revoked_by,
                 ..
             } = mapping
             {
@@ -893,16 +962,27 @@ impl MappingRegistry {
                     self.active_requests.remove(id);
                 }
                 waiters.clear();
-                *revoked = true;
+                *revoked_by = Some(policy_id);
+                if !*started {
+                    abandoned.push((*identity, attempt.listener_reservation));
+                }
             }
+        }
+        for (identity, reservation) in abandoned {
+            if let Some(reservation) = reservation {
+                let _ = self.lifetime_ledger.settle(reservation, 0);
+            }
+            self.mappings.remove(&identity);
         }
         settlements
     }
 
     pub(super) fn master_died(&mut self) -> Vec<MappingSettlement> {
         self.master_live = false;
+        self.generation = self.generation.saturating_add(1);
         self.quarantine.clear();
         self.active_requests.clear();
+        self.pending_saved_limit = None;
         self.lifetime_ledger = LifetimeLedger::default();
         let mappings = std::mem::take(&mut self.mappings);
         mappings
@@ -983,7 +1063,7 @@ impl MappingRegistry {
             waiters,
             mut fallback_attempts,
             started,
-            revoked,
+            revoked_by,
             last_requested,
         } = mapping
         else {
@@ -998,7 +1078,7 @@ impl MappingRegistry {
                     waiters,
                     fallback_attempts,
                     started,
-                    revoked,
+                    revoked_by,
                     last_requested,
                 },
             );
@@ -1016,10 +1096,7 @@ impl MappingRegistry {
             | MappingControlResult::PairFirstTimedOut => 0,
         };
         let failure = match (attempt.spec, result) {
-            (ListenerSpec::Scalar(_), MappingControlResult::Succeeded)
-            | (ListenerSpec::Localhost(_), MappingControlResult::PairSucceeded)
-                if revoked =>
-            {
+            (_, _) if revoked_by.is_some() && successful_listeners > 0 => {
                 if let Err(error) = self.settle_listener_reservation(attempt, successful_listeners)
                 {
                     return MappingCompletion {
@@ -1027,10 +1104,13 @@ impl MappingRegistry {
                         ..MappingCompletion::default()
                     };
                 }
+                if result == MappingControlResult::PairSecondFailed {
+                    self.quarantine(attempt.local_port());
+                }
                 return MappingCompletion {
                     attempt: None,
                     cancellation: Some(attempt),
-                    cancellation_policy: None,
+                    cancellation_policy: revoked_by,
                     settlements: Vec::new(),
                     invariant_error: None,
                 };
@@ -1116,7 +1196,7 @@ impl MappingRegistry {
                                 waiters,
                                 fallback_attempts,
                                 started: false,
-                                revoked,
+                                revoked_by,
                                 last_requested,
                             },
                         );
@@ -1225,6 +1305,10 @@ impl MappingRegistry {
             });
         }
         Err(ForwardFailure::BindFailed)
+    }
+
+    pub(super) fn quarantine_uncertain(&mut self, port: u16) {
+        self.quarantine(port);
     }
 
     fn quarantine(&mut self, port: u16) {
