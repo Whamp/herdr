@@ -5,7 +5,7 @@ use std::num::NonZeroU64;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-pub(super) const BROKER_PROTOCOL_VERSION: u16 = 1;
+pub(super) const BROKER_PROTOCOL_VERSION: u16 = 2;
 pub(super) const MAX_PAYLOAD_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -21,7 +21,7 @@ impl CorrelationId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum LoopbackAddress {
     Ipv4([u8; 4]),
     Ipv6,
@@ -45,7 +45,7 @@ impl LoopbackAddress {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct ForwardSpec {
     pub(crate) local_address: LoopbackAddress,
     pub(crate) local_port: u16,
@@ -59,6 +59,7 @@ impl ForwardSpec {
             && self.remote_port != 0
             && self.local_address.is_valid()
             && self.remote_address.is_valid()
+            && self.local_address == self.remote_address
     }
 
     pub(super) fn ssh_value(self) -> String {
@@ -107,6 +108,8 @@ pub(crate) enum ForwardFailure {
     Disabled,
     Cancelled,
     TooManyRequests,
+    AlreadyOwned,
+    BindFailed,
     CommandRejected,
     CommandTimedOut,
     CapabilityClosed,
@@ -120,7 +123,9 @@ pub(super) enum ServerMessage {
     },
     PolicyAcknowledged {
         id: CorrelationId,
-        enabled: bool,
+        requested: bool,
+        effective: bool,
+        result: Result<(), ForwardFailure>,
     },
     ForwardSettled {
         id: CorrelationId,
@@ -215,6 +220,30 @@ fn bincode_config() -> impl bincode::config::Config {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn forward_specs_require_the_same_exact_loopback_identity_at_both_ends() {
+        let exact_ipv4 = ForwardSpec {
+            local_address: LoopbackAddress::Ipv4([127, 0, 0, 42]),
+            local_port: 8080,
+            remote_address: LoopbackAddress::Ipv4([127, 0, 0, 42]),
+            remote_port: 3000,
+        };
+        let exact_ipv6 = ForwardSpec {
+            local_address: LoopbackAddress::Ipv6,
+            local_port: 8080,
+            remote_address: LoopbackAddress::Ipv6,
+            remote_port: 3000,
+        };
+
+        assert!(exact_ipv4.is_valid());
+        assert!(exact_ipv6.is_valid());
+        assert!(!ForwardSpec {
+            remote_address: LoopbackAddress::Ipv6,
+            ..exact_ipv4
+        }
+        .is_valid());
+    }
 
     #[test]
     fn broker_frame_accepts_the_four_kibibyte_payload_boundary() {

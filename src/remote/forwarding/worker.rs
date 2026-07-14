@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc};
@@ -60,6 +60,7 @@ pub(super) enum ControlOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ControlResult {
     Succeeded,
+    BindFailed,
     Rejected,
     TimedOut,
 }
@@ -76,7 +77,7 @@ impl CommandRunner for ProcessCommandRunner {
             .args(&invocation.args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
         {
             Ok(child) => child,
@@ -86,10 +87,16 @@ impl CommandRunner for ProcessCommandRunner {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    return if status.success() {
-                        ControlResult::Succeeded
-                    } else {
-                        ControlResult::Rejected
+                    if status.success() {
+                        return ControlResult::Succeeded;
+                    }
+                    let mut stderr = String::new();
+                    if let Some(mut pipe) = child.stderr.take() {
+                        let _ = pipe.read_to_string(&mut stderr);
+                    }
+                    return match classify_openssh_control_stderr(&stderr) {
+                        OpenSshControlFailure::BindCollision => ControlResult::BindFailed,
+                        OpenSshControlFailure::Rejected => ControlResult::Rejected,
                     };
                 }
                 Ok(None) if Instant::now() < deadline => {
@@ -107,6 +114,36 @@ impl CommandRunner for ProcessCommandRunner {
                 }
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenSshControlFailure {
+    BindCollision,
+    Rejected,
+}
+
+fn classify_openssh_control_stderr(stderr: &str) -> OpenSshControlFailure {
+    let collision = stderr.lines().any(|line| {
+        let lowercase = line.trim().to_ascii_lowercase();
+        let Some(binding) = lowercase.strip_prefix("bind [") else {
+            return false;
+        };
+        let Some((address, after_address)) = binding.split_once("]:") else {
+            return false;
+        };
+        let Some((port, reason)) = after_address.split_once(": ") else {
+            return false;
+        };
+        !address.is_empty()
+            && !port.is_empty()
+            && port.bytes().all(|byte| byte.is_ascii_digit())
+            && reason == "address already in use"
+    });
+    if collision {
+        OpenSshControlFailure::BindCollision
+    } else {
+        OpenSshControlFailure::Rejected
     }
 }
 
@@ -176,7 +213,6 @@ impl ControlWorker {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "forwarding worker closed"))
     }
 
-    #[cfg(test)]
     pub(super) fn recv(&self) -> io::Result<WorkerResult> {
         self.results
             .recv()
@@ -285,6 +321,39 @@ mod tests {
             ControlResult::Succeeded
         );
         assert_eq!(probe.max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn retryable_bind_failures_require_unambiguous_openssh_listener_collision_evidence() {
+        for stderr in [
+            "bind [127.0.0.1]:80: Address already in use",
+            "bind [::1]:8080: address already in use\r\nCould not request local forwarding.",
+        ] {
+            assert_eq!(
+                classify_openssh_control_stderr(stderr),
+                OpenSshControlFailure::BindCollision,
+                "stderr: {stderr:?}"
+            );
+        }
+
+        for stderr in [
+            "bind [127.0.0.1]:80: Permission denied",
+            "Control socket connect(/tmp/herdr-ctl): Permission denied",
+            "user@remote: Permission denied (publickey).",
+            "open /private/ctl: Permission denied",
+            "bind [::1]:8080: Adresse bereits verwendet",
+            "debug noise: Address already in use",
+            "Address already in use",
+            "",
+            "Could not request local forwarding.",
+            "mux_client_request_session: master session id: 2",
+        ] {
+            assert_eq!(
+                classify_openssh_control_stderr(stderr),
+                OpenSshControlFailure::Rejected,
+                "stderr: {stderr:?}"
+            );
+        }
     }
 
     #[test]

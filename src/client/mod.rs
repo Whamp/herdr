@@ -90,6 +90,7 @@ struct ClientLoopConfig {
     kitty_graphics_enabled: bool,
     mouse_capture_active: bool,
     external_open_policy: crate::protocol::ExternalOpenPolicy,
+    external_open_forwarding: crate::external_open::ExternalOpenForwarding,
     #[cfg(unix)]
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
 }
@@ -1194,14 +1195,13 @@ fn run_client_with_mode(
     } else {
         crate::protocol::ExternalOpenPolicy::Disabled
     };
-    let _forwarding_capability = connection_kind
-        .is_full_app()
-        .then(|| {
-            crate::platform::adopt_inherited_forwarding_capability(
-                external_open_policy == crate::protocol::ExternalOpenPolicy::Enabled,
-            )
-        })
-        .transpose()?;
+    let external_open_forwarding = if connection_kind.is_full_app() {
+        crate::platform::adopt_inherited_forwarding_capability(
+            external_open_policy == crate::protocol::ExternalOpenPolicy::Enabled,
+        )?
+    } else {
+        crate::external_open::ExternalOpenForwarding::Unavailable
+    };
     #[cfg(unix)]
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
     let kitty_graphics_enabled =
@@ -1215,6 +1215,7 @@ fn run_client_with_mode(
         kitty_graphics_enabled,
         mouse_capture_active: mouse_capture,
         external_open_policy,
+        external_open_forwarding,
         #[cfg(unix)]
         remote_image_paste_key,
     };
@@ -1446,12 +1447,14 @@ async fn run_client_loop(
     // This (foreground) client owns the prefix ASCII input-source switch; a no-op on non-macOS.
     use crate::platform::PrefixInputSource;
     let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
-    let mut external_open =
-        external_open::ClientExternalOpen::new(if config.connection_kind.is_full_app() {
+    let mut external_open = external_open::ClientExternalOpen::new(
+        if config.connection_kind.is_full_app() {
             config.external_open_policy
         } else {
             crate::protocol::ExternalOpenPolicy::Disabled
-        });
+        },
+        config.external_open_forwarding,
+    );
 
     // Main event loop.
     while !should_quit.load(Ordering::Acquire) {
@@ -1661,20 +1664,20 @@ async fn run_client_loop(
                         #[cfg(unix)]
                         &mut state.remote_image_paste_key,
                     );
-                    let policy_message = if let Some(policy) = reloaded_policy {
+                    let policy_messages = if let Some(policy) = reloaded_policy {
                         confirmed_external_open_policy_update(
                             config.connection_kind,
                             &mut external_open,
                             policy,
                         )
+                    } else if config.connection_kind.is_full_app() {
+                        vec![ClientMessage::ExternalOpenPolicyReloadFailed {
+                            effective_policy: external_open.policy(),
+                        }]
                     } else {
-                        config.connection_kind.is_full_app().then_some(
-                            ClientMessage::ExternalOpenPolicyReloadFailed {
-                                effective_policy: external_open.policy(),
-                            },
-                        )
+                        Vec::new()
                     };
-                    if let Some(policy_message) = policy_message {
+                    for policy_message in policy_messages {
                         if let Err(error) = write_to_server(&mut write_stream, &policy_message) {
                             return Err(ClientError::ConnectionLost(error));
                         }
@@ -1740,15 +1743,10 @@ async fn run_client_loop(
                             requested_policy,
                             prior_effective,
                         );
-                        if let ClientMessage::ExternalOpenPolicyMutationResult {
-                            effective_policy,
-                            ..
-                        } = &result
-                        {
-                            external_open.confirm_policy(*effective_policy);
-                        }
-                        if let Err(error) = write_to_server(&mut write_stream, &result) {
-                            return Err(ClientError::ConnectionLost(error));
+                        for result in external_open.begin_policy_mutation(result) {
+                            if let Err(error) = write_to_server(&mut write_stream, &result) {
+                                return Err(ClientError::ConnectionLost(error));
+                            }
                         }
                     }
                 }
@@ -1762,12 +1760,19 @@ async fn run_client_loop(
                 }
             }
             ClientLoopEvent::ServerDisconnected => {
+                external_open.cancel_all();
                 return Err(ClientError::ConnectionLost(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "server closed connection",
                 )));
             }
             ClientLoopEvent::Timer => {}
+        }
+
+        for reply in external_open.poll() {
+            if let Err(error) = write_to_server(&mut write_stream, &reply) {
+                return Err(ClientError::ConnectionLost(error));
+            }
         }
     }
 
@@ -1904,10 +1909,12 @@ fn confirmed_external_open_policy_update(
     connection_kind: ClientConnectionKind,
     external_open: &mut external_open::ClientExternalOpen,
     policy: crate::protocol::ExternalOpenPolicy,
-) -> Option<ClientMessage> {
-    connection_kind
-        .is_full_app()
-        .then(|| external_open.confirm_policy(policy))
+) -> Vec<ClientMessage> {
+    if connection_kind.is_full_app() {
+        external_open.begin_policy_reload(policy)
+    } else {
+        Vec::new()
+    }
 }
 
 fn reload_local_client_config(

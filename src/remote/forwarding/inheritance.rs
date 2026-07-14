@@ -7,7 +7,10 @@ use std::process::Command;
 use super::broker::{BrokerServer, ForwardingClient};
 use super::worker::ControlAuthority;
 
-use super::INHERITED_BROKER_FD_ENV;
+use super::{
+    FORWARDING_LAUNCH_STATUS_ENV, FORWARDING_STATUS_AVAILABLE,
+    FORWARDING_STATUS_MANAGED_SSH_REQUIRED, FORWARDING_STATUS_UNAVAILABLE, INHERITED_BROKER_FD_ENV,
+};
 
 pub(crate) struct PendingBroker {
     parent: UnixStream,
@@ -61,9 +64,32 @@ impl PendingBroker {
     }
 }
 
-pub(crate) fn adopt_inherited_capability(
+pub(crate) fn adopt_external_open_forwarding(
     initial_policy: bool,
-) -> io::Result<Option<ForwardingClient>> {
+) -> io::Result<crate::external_open::ExternalOpenForwarding> {
+    let status = std::env::var(FORWARDING_LAUNCH_STATUS_ENV).ok();
+    std::env::remove_var(FORWARDING_LAUNCH_STATUS_ENV);
+    let client = adopt_inherited_capability(initial_policy)?;
+    match (client, status.as_deref()) {
+        (Some(client), Some(FORWARDING_STATUS_AVAILABLE) | None) => {
+            Ok(crate::external_open::ExternalOpenForwarding::available(
+                std::sync::Arc::new(super::NumericForwardingController::new(client)),
+            ))
+        }
+        (Some(_), _) => Ok(crate::external_open::ExternalOpenForwarding::Unavailable),
+        (None, Some(FORWARDING_STATUS_UNAVAILABLE)) => {
+            Ok(crate::external_open::ExternalOpenForwarding::Unavailable)
+        }
+        (None, Some(FORWARDING_STATUS_MANAGED_SSH_REQUIRED) | None) => {
+            Ok(crate::external_open::ExternalOpenForwarding::ManagedSshRequired)
+        }
+        (None, Some(FORWARDING_STATUS_AVAILABLE) | Some(_)) => {
+            Ok(crate::external_open::ExternalOpenForwarding::Unavailable)
+        }
+    }
+}
+
+fn adopt_inherited_capability(initial_policy: bool) -> io::Result<Option<ForwardingClient>> {
     let Some(raw_descriptor) = std::env::var_os(INHERITED_BROKER_FD_ENV) else {
         return Ok(None);
     };
