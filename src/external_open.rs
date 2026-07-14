@@ -336,13 +336,18 @@ pub(crate) fn validate_external_open_url(
         return Ok(ValidatedExternalOpenUrl::Ordinary(input));
     };
     match (platform, target) {
-        (ExternalOpenPlatform::Linux, _)
+        (
+            ExternalOpenPlatform::Linux,
+            LoopbackTarget::Localhost | LoopbackTarget::Ipv4(_) | LoopbackTarget::Ipv6,
+        )
         | (ExternalOpenPlatform::MacOs, LoopbackTarget::Localhost)
         | (ExternalOpenPlatform::MacOs, LoopbackTarget::Ipv6)
         | (ExternalOpenPlatform::MacOs, LoopbackTarget::Ipv4(std::net::Ipv4Addr::LOCALHOST)) => {}
-        (ExternalOpenPlatform::MacOs | ExternalOpenPlatform::Unsupported, _) => {
-            return Err(ExternalOpenUrlError::LoopbackUnsupportedOnPlatform);
-        }
+        (ExternalOpenPlatform::MacOs, LoopbackTarget::Ipv4(_))
+        | (
+            ExternalOpenPlatform::Unsupported,
+            LoopbackTarget::Localhost | LoopbackTarget::Ipv4(_) | LoopbackTarget::Ipv6,
+        ) => return Err(ExternalOpenUrlError::LoopbackUnsupportedOnPlatform),
     }
     let remote_port = parsed_authority
         .explicit_port

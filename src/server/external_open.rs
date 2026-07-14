@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::protocol::{ExternalOpenResult, ExternalOpenTarget};
@@ -9,8 +10,34 @@ const MAX_EXTERNAL_OPENS_PER_ATTACHMENT: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExternalOpenAdmissionError {
     NotAuthorized,
-    TooManyInProgress,
-    RequestIdsExhausted,
+    Closed(ExternalOpenClosed),
+}
+
+/// Identifies a terminal diagnostic without borrowing authority from the wire
+/// request-ID namespace. Accepted requests retain their exact wire ID;
+/// pre-dispatch rejections use a tagged, server-local admission sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ExternalOpenTerminalId {
+    WireRequest(u64),
+    AdmissionAttempt(u128),
+}
+
+impl ExternalOpenTerminalId {
+    pub(crate) const fn wire_request_id(self) -> Option<u64> {
+        match self {
+            Self::WireRequest(request_id) => Some(request_id),
+            Self::AdmissionAttempt(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for ExternalOpenTerminalId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WireRequest(request_id) => request_id.fmt(formatter),
+            Self::AdmissionAttempt(attempt_id) => write!(formatter, "admission:{attempt_id}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +75,10 @@ impl ExternalOpenTerminalOutcome {
     pub(crate) const fn canonical_outcome(self) -> &'static str {
         match self {
             Self::OpenedDirectly => "opened_directly",
-            Self::OpenedThroughForward(_) => "opened_through_forward",
+            Self::OpenedThroughForward(
+                crate::protocol::ExternalOpenPortStatus::SamePort
+                | crate::protocol::ExternalOpenPortStatus::RemappedPort,
+            ) => "opened_through_forward",
             Self::PreparationFailed(reason) => canonical_preparation_failure(reason),
             Self::PlatformOpenRejected => "platform_open_rejected",
             Self::ClientDeliveryFailed => "client_delivery_failed",
@@ -65,7 +95,10 @@ impl ExternalOpenTerminalOutcome {
 
         match self {
             Self::OpenedDirectly
-            | Self::OpenedThroughForward(_)
+            | Self::OpenedThroughForward(
+                crate::protocol::ExternalOpenPortStatus::SamePort
+                | crate::protocol::ExternalOpenPortStatus::RemappedPort,
+            )
             | Self::CancelledBeforeCommit
             | Self::ClientDisconnectedBeforeCommit => None,
             Self::PreparationFailed(Failure::UnsupportedScheme) => {
@@ -144,7 +177,7 @@ const fn canonical_preparation_failure(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExternalOpenClosed {
-    pub(crate) request_id: u64,
+    pub(crate) terminal_id: ExternalOpenTerminalId,
     pub(crate) client_id: u64,
     pub(crate) outcome: ExternalOpenTerminalOutcome,
     accepted_at: Instant,
@@ -152,6 +185,10 @@ pub(crate) struct ExternalOpenClosed {
 }
 
 impl ExternalOpenClosed {
+    pub(crate) const fn wire_request_id(self) -> Option<u64> {
+        self.terminal_id.wire_request_id()
+    }
+
     pub(crate) fn elapsed_ms(self, now: Instant) -> u128 {
         now.saturating_duration_since(self.accepted_at).as_millis()
     }
@@ -159,7 +196,12 @@ impl ExternalOpenClosed {
     pub(crate) const fn commit_state(self) -> &'static str {
         match self.phase {
             ExternalOpenPhase::Preparing => "uncommitted",
-            ExternalOpenPhase::Committed(_) => "committed",
+            ExternalOpenPhase::Committed(ExternalOpenTarget::Direct)
+            | ExternalOpenPhase::Committed(ExternalOpenTarget::Forwarded {
+                port_status:
+                    crate::protocol::ExternalOpenPortStatus::SamePort
+                    | crate::protocol::ExternalOpenPortStatus::RemappedPort,
+            }) => "committed",
         }
     }
 
@@ -209,6 +251,7 @@ struct ExternalOpenAttachment {
 pub(crate) struct ExternalOpenAttachments {
     attachments: HashMap<crate::protocol::ExternalOpenAttachmentId, ExternalOpenAttachment>,
     client_attachments: HashMap<u64, crate::protocol::ExternalOpenAttachmentId>,
+    next_admission_attempt_id: u128,
 }
 
 impl ExternalOpenAttachments {
@@ -256,7 +299,7 @@ impl ExternalOpenAttachments {
             .values_mut()
             .flat_map(|attachment| attachment.requests.expire_due(now))
             .collect::<Vec<_>>();
-        closed.sort_by_key(|request| (request.accepted_at, request.request_id));
+        closed.sort_by_key(|request| (request.accepted_at, request.terminal_id));
         closed
     }
 
@@ -274,9 +317,23 @@ impl ExternalOpenAttachments {
         client_id: u64,
         accepted_at: Instant,
     ) -> Result<ExternalOpenDispatch, ExternalOpenAdmissionError> {
-        self.requests_for_client_mut(client_id)
+        let admission = self
+            .requests_for_client_mut(client_id)
             .ok_or(ExternalOpenAdmissionError::NotAuthorized)?
-            .start(client_id, accepted_at)
+            .start(client_id, accepted_at);
+        admission.map_err(|_| {
+            let attempt_id = self.next_admission_attempt_id.saturating_add(1);
+            self.next_admission_attempt_id = attempt_id;
+            ExternalOpenAdmissionError::Closed(ExternalOpenClosed {
+                terminal_id: ExternalOpenTerminalId::AdmissionAttempt(attempt_id),
+                client_id,
+                outcome: ExternalOpenTerminalOutcome::PreparationFailed(
+                    crate::protocol::ExternalOpenPreparationFailure::TooManyOpensInProgress,
+                ),
+                accepted_at,
+                phase: ExternalOpenPhase::Preparing,
+            })
+        })
     }
 
     pub(crate) fn ready(
@@ -333,6 +390,13 @@ impl ExternalOpenAttachments {
             .map(|attachment| &mut attachment.requests)
     }
 
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn exhaust_request_ids_for_test(&mut self, client_id: u64) {
+        self.requests_for_client_mut(client_id)
+            .expect("authorized test client")
+            .next_request_id = 0;
+    }
+
     #[cfg(test)]
     pub(crate) fn attachment_count_for_test(&self) -> usize {
         self.attachments.len()
@@ -353,6 +417,12 @@ impl ExternalOpenAttachments {
 pub(crate) struct ExternalOpenRequests {
     next_request_id: u64,
     requests: HashMap<u64, ExternalOpenRequest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalOpenAdmissionRejection {
+    TooManyInProgress,
+    RequestIdsExhausted,
 }
 
 impl Default for ExternalOpenRequests {
@@ -389,9 +459,12 @@ impl ExternalOpenRequests {
                     ExternalOpenPhase::Preparing => {
                         ExternalOpenTerminalOutcome::TimedOutBeforeCommit
                     }
-                    ExternalOpenPhase::Committed(_) => {
-                        ExternalOpenTerminalOutcome::CommittedOutcomeUnknown
-                    }
+                    ExternalOpenPhase::Committed(ExternalOpenTarget::Direct)
+                    | ExternalOpenPhase::Committed(ExternalOpenTarget::Forwarded {
+                        port_status:
+                            crate::protocol::ExternalOpenPortStatus::SamePort
+                            | crate::protocol::ExternalOpenPortStatus::RemappedPort,
+                    }) => ExternalOpenTerminalOutcome::CommittedOutcomeUnknown,
                 };
                 Some(Self::closed(request_id, request, outcome))
             })
@@ -443,27 +516,30 @@ impl ExternalOpenRequests {
                     ExternalOpenPhase::Preparing => {
                         ExternalOpenTerminalOutcome::ClientDisconnectedBeforeCommit
                     }
-                    ExternalOpenPhase::Committed(_) => {
-                        ExternalOpenTerminalOutcome::CommittedOutcomeUnknown
-                    }
+                    ExternalOpenPhase::Committed(ExternalOpenTarget::Direct)
+                    | ExternalOpenPhase::Committed(ExternalOpenTarget::Forwarded {
+                        port_status:
+                            crate::protocol::ExternalOpenPortStatus::SamePort
+                            | crate::protocol::ExternalOpenPortStatus::RemappedPort,
+                    }) => ExternalOpenTerminalOutcome::CommittedOutcomeUnknown,
                 };
                 Some(Self::closed(request_id, request, outcome))
             })
             .collect()
     }
 
-    pub(crate) fn start(
+    fn start(
         &mut self,
         client_id: u64,
         accepted_at: Instant,
-    ) -> Result<ExternalOpenDispatch, ExternalOpenAdmissionError> {
+    ) -> Result<ExternalOpenDispatch, ExternalOpenAdmissionRejection> {
         if self.requests.len() >= MAX_EXTERNAL_OPENS_PER_ATTACHMENT {
-            return Err(ExternalOpenAdmissionError::TooManyInProgress);
+            return Err(ExternalOpenAdmissionRejection::TooManyInProgress);
+        }
+        if self.next_request_id == 0 {
+            return Err(ExternalOpenAdmissionRejection::RequestIdsExhausted);
         }
         let request_id = self.next_request_id;
-        if request_id == 0 {
-            return Err(ExternalOpenAdmissionError::RequestIdsExhausted);
-        }
         self.next_request_id = request_id.checked_add(1).unwrap_or(0);
         let deadline = accepted_at + EXTERNAL_OPEN_DEADLINE;
         self.requests.insert(
@@ -583,26 +659,7 @@ impl ExternalOpenRequests {
                 ExternalOpenTerminalOutcome::CommittedOutcomeUnknown,
             );
         }
-        let outcome = match (target, result) {
-            (ExternalOpenTarget::Direct, ExternalOpenResult::OpenedDirectly) => {
-                ExternalOpenTerminalOutcome::OpenedDirectly
-            }
-            (
-                ExternalOpenTarget::Forwarded {
-                    port_status: prepared,
-                },
-                ExternalOpenResult::OpenedThroughForward {
-                    port_status: reported,
-                },
-            ) if prepared == reported => {
-                ExternalOpenTerminalOutcome::OpenedThroughForward(reported)
-            }
-            (_, ExternalOpenResult::PlatformOpenRejected) => {
-                ExternalOpenTerminalOutcome::PlatformOpenRejected
-            }
-            _ => ExternalOpenTerminalOutcome::InvalidClientResult,
-        };
-        self.close(request_id, outcome)
+        self.close(request_id, terminal_result_outcome(target, result))
     }
 
     fn close(
@@ -622,12 +679,53 @@ impl ExternalOpenRequests {
         outcome: ExternalOpenTerminalOutcome,
     ) -> ExternalOpenClosed {
         ExternalOpenClosed {
-            request_id,
+            terminal_id: ExternalOpenTerminalId::WireRequest(request_id),
             client_id: request.client_id,
             outcome,
             accepted_at: request.deadline - EXTERNAL_OPEN_DEADLINE,
             phase: request.phase,
         }
+    }
+}
+
+fn terminal_result_outcome(
+    target: ExternalOpenTarget,
+    result: ExternalOpenResult,
+) -> ExternalOpenTerminalOutcome {
+    use crate::protocol::ExternalOpenPortStatus as PortStatus;
+
+    match target {
+        ExternalOpenTarget::Direct => match result {
+            ExternalOpenResult::OpenedDirectly => ExternalOpenTerminalOutcome::OpenedDirectly,
+            ExternalOpenResult::OpenedThroughForward {
+                port_status: PortStatus::SamePort | PortStatus::RemappedPort,
+            } => ExternalOpenTerminalOutcome::InvalidClientResult,
+            ExternalOpenResult::PlatformOpenRejected => {
+                ExternalOpenTerminalOutcome::PlatformOpenRejected
+            }
+        },
+        ExternalOpenTarget::Forwarded {
+            port_status: prepared,
+        } => match result {
+            ExternalOpenResult::OpenedDirectly => ExternalOpenTerminalOutcome::InvalidClientResult,
+            ExternalOpenResult::OpenedThroughForward {
+                port_status: reported,
+            } => match (prepared, reported) {
+                (PortStatus::SamePort, PortStatus::SamePort) => {
+                    ExternalOpenTerminalOutcome::OpenedThroughForward(PortStatus::SamePort)
+                }
+                (PortStatus::RemappedPort, PortStatus::RemappedPort) => {
+                    ExternalOpenTerminalOutcome::OpenedThroughForward(PortStatus::RemappedPort)
+                }
+                (PortStatus::SamePort, PortStatus::RemappedPort)
+                | (PortStatus::RemappedPort, PortStatus::SamePort) => {
+                    ExternalOpenTerminalOutcome::InvalidClientResult
+                }
+            },
+            ExternalOpenResult::PlatformOpenRejected => {
+                ExternalOpenTerminalOutcome::PlatformOpenRejected
+            }
+        },
     }
 }
 
@@ -652,6 +750,12 @@ mod tests {
             (
                 ExternalOpenTerminalOutcome::OpenedThroughForward(
                     crate::protocol::ExternalOpenPortStatus::SamePort,
+                ),
+                "opened_through_forward",
+            ),
+            (
+                ExternalOpenTerminalOutcome::OpenedThroughForward(
+                    crate::protocol::ExternalOpenPortStatus::RemappedPort,
                 ),
                 "opened_through_forward",
             ),
@@ -772,6 +876,12 @@ mod tests {
                 None,
             ),
             (
+                ExternalOpenTerminalOutcome::OpenedThroughForward(
+                    crate::protocol::ExternalOpenPortStatus::RemappedPort,
+                ),
+                None,
+            ),
+            (
                 ExternalOpenTerminalOutcome::PreparationFailed(Failure::UnsupportedScheme),
                 Some("Couldn’t open link · link type isn’t supported"),
             ),
@@ -872,26 +982,112 @@ mod tests {
     }
 
     #[test]
+    fn committed_result_translation_is_exhaustive_for_every_target_and_result_pair() {
+        use crate::protocol::ExternalOpenPortStatus as PortStatus;
+
+        let direct = ExternalOpenTarget::Direct;
+        let same = ExternalOpenTarget::Forwarded {
+            port_status: PortStatus::SamePort,
+        };
+        let remapped = ExternalOpenTarget::Forwarded {
+            port_status: PortStatus::RemappedPort,
+        };
+        let opened_directly = ExternalOpenResult::OpenedDirectly;
+        let opened_same = ExternalOpenResult::OpenedThroughForward {
+            port_status: PortStatus::SamePort,
+        };
+        let opened_remapped = ExternalOpenResult::OpenedThroughForward {
+            port_status: PortStatus::RemappedPort,
+        };
+        let rejected = ExternalOpenResult::PlatformOpenRejected;
+
+        for (target, result, expected) in [
+            (
+                direct,
+                opened_directly,
+                ExternalOpenTerminalOutcome::OpenedDirectly,
+            ),
+            (
+                direct,
+                opened_same,
+                ExternalOpenTerminalOutcome::InvalidClientResult,
+            ),
+            (
+                direct,
+                opened_remapped,
+                ExternalOpenTerminalOutcome::InvalidClientResult,
+            ),
+            (
+                direct,
+                rejected,
+                ExternalOpenTerminalOutcome::PlatformOpenRejected,
+            ),
+            (
+                same,
+                opened_directly,
+                ExternalOpenTerminalOutcome::InvalidClientResult,
+            ),
+            (
+                same,
+                opened_same,
+                ExternalOpenTerminalOutcome::OpenedThroughForward(PortStatus::SamePort),
+            ),
+            (
+                same,
+                opened_remapped,
+                ExternalOpenTerminalOutcome::InvalidClientResult,
+            ),
+            (
+                same,
+                rejected,
+                ExternalOpenTerminalOutcome::PlatformOpenRejected,
+            ),
+            (
+                remapped,
+                opened_directly,
+                ExternalOpenTerminalOutcome::InvalidClientResult,
+            ),
+            (
+                remapped,
+                opened_same,
+                ExternalOpenTerminalOutcome::InvalidClientResult,
+            ),
+            (
+                remapped,
+                opened_remapped,
+                ExternalOpenTerminalOutcome::OpenedThroughForward(PortStatus::RemappedPort),
+            ),
+            (
+                remapped,
+                rejected,
+                ExternalOpenTerminalOutcome::PlatformOpenRejected,
+            ),
+        ] {
+            assert_eq!(terminal_result_outcome(target, result), expected);
+        }
+    }
+
+    #[test]
     fn terminal_diagnostic_context_uses_closed_commit_and_forward_vocabulary() {
         let accepted_at = Instant::now();
         let terminal_at = accepted_at + Duration::from_millis(1_234);
         let closed = [
             ExternalOpenClosed {
-                request_id: 1,
+                terminal_id: ExternalOpenTerminalId::WireRequest(1),
                 client_id: 7,
                 outcome: ExternalOpenTerminalOutcome::InvalidClientResult,
                 accepted_at,
                 phase: ExternalOpenPhase::Preparing,
             },
             ExternalOpenClosed {
-                request_id: 2,
+                terminal_id: ExternalOpenTerminalId::WireRequest(2),
                 client_id: 7,
                 outcome: ExternalOpenTerminalOutcome::OpenedDirectly,
                 accepted_at,
                 phase: ExternalOpenPhase::Committed(ExternalOpenTarget::Direct),
             },
             ExternalOpenClosed {
-                request_id: 3,
+                terminal_id: ExternalOpenTerminalId::WireRequest(3),
                 client_id: 7,
                 outcome: ExternalOpenTerminalOutcome::OpenedThroughForward(
                     crate::protocol::ExternalOpenPortStatus::SamePort,
@@ -902,7 +1098,7 @@ mod tests {
                 }),
             },
             ExternalOpenClosed {
-                request_id: 4,
+                terminal_id: ExternalOpenTerminalId::WireRequest(4),
                 client_id: 7,
                 outcome: ExternalOpenTerminalOutcome::OpenedThroughForward(
                     crate::protocol::ExternalOpenPortStatus::RemappedPort,
@@ -943,11 +1139,11 @@ mod tests {
 
         assert_eq!(
             attachment.start(7, accepted_at),
-            Err(ExternalOpenAdmissionError::TooManyInProgress)
+            Err(ExternalOpenAdmissionRejection::TooManyInProgress)
         );
         assert_eq!(
             attachment.start(8, accepted_at),
-            Err(ExternalOpenAdmissionError::TooManyInProgress)
+            Err(ExternalOpenAdmissionRejection::TooManyInProgress)
         );
         let mut distinct_attachment = ExternalOpenRequests::default();
         assert!(distinct_attachment.start(7, accepted_at).is_ok());
@@ -963,7 +1159,7 @@ mod tests {
         );
         assert_eq!(
             attachment.start(8, accepted_at),
-            Err(ExternalOpenAdmissionError::TooManyInProgress),
+            Err(ExternalOpenAdmissionRejection::TooManyInProgress),
             "committed-pending work still owns its attachment slot"
         );
         assert!(matches!(
@@ -991,7 +1187,7 @@ mod tests {
         assert_eq!(
             requests.expire_due(first.deadline()),
             vec![ExternalOpenClosed {
-                request_id: first.request_id(),
+                terminal_id: ExternalOpenTerminalId::WireRequest(first.request_id()),
                 client_id: 7,
                 outcome: ExternalOpenTerminalOutcome::TimedOutBeforeCommit,
                 accepted_at,
@@ -1045,7 +1241,7 @@ mod tests {
                 accepted_at + Duration::from_secs(1),
             ),
             ExternalOpenTransition::Closed(ExternalOpenClosed {
-                request_id: first.request_id(),
+                terminal_id: ExternalOpenTerminalId::WireRequest(first.request_id()),
                 client_id: 7,
                 outcome: ExternalOpenTerminalOutcome::PreparationFailed(reason),
                 accepted_at,
@@ -1077,14 +1273,14 @@ mod tests {
             requests.connection_lost(7),
             vec![
                 ExternalOpenClosed {
-                    request_id: committed.request_id(),
+                    terminal_id: ExternalOpenTerminalId::WireRequest(committed.request_id()),
                     client_id: 7,
                     outcome: ExternalOpenTerminalOutcome::CommittedOutcomeUnknown,
                     accepted_at,
                     phase: ExternalOpenPhase::Committed(ExternalOpenTarget::Direct),
                 },
                 ExternalOpenClosed {
-                    request_id: preparing.request_id(),
+                    terminal_id: ExternalOpenTerminalId::WireRequest(preparing.request_id()),
                     client_id: 7,
                     outcome: ExternalOpenTerminalOutcome::ClientDisconnectedBeforeCommit,
                     accepted_at,
@@ -1117,7 +1313,7 @@ mod tests {
         assert_eq!(
             requests.cancel_preparing_for_client(7),
             vec![ExternalOpenClosed {
-                request_id: preparing.request_id(),
+                terminal_id: ExternalOpenTerminalId::WireRequest(preparing.request_id()),
                 client_id: 7,
                 outcome: ExternalOpenTerminalOutcome::CancelledBeforeCommit,
                 accepted_at,
@@ -1132,7 +1328,7 @@ mod tests {
                 accepted_at + Duration::from_secs(2),
             ),
             ExternalOpenTransition::Closed(ExternalOpenClosed {
-                request_id: committed.request_id(),
+                terminal_id: ExternalOpenTerminalId::WireRequest(committed.request_id()),
                 client_id: 7,
                 outcome: ExternalOpenTerminalOutcome::OpenedDirectly,
                 accepted_at,
@@ -1156,7 +1352,7 @@ mod tests {
         assert_eq!(
             requests.delivery_failed(7, first.request_id()),
             ExternalOpenTransition::Closed(ExternalOpenClosed {
-                request_id: first.request_id(),
+                terminal_id: ExternalOpenTerminalId::WireRequest(first.request_id()),
                 client_id: 7,
                 outcome: ExternalOpenTerminalOutcome::ClientDeliveryFailed,
                 accepted_at,
@@ -1207,7 +1403,7 @@ mod tests {
                 accepted_at + Duration::from_secs(2),
             ),
             ExternalOpenTransition::Closed(ExternalOpenClosed {
-                request_id: rejected.request_id(),
+                terminal_id: ExternalOpenTerminalId::WireRequest(rejected.request_id()),
                 client_id: 7,
                 outcome: ExternalOpenTerminalOutcome::PlatformOpenRejected,
                 accepted_at,
@@ -1224,7 +1420,7 @@ mod tests {
                 accepted_at + Duration::from_secs(2),
             ),
             ExternalOpenTransition::Closed(ExternalOpenClosed {
-                request_id: forwarded.request_id(),
+                terminal_id: ExternalOpenTerminalId::WireRequest(forwarded.request_id()),
                 client_id: 7,
                 outcome: ExternalOpenTerminalOutcome::OpenedThroughForward(
                     crate::protocol::ExternalOpenPortStatus::SamePort,
@@ -1245,7 +1441,7 @@ mod tests {
                 accepted_at + Duration::from_secs(2),
             ),
             ExternalOpenTransition::Closed(ExternalOpenClosed {
-                request_id: invalid.request_id(),
+                terminal_id: ExternalOpenTerminalId::WireRequest(invalid.request_id()),
                 client_id: 7,
                 outcome: ExternalOpenTerminalOutcome::InvalidClientResult,
                 accepted_at,
@@ -1268,7 +1464,7 @@ mod tests {
                 accepted_at + Duration::from_secs(1),
             ),
             ExternalOpenTransition::Closed(ExternalOpenClosed {
-                request_id: dispatch.request_id(),
+                terminal_id: ExternalOpenTerminalId::WireRequest(dispatch.request_id()),
                 client_id: 7,
                 outcome: ExternalOpenTerminalOutcome::InvalidClientResult,
                 accepted_at,
@@ -1377,7 +1573,7 @@ mod tests {
         assert_eq!(
             requests.expire_due(second.deadline()),
             vec![ExternalOpenClosed {
-                request_id: second.request_id(),
+                terminal_id: ExternalOpenTerminalId::WireRequest(second.request_id()),
                 client_id: 8,
                 outcome: ExternalOpenTerminalOutcome::TimedOutBeforeCommit,
                 accepted_at,
@@ -1415,7 +1611,7 @@ mod tests {
         assert_eq!(
             requests.expire_due(dispatch.deadline()),
             vec![ExternalOpenClosed {
-                request_id: dispatch.request_id(),
+                terminal_id: ExternalOpenTerminalId::WireRequest(dispatch.request_id()),
                 client_id: 7,
                 outcome: ExternalOpenTerminalOutcome::CommittedOutcomeUnknown,
                 accepted_at,
@@ -1467,7 +1663,7 @@ mod tests {
                 accepted_at + Duration::from_millis(9_500),
             ),
             ExternalOpenTransition::Closed(ExternalOpenClosed {
-                request_id: dispatch.request_id(),
+                terminal_id: ExternalOpenTerminalId::WireRequest(dispatch.request_id()),
                 client_id: 7,
                 outcome: ExternalOpenTerminalOutcome::OpenedDirectly,
                 accepted_at,

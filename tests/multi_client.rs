@@ -128,6 +128,17 @@ fn wait_for_file(path: &Path, timeout: Duration) {
     panic!("socket did not accept connections at {}", path.display());
 }
 
+fn wait_for_path_absent(path: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !path.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("test control was not consumed: {}", path.display());
+}
+
 fn accept_spawned_client(
     listener: &UnixListener,
     client: &mut SpawnedHerdr,
@@ -219,6 +230,10 @@ fn spawn_server_with_test_controls(
     cmd.env("SHELL", "/bin/sh");
     cmd.env("PATH", path);
     cmd.env("HERDR_TEST_OPEN_LOG", external_open_log_path(config_home));
+    cmd.env(
+        "HERDR_TEST_EXTERNAL_OPEN_ID_EXHAUSTION_PATH",
+        external_open_id_exhaustion_path(config_home),
+    );
     if let Some(path) = monotonic_clock_path {
         cmd.env("HERDR_TEST_MONOTONIC_CLOCK_PATH", path);
     }
@@ -279,6 +294,26 @@ fn spawn_client_process(
     cmd.env(
         "HERDR_TEST_OPEN_LOG",
         client_external_open_log_path(config_home),
+    );
+    cmd.env(
+        "HERDR_TEST_EXTERNAL_OPEN_FORWARD_PORT_PATH",
+        client_external_open_forward_port_path(config_home),
+    );
+    cmd.env(
+        "HERDR_TEST_EXTERNAL_OPEN_SUPPRESS_READY_PATH",
+        client_external_open_suppress_ready_path(config_home),
+    );
+    cmd.env(
+        "HERDR_TEST_EXTERNAL_OPEN_SUPPRESS_RESULT_PATH",
+        client_external_open_suppress_result_path(config_home),
+    );
+    cmd.env(
+        "HERDR_TEST_EXTERNAL_OPEN_REJECT_PATH",
+        client_external_open_reject_path(config_home),
+    );
+    cmd.env(
+        "HERDR_TEST_EXTERNAL_OPEN_ACTION_PATH",
+        client_external_open_action_path(config_home),
     );
     cmd.env_remove("HERDR_ENV");
 
@@ -349,6 +384,30 @@ fn external_open_log_path(config_home: &Path) -> PathBuf {
 
 fn client_external_open_log_path(config_home: &Path) -> PathBuf {
     config_home.join("client-external-open.log")
+}
+
+fn client_external_open_forward_port_path(config_home: &Path) -> PathBuf {
+    config_home.join("client-external-open-forward-port")
+}
+
+fn client_external_open_suppress_ready_path(config_home: &Path) -> PathBuf {
+    config_home.join("client-external-open-suppress-ready")
+}
+
+fn client_external_open_suppress_result_path(config_home: &Path) -> PathBuf {
+    config_home.join("client-external-open-suppress-result")
+}
+
+fn client_external_open_reject_path(config_home: &Path) -> PathBuf {
+    config_home.join("client-external-open-reject")
+}
+
+fn client_external_open_action_path(config_home: &Path) -> PathBuf {
+    config_home.join("client-external-open-action")
+}
+
+fn external_open_id_exhaustion_path(config_home: &Path) -> PathBuf {
+    config_home.join("external-open-id-exhaustion")
 }
 
 fn set_test_monotonic_time(path: &Path, elapsed: Duration) {
@@ -473,19 +532,72 @@ fn all_external_open_settlement_lines(path: &Path) -> Vec<String> {
 }
 
 fn external_open_settlement_lines(path: &Path, request_id: u64) -> Vec<String> {
-    let request_id = format!("request_id={request_id}");
     all_external_open_settlement_lines(path)
         .into_iter()
-        .filter(|line| line.contains(&request_id))
+        .filter(|line| settlement_request_id(line) == Some(request_id))
         .collect()
 }
 
+fn settlement_terminal_id(line: &str) -> Option<&str> {
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix("request_id="))
+}
+
 fn settlement_request_id(line: &str) -> Option<u64> {
-    line.split_whitespace().find_map(|field| {
-        field
-            .strip_prefix("request_id=")
-            .and_then(|value| value.parse().ok())
-    })
+    settlement_terminal_id(line).and_then(|value| value.parse().ok())
+}
+
+fn assert_canonical_external_open_settlement(
+    line: &str,
+    terminal_id: &str,
+    outcome: &str,
+    commit_state: &str,
+    forward_status: &str,
+) {
+    let fields = structured_diagnostic_fields(line, "external-open request settled");
+    assert_eq!(
+        fields
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "request_id",
+            "lifecycle_phase",
+            "outcome",
+            "elapsed_ms",
+            "commit_state",
+            "forward_status",
+        ],
+        "terminal diagnostic must contain only the canonical field allowlist"
+    );
+    assert_eq!(fields[0].1, terminal_id);
+    assert_eq!(fields[1].1, "terminal");
+    assert_eq!(fields[2].1, outcome);
+    fields[3]
+        .1
+        .parse::<u128>()
+        .expect("elapsed_ms must be a canonical integer");
+    assert_eq!(fields[4].1, commit_state);
+    assert_eq!(fields[5].1, forward_status);
+}
+
+fn wait_for_external_open_settlement_count(
+    path: &Path,
+    expected: usize,
+    timeout: Duration,
+) -> Vec<String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let lines = all_external_open_settlement_lines(path);
+        if lines.len() >= expected {
+            return lines;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "external-open settlement count did not reach {expected}; log tail:\n{}",
+        log_tail(path, 80)
+    );
 }
 
 fn wait_for_external_open_settlement(
@@ -1659,6 +1771,919 @@ fn explicit_config_reload_never_advertises_policy_from_terminal_connection_kinds
     }
 
     cleanup_test_base(&base);
+}
+
+#[test]
+fn production_socket_client_loop_invokes_recording_opener_once_for_each_committed_target() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    write_external_open_config(&config_home, true);
+    let server = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+    let (_, link_pane, _) =
+        create_workspace_and_root_terminal(&api_socket, "real-client-opener-authority");
+
+    let server_log = server_log_path(&config_home);
+    let connected_before = count_log_occurrences(&server_log, "client connected");
+    let mut client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+    assert!(wait_for_log_occurrence_count(
+        &server_log,
+        "client connected",
+        connected_before + 1,
+        Duration::from_secs(8),
+    ));
+    let mut observer = connect_full_app_client(&client_socket, 80, 24, false);
+    assert!(wait_for_frame(&mut observer, Duration::from_secs(3)));
+    client.write_input(b"echo real-client-opener-ready\n");
+    assert!(pane_read_recent_contains(
+        &api_socket,
+        &link_pane,
+        "real-client-opener-ready",
+        Duration::from_secs(3),
+    ));
+
+    let cases = [
+        (
+            "direct",
+            "https://example.com/ticket-37-direct",
+            None,
+            "https://example.com/ticket-37-direct",
+            "opened_directly",
+            "no",
+            false,
+        ),
+        (
+            "forwarded-same",
+            "http://127.0.0.1:18081/ticket-37-same",
+            Some(18081_u16),
+            "http://127.0.0.1:18081/ticket-37-same",
+            "opened_through_forward",
+            "same",
+            false,
+        ),
+        (
+            "forwarded-remapped",
+            "http://127.0.0.1:18082/ticket-37-remapped",
+            Some(28082_u16),
+            "http://127.0.0.1:28082/ticket-37-remapped",
+            "opened_through_forward",
+            "remapped",
+            false,
+        ),
+        (
+            "opener-rejected",
+            "https://example.com/ticket-37-opener-rejected",
+            None,
+            "https://example.com/ticket-37-opener-rejected",
+            "platform_open_rejected",
+            "no",
+            true,
+        ),
+    ];
+    let opener_log = client_external_open_log_path(&config_home);
+    assert!(fs::read_to_string(&opener_log)
+        .unwrap_or_default()
+        .is_empty());
+
+    for (
+        index,
+        (label, original_url, forwarded_port, opened_url, outcome, forward_status, reject),
+    ) in cases.into_iter().enumerate()
+    {
+        if let Some(port) = forwarded_port {
+            fs::write(
+                client_external_open_forward_port_path(&config_home),
+                port.to_string(),
+            )
+            .expect("arm deterministic production-client forwarding result");
+        }
+        if reject {
+            fs::write(
+                client_external_open_reject_path(&config_home),
+                b"reject after invoking the recording opener",
+            )
+            .expect("arm deterministic production-client opener rejection");
+        }
+        pane_send_input(&api_socket, &link_pane, &format!("echo {original_url}"));
+        let (column, row) =
+            wait_for_text_position(&mut observer, original_url, Duration::from_secs(8))
+                .unwrap_or_else(|error| panic!("{label} URL should render: {error}"));
+        send_spawned_client_ctrl_click(&mut client, column, row);
+        assert!(
+            wait_for_external_open_log(&opener_log, opened_url, Duration::from_secs(3)),
+            "{label} must invoke the real recording opener after commit"
+        );
+
+        let settlements =
+            wait_for_external_open_settlement_count(&server_log, index + 1, Duration::from_secs(3));
+        let settlement = settlements
+            .get(index)
+            .unwrap_or_else(|| panic!("missing {label} settlement"));
+        let request_id = settlement_terminal_id(settlement).expect("wire request identity");
+        assert!(
+            request_id.parse::<u64>().is_ok(),
+            "committed request uses wire ID"
+        );
+        assert_canonical_external_open_settlement(
+            settlement,
+            request_id,
+            outcome,
+            "committed",
+            forward_status,
+        );
+        assert_eq!(
+            fs::read_to_string(&opener_log)
+                .expect("real client opener log")
+                .lines()
+                .collect::<Vec<_>>(),
+            cases[..=index]
+                .iter()
+                .map(|case| case.3)
+                .collect::<Vec<_>>(),
+            "{label} must invoke the actual opener exactly once"
+        );
+        assert_eq!(
+            external_open_settlement_lines(
+                &server_log,
+                request_id.parse().expect("numeric wire ID"),
+            )
+            .len(),
+            1,
+            "{label} must settle exactly once"
+        );
+    }
+
+    assert_no_server_opener_calls(&config_home);
+    drop(client);
+    cleanup_spawned_herdr(server, base);
+}
+
+#[test]
+fn production_socket_client_loop_reports_practical_precommit_failures_without_opener_authority() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let delivery_failure_path = base.join("real-client-delivery-failure");
+    write_external_open_config(&config_home, true);
+    let server = spawn_server_with_test_controls(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        None,
+        Some(&delivery_failure_path),
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+    let (_, link_pane, _) =
+        create_workspace_and_root_terminal(&api_socket, "real-client-precommit-failures");
+
+    let server_log = server_log_path(&config_home);
+    let connected_before = count_log_occurrences(&server_log, "client connected");
+    let mut client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+    assert!(wait_for_log_occurrence_count(
+        &server_log,
+        "client connected",
+        connected_before + 1,
+        Duration::from_secs(8),
+    ));
+    let mut observer = connect_full_app_client(&client_socket, 80, 24, false);
+    assert!(wait_for_frame(&mut observer, Duration::from_secs(3)));
+    client.write_input(b"echo real-client-precommit-ready\n");
+    assert!(pane_read_recent_contains(
+        &api_socket,
+        &link_pane,
+        "real-client-precommit-ready",
+        Duration::from_secs(3),
+    ));
+
+    let cases = [
+        (
+            "http://user@example.com/ticket-37-userinfo",
+            "authority_userinfo_forbidden",
+        ),
+        ("http://example.com:0/ticket-37-port", "invalid_port"),
+        (
+            "http://127.1/ticket-37-loopback-form",
+            "unsupported_loopback_form",
+        ),
+        (
+            "http://127.0.0.1:18083/ticket-37-managed-ssh",
+            "managed_ssh_required",
+        ),
+    ];
+    let opener_log = client_external_open_log_path(&config_home);
+
+    for (index, (url, outcome)) in cases.into_iter().enumerate() {
+        pane_send_input(&api_socket, &link_pane, &format!("echo {url}"));
+        let (column, row) = wait_for_text_position(&mut observer, url, Duration::from_secs(8))
+            .unwrap_or_else(|error| panic!("{outcome} URL should render: {error}"));
+        send_spawned_client_ctrl_click(&mut client, column, row);
+        let settlements =
+            wait_for_external_open_settlement_count(&server_log, index + 1, Duration::from_secs(3));
+        let settlement = &settlements[index];
+        let request_id = settlement_terminal_id(settlement).expect("wire request identity");
+        assert_canonical_external_open_settlement(
+            settlement,
+            request_id,
+            outcome,
+            "uncommitted",
+            "no",
+        );
+        assert!(
+            fs::read_to_string(&opener_log)
+                .unwrap_or_default()
+                .is_empty(),
+            "{outcome} must not invoke the production client opener"
+        );
+        assert_eq!(
+            external_open_settlement_lines(
+                &server_log,
+                request_id.parse().expect("numeric wire ID"),
+            )
+            .len(),
+            1
+        );
+    }
+
+    let delivery_url = "https://example.com/ticket-37-delivery-failure";
+    pane_send_input(&api_socket, &link_pane, &format!("echo {delivery_url}"));
+    let (column, row) = wait_for_text_position(&mut observer, delivery_url, Duration::from_secs(8))
+        .expect("delivery-failure URL should render");
+    fs::write(&delivery_failure_path, b"fail the next production prepare")
+        .expect("arm production prepare delivery failure");
+    send_spawned_client_ctrl_click(&mut client, column, row);
+    let settlements = wait_for_external_open_settlement_count(
+        &server_log,
+        cases.len() + 1,
+        Duration::from_secs(3),
+    );
+    let settlement = &settlements[cases.len()];
+    let request_id = settlement_terminal_id(settlement).expect("delivery failure wire ID");
+    assert_canonical_external_open_settlement(
+        settlement,
+        request_id,
+        "client_delivery_failed",
+        "uncommitted",
+        "no",
+    );
+    assert!(
+        fs::read_to_string(&opener_log)
+            .unwrap_or_default()
+            .is_empty(),
+        "failed production delivery must not invoke the client opener"
+    );
+    assert_eq!(
+        external_open_settlement_lines(
+            &server_log,
+            request_id.parse().expect("numeric delivery failure ID"),
+        )
+        .len(),
+        1
+    );
+
+    assert_no_server_opener_calls(&config_home);
+    drop(client);
+    cleanup_spawned_herdr(server, base);
+}
+
+#[test]
+fn production_socket_real_client_precommit_lifecycle_never_acquires_opener_authority() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let clock_path = base.join("real-client-precommit-clock");
+    set_test_monotonic_time(&clock_path, Duration::ZERO);
+    write_external_open_config(&config_home, true);
+    let server = spawn_server_with_test_controls(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        Some(&clock_path),
+        None,
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+    let (_, link_pane, _) =
+        create_workspace_and_root_terminal(&api_socket, "real-client-precommit-lifecycle");
+    let server_log = server_log_path(&config_home);
+    let connected_before = count_log_occurrences(&server_log, "client connected");
+    let mut client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+    assert!(wait_for_log_occurrence_count(
+        &server_log,
+        "client connected",
+        connected_before + 1,
+        Duration::from_secs(8),
+    ));
+    let mut observer = connect_full_app_client(&client_socket, 80, 24, false);
+    assert!(wait_for_frame(&mut observer, Duration::from_secs(3)));
+    client.write_input(b"echo real-client-precommit-lifecycle-ready\n");
+    assert!(pane_read_recent_contains(
+        &api_socket,
+        &link_pane,
+        "real-client-precommit-lifecycle-ready",
+        Duration::from_secs(3),
+    ));
+    let url = "https://example.com/ticket-37-precommit-lifecycle";
+    pane_send_input(&api_socket, &link_pane, &format!("echo {url}"));
+    let (column, row) = wait_for_text_position(&mut observer, url, Duration::from_secs(8))
+        .expect("precommit lifecycle URL should render");
+    let suppress_ready_path = client_external_open_suppress_ready_path(&config_home);
+    let opener_log = client_external_open_log_path(&config_home);
+
+    fs::write(&suppress_ready_path, b"hold policy-cancelled readiness")
+        .expect("arm held readiness");
+    send_spawned_client_ctrl_click(&mut client, column, row);
+    wait_for_path_absent(&suppress_ready_path, Duration::from_secs(3));
+    write_external_open_config(&config_home, false);
+    let response = send_json_request(
+        &api_socket,
+        r#"{"id":"ticket-37-disable","method":"server.reload_config","params":{}}"#,
+    );
+    assert!(
+        response.get("result").is_some(),
+        "reload response: {response}"
+    );
+    let settlements =
+        wait_for_external_open_settlement_count(&server_log, 1, Duration::from_secs(3));
+    let cancelled_id = settlement_terminal_id(&settlements[0]).expect("cancelled wire ID");
+    assert_canonical_external_open_settlement(
+        &settlements[0],
+        cancelled_id,
+        "cancelled_before_commit",
+        "uncommitted",
+        "no",
+    );
+    assert!(fs::read_to_string(&opener_log)
+        .unwrap_or_default()
+        .is_empty());
+
+    write_external_open_config(&config_home, true);
+    let response = send_json_request(
+        &api_socket,
+        r#"{"id":"ticket-37-enable","method":"server.reload_config","params":{}}"#,
+    );
+    assert!(
+        response.get("result").is_some(),
+        "reload response: {response}"
+    );
+    assert!(wait_for_log_occurrence_count(
+        &server_log,
+        "external-open policy updated",
+        2,
+        Duration::from_secs(3),
+    ));
+
+    fs::write(&suppress_ready_path, b"hold exact-deadline readiness").expect("arm held readiness");
+    send_spawned_client_ctrl_click(&mut client, column, row);
+    wait_for_path_absent(&suppress_ready_path, Duration::from_secs(3));
+    set_test_monotonic_time(&clock_path, Duration::from_secs(10));
+    assert!(ping_socket(&api_socket).contains("pong"));
+    let settlements =
+        wait_for_external_open_settlement_count(&server_log, 2, Duration::from_secs(3));
+    let timed_out_id = settlement_terminal_id(&settlements[1]).expect("timeout wire ID");
+    assert_canonical_external_open_settlement(
+        &settlements[1],
+        timed_out_id,
+        "timed_out_before_commit",
+        "uncommitted",
+        "no",
+    );
+    assert_ne!(timed_out_id, cancelled_id);
+    assert!(fs::read_to_string(&opener_log)
+        .unwrap_or_default()
+        .is_empty());
+
+    set_test_monotonic_time(&clock_path, Duration::from_secs(11));
+    fs::write(&suppress_ready_path, b"hold disconnect readiness").expect("arm held readiness");
+    send_spawned_client_ctrl_click(&mut client, column, row);
+    wait_for_path_absent(&suppress_ready_path, Duration::from_secs(3));
+    drop(client);
+    let settlements =
+        wait_for_external_open_settlement_count(&server_log, 3, Duration::from_secs(3));
+    let disconnected_id = settlement_terminal_id(&settlements[2]).expect("disconnect wire ID");
+    assert_canonical_external_open_settlement(
+        &settlements[2],
+        disconnected_id,
+        "client_disconnected_before_commit",
+        "uncommitted",
+        "no",
+    );
+    assert_ne!(disconnected_id, timed_out_id);
+    assert_eq!(
+        all_external_open_settlement_lines(&server_log).len(),
+        3,
+        "each real-client precommit terminal family settles exactly once"
+    );
+    assert!(
+        fs::read_to_string(&opener_log).unwrap_or_default().is_empty(),
+        "policy cancellation, exact timeout, and disconnect must invoke the client opener zero times"
+    );
+    assert_no_server_opener_calls(&config_home);
+    cleanup_spawned_herdr(server, base);
+}
+
+#[test]
+fn production_socket_committed_result_loss_invokes_real_opener_once_without_retry() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let clock_path = base.join("real-client-committed-result-loss-clock");
+    set_test_monotonic_time(&clock_path, Duration::ZERO);
+    write_external_open_config(&config_home, true);
+    let server = spawn_server_with_test_controls(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        Some(&clock_path),
+        None,
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+    let (_, link_pane, _) =
+        create_workspace_and_root_terminal(&api_socket, "real-client-committed-result-loss");
+    let server_log = server_log_path(&config_home);
+    let connected_before = count_log_occurrences(&server_log, "client connected");
+    let mut client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+    assert!(wait_for_log_occurrence_count(
+        &server_log,
+        "client connected",
+        connected_before + 1,
+        Duration::from_secs(8),
+    ));
+    let mut observer = connect_full_app_client(&client_socket, 80, 24, false);
+    assert!(wait_for_frame(&mut observer, Duration::from_secs(3)));
+    client.write_input(b"echo real-client-result-loss-ready\n");
+    assert!(pane_read_recent_contains(
+        &api_socket,
+        &link_pane,
+        "real-client-result-loss-ready",
+        Duration::from_secs(3),
+    ));
+    let opener_log = client_external_open_log_path(&config_home);
+    let suppress_result_path = client_external_open_suppress_result_path(&config_home);
+
+    let deadline_url = "https://example.com/ticket-37-committed-deadline-loss";
+    pane_send_input(&api_socket, &link_pane, &format!("echo {deadline_url}"));
+    let (column, row) = wait_for_text_position(&mut observer, deadline_url, Duration::from_secs(8))
+        .expect("committed deadline URL should render");
+    fs::write(&suppress_result_path, b"lose the next committed result")
+        .expect("arm committed result loss");
+    send_spawned_client_ctrl_click(&mut client, column, row);
+    wait_for_path_absent(&suppress_result_path, Duration::from_secs(3));
+    assert!(wait_for_external_open_log(
+        &opener_log,
+        deadline_url,
+        Duration::from_secs(3),
+    ));
+    set_test_monotonic_time(&clock_path, Duration::from_secs(10));
+    assert!(ping_socket(&api_socket).contains("pong"));
+    let settlements =
+        wait_for_external_open_settlement_count(&server_log, 1, Duration::from_secs(3));
+    let deadline_id = settlement_terminal_id(&settlements[0]).expect("deadline wire ID");
+    assert_canonical_external_open_settlement(
+        &settlements[0],
+        deadline_id,
+        "committed_outcome_unknown",
+        "committed",
+        "no",
+    );
+    assert_eq!(
+        fs::read_to_string(&opener_log)
+            .expect("real opener log")
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![deadline_url],
+        "committed deadline result loss must not retry the opener"
+    );
+
+    set_test_monotonic_time(&clock_path, Duration::from_secs(11));
+    fs::write(&suppress_result_path, b"lose the next committed result")
+        .expect("arm committed result loss");
+    send_spawned_client_ctrl_click(&mut client, column, row);
+    wait_for_path_absent(&suppress_result_path, Duration::from_secs(3));
+    assert!(wait_for_log_occurrence_count(
+        &opener_log,
+        deadline_url,
+        2,
+        Duration::from_secs(3),
+    ));
+    drop(client);
+    let settlements =
+        wait_for_external_open_settlement_count(&server_log, 2, Duration::from_secs(3));
+    let disconnect_id = settlement_terminal_id(&settlements[1]).expect("disconnect wire ID");
+    assert_canonical_external_open_settlement(
+        &settlements[1],
+        disconnect_id,
+        "committed_outcome_unknown",
+        "committed",
+        "no",
+    );
+    assert_ne!(disconnect_id, deadline_id);
+    assert_eq!(
+        fs::read_to_string(&opener_log)
+            .expect("real opener log")
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![deadline_url, deadline_url],
+        "committed disconnect result loss must not retry either opener"
+    );
+    assert_eq!(
+        all_external_open_settlement_lines(&server_log).len(),
+        2,
+        "each committed result-loss family settles exactly once"
+    );
+    assert_no_server_opener_calls(&config_home);
+    cleanup_spawned_herdr(server, base);
+}
+
+#[test]
+fn production_socket_preparation_failure_matrix_is_canonical_and_has_no_fallback_authority() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let clock_path = base.join("preparation-matrix-clock");
+    set_test_monotonic_time(&clock_path, Duration::ZERO);
+    write_external_open_config(&config_home, true);
+    let server = spawn_server_with_test_controls(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        Some(&clock_path),
+        None,
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+    let (_, link_pane, _) =
+        create_workspace_and_root_terminal(&api_socket, "preparation-failure-matrix");
+    let server_log = server_log_path(&config_home);
+    let connected_before = count_log_occurrences(&server_log, "client connected");
+    let mut source = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+    assert!(wait_for_log_occurrence_count(
+        &server_log,
+        "client connected",
+        connected_before + 1,
+        Duration::from_secs(8),
+    ));
+    let mut observer = connect_full_app_client(&client_socket, 100, 30, false);
+    assert!(wait_for_frame(&mut observer, Duration::from_secs(3)));
+    source.write_input(b"echo spawned-preparation-matrix-ready\n");
+    assert!(pane_read_recent_contains(
+        &api_socket,
+        &link_pane,
+        "spawned-preparation-matrix-ready",
+        Duration::from_secs(3),
+    ));
+
+    let url = "https://example.com/ticket-37-preparation-matrix";
+    pane_send_input(&api_socket, &link_pane, &format!("echo {url}"));
+    let (column, row) = wait_for_text_position(&mut observer, url, Duration::from_secs(8))
+        .expect("observer should locate matrix URL");
+    let cases = [
+        "unsupported_scheme",
+        "authority_userinfo_forbidden",
+        "invalid_port",
+        "invalid_absolute_url",
+        "unsupported_loopback_form",
+        "loopback_unsupported_on_platform",
+        "managed_ssh_required",
+        "forwarding_unavailable",
+        "too_many_opens_in_progress",
+        "too_many_forward_requests",
+        "too_many_mapping_waiters",
+        "forward_capacity_exhausted",
+        "forward_bind_exhausted",
+        "atomic_forward_creation_failed",
+        "forward_command_rejected",
+        "forward_command_timed_out",
+    ];
+    let action_path = client_external_open_action_path(&config_home);
+    let opener_log = client_external_open_log_path(&config_home);
+
+    for (index, outcome) in cases.into_iter().enumerate() {
+        fs::write(&action_path, format!("failure current {outcome}\n"))
+            .expect("queue spawned-client preparation failure");
+        send_spawned_client_ctrl_click(&mut source, column, row);
+        wait_for_path_absent(&action_path, Duration::from_secs(3));
+        let settlements =
+            wait_for_external_open_settlement_count(&server_log, index + 1, Duration::from_secs(3));
+        let settlement = &settlements[index];
+        let request_id = settlement_request_id(settlement).expect("spawned-client wire ID");
+        assert_canonical_external_open_settlement(
+            settlement,
+            &request_id.to_string(),
+            outcome,
+            "uncommitted",
+            "no",
+        );
+        assert_eq!(
+            external_open_settlement_lines(&server_log, request_id).len(),
+            1,
+            "{outcome} must settle exactly once",
+        );
+        assert!(
+            fs::read_to_string(&opener_log)
+                .unwrap_or_default()
+                .is_empty(),
+            "{outcome} must leave the actual spawned-client opener log empty",
+        );
+    }
+
+    fs::write(
+        &action_path,
+        concat!(
+            "failure current invalid_absolute_url\n",
+            "failure current invalid_absolute_url\n",
+            "ready current\n",
+            "result current\n",
+            "failure unknown invalid_absolute_url\n",
+            "ready unknown\n",
+            "result unknown\n",
+        ),
+    )
+    .expect("queue duplicate, stale, late, and unknown spawned-client traffic");
+    send_spawned_client_ctrl_click(&mut source, column, row);
+    wait_for_path_absent(&action_path, Duration::from_secs(3));
+    let settlements = wait_for_external_open_settlement_count(
+        &server_log,
+        cases.len() + 1,
+        Duration::from_secs(3),
+    );
+    let ignored_id =
+        settlement_request_id(&settlements[cases.len()]).expect("ignored-race wire ID");
+    assert_canonical_external_open_settlement(
+        &settlements[cases.len()],
+        &ignored_id.to_string(),
+        "invalid_absolute_url",
+        "uncommitted",
+        "no",
+    );
+    assert_eq!(
+        external_open_settlement_lines(&server_log, ignored_id).len(),
+        1
+    );
+    assert!(fs::read_to_string(&opener_log)
+        .unwrap_or_default()
+        .is_empty());
+
+    fs::write(
+        &action_path,
+        "result current\nfailure current invalid_absolute_url\n",
+    )
+    .expect("queue invalid result before readiness");
+    send_spawned_client_ctrl_click(&mut source, column, row);
+    wait_for_path_absent(&action_path, Duration::from_secs(3));
+    let settlements = wait_for_external_open_settlement_count(
+        &server_log,
+        cases.len() + 2,
+        Duration::from_secs(3),
+    );
+    let invalid_id =
+        settlement_request_id(&settlements[cases.len() + 1]).expect("invalid-result wire ID");
+    assert_canonical_external_open_settlement(
+        &settlements[cases.len() + 1],
+        &invalid_id.to_string(),
+        "invalid_client_result",
+        "uncommitted",
+        "no",
+    );
+    assert_eq!(
+        external_open_settlement_lines(&server_log, invalid_id).len(),
+        1
+    );
+    assert!(fs::read_to_string(&opener_log)
+        .unwrap_or_default()
+        .is_empty());
+
+    fs::write(&action_path, "suppress\n").expect("queue suppressed readiness");
+    send_spawned_client_ctrl_click(&mut source, column, row);
+    wait_for_path_absent(&action_path, Duration::from_secs(3));
+    let foreign_id = invalid_id.checked_add(1).expect("next source request ID");
+    assert!(
+        external_open_settlement_lines(&server_log, foreign_id).is_empty(),
+        "the synchronized suppressed request must remain live before mismatched traffic",
+    );
+
+    let connected_before = count_log_occurrences(&server_log, "client connected");
+    let mut mismatched = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+    assert!(wait_for_log_occurrence_count(
+        &server_log,
+        "client connected",
+        connected_before + 1,
+        Duration::from_secs(8),
+    ));
+    mismatched.write_input(b"echo spawned-mismatched-source-ready\n");
+    assert!(pane_read_recent_contains(
+        &api_socket,
+        &link_pane,
+        "spawned-mismatched-source-ready",
+        Duration::from_secs(3),
+    ));
+    fs::write(
+        &action_path,
+        format!(
+            "failure {foreign_id} invalid_absolute_url\nfailure {ignored_id} invalid_absolute_url\nfailure current invalid_absolute_url\n"
+        ),
+    )
+    .expect("queue mismatched-source, stale, and matching spawned-client traffic");
+    send_spawned_client_ctrl_click(&mut mismatched, column, row);
+    wait_for_path_absent(&action_path, Duration::from_secs(3));
+    let settlements = wait_for_external_open_settlement_count(
+        &server_log,
+        cases.len() + 3,
+        Duration::from_secs(3),
+    );
+    let mismatched_id = settlement_request_id(&settlements[cases.len() + 2])
+        .expect("mismatched-source request wire ID");
+    assert_canonical_external_open_settlement(
+        &settlements[cases.len() + 2],
+        &mismatched_id.to_string(),
+        "invalid_absolute_url",
+        "uncommitted",
+        "no",
+    );
+    assert!(
+        external_open_settlement_lines(&server_log, foreign_id).is_empty(),
+        "mismatched traffic must not settle another spawned client's live request",
+    );
+    assert_eq!(
+        external_open_settlement_lines(&server_log, ignored_id).len(),
+        1,
+        "mismatched stale traffic must not revive a settled source request",
+    );
+
+    write_external_open_config(&config_home, false);
+    let response = send_json_request(
+        &api_socket,
+        r#"{"id":"ticket-37-matrix-disable","method":"server.reload_config","params":{}}"#,
+    );
+    assert!(
+        response.get("result").is_some(),
+        "reload response: {response}",
+    );
+    let settlements = wait_for_external_open_settlement_count(
+        &server_log,
+        cases.len() + 4,
+        Duration::from_secs(3),
+    );
+    let cancellation = external_open_settlement_lines(&server_log, foreign_id);
+    assert_eq!(cancellation.len(), 1);
+    assert_canonical_external_open_settlement(
+        &cancellation[0],
+        &foreign_id.to_string(),
+        "cancelled_before_commit",
+        "uncommitted",
+        "no",
+    );
+    assert_eq!(
+        settlements.len(),
+        cases.len() + 4,
+        "duplicate, stale, unknown, late, and mismatched traffic adds no settlement",
+    );
+    assert!(
+        fs::read_to_string(&opener_log)
+            .unwrap_or_default()
+            .is_empty(),
+        "all spawned-client precommit and ignored cases must leave its actual opener log empty",
+    );
+    assert_no_server_opener_calls(&config_home);
+
+    drop(mismatched);
+    drop(source);
+    cleanup_spawned_herdr(server, base);
+}
+
+#[test]
+fn production_socket_admission_matrix_uses_tagged_attempts_without_opener_authority() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let clock_path = base.join("admission-matrix-clock");
+    set_test_monotonic_time(&clock_path, Duration::ZERO);
+    write_external_open_config(&config_home, true);
+    let server = spawn_server_with_test_controls(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        Some(&clock_path),
+        None,
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+    let (_, link_pane, _) = create_workspace_and_root_terminal(&api_socket, "admission-matrix");
+    let server_log = server_log_path(&config_home);
+    let connected_before = count_log_occurrences(&server_log, "client connected");
+    let mut capacity_source = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+    assert!(wait_for_log_occurrence_count(
+        &server_log,
+        "client connected",
+        connected_before + 1,
+        Duration::from_secs(8),
+    ));
+    let mut observer = connect_full_app_client(&client_socket, 80, 24, false);
+    assert!(wait_for_frame(&mut observer, Duration::from_secs(3)));
+    capacity_source.write_input(b"echo real-admission-source-ready\n");
+    assert!(pane_read_recent_contains(
+        &api_socket,
+        &link_pane,
+        "real-admission-source-ready",
+        Duration::from_secs(3),
+    ));
+
+    let url = "https://example.com/ticket-37-admission";
+    pane_send_input(&api_socket, &link_pane, &format!("echo {url}"));
+    let (column, row) = wait_for_text_position(&mut observer, url, Duration::from_secs(8))
+        .expect("admission URL should render");
+    let suppress_ready_path = client_external_open_suppress_ready_path(&config_home);
+    for _ in 0..32 {
+        fs::write(
+            &suppress_ready_path,
+            b"hold the next readiness before commit",
+        )
+        .expect("arm production-client readiness hold");
+        send_spawned_client_ctrl_click(&mut capacity_source, column, row);
+        wait_for_path_absent(&suppress_ready_path, Duration::from_secs(3));
+    }
+    assert!(
+        fs::read_to_string(client_external_open_log_path(&config_home))
+            .unwrap_or_default()
+            .is_empty(),
+        "32 preparing requests must invoke the actual client opener zero times"
+    );
+    send_spawned_client_ctrl_click(&mut capacity_source, column, row);
+    let settlements =
+        wait_for_external_open_settlement_count(&server_log, 1, Duration::from_secs(3));
+    assert_canonical_external_open_settlement(
+        &settlements[0],
+        "admission:1",
+        "too_many_opens_in_progress",
+        "uncommitted",
+        "no",
+    );
+    assert!(
+        settlement_request_id(&settlements[0]).is_none(),
+        "admission attempts must not masquerade as wire request IDs"
+    );
+
+    let connected_before = count_log_occurrences(&server_log, "client connected");
+    let mut exhausted_source = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+    assert!(wait_for_log_occurrence_count(
+        &server_log,
+        "client connected",
+        connected_before + 1,
+        Duration::from_secs(8),
+    ));
+    fs::write(
+        external_open_id_exhaustion_path(&config_home),
+        b"exhaust the next source attachment",
+    )
+    .expect("arm request-ID exhaustion control");
+    send_spawned_client_ctrl_click(&mut exhausted_source, column, row);
+    let settlements =
+        wait_for_external_open_settlement_count(&server_log, 2, Duration::from_secs(3));
+    assert_canonical_external_open_settlement(
+        &settlements[1],
+        "admission:2",
+        "too_many_opens_in_progress",
+        "uncommitted",
+        "no",
+    );
+    assert!(settlement_request_id(&settlements[1]).is_none());
+    assert_eq!(
+        all_external_open_settlement_lines(&server_log).len(),
+        2,
+        "each rejected attempt settles exactly once"
+    );
+    assert!(
+        fs::read_to_string(client_external_open_log_path(&config_home))
+            .unwrap_or_default()
+            .is_empty(),
+        "capacity and ID exhaustion must invoke both production client openers zero times"
+    );
+    assert_no_server_opener_calls(&config_home);
+
+    drop(exhausted_source);
+    drop(capacity_source);
+    cleanup_spawned_herdr(server, base);
 }
 
 #[test]

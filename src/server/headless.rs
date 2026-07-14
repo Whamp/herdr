@@ -2604,6 +2604,11 @@ impl HeadlessServer {
                             }
                         }
                         Some(crate::protocol::ExternalOpenPolicy::Enabled) => {
+                            #[cfg(debug_assertions)]
+                            if external_open_id_exhaustion_armed_for_test() {
+                                self.external_open_attachments
+                                    .exhaust_request_ids_for_test(client_id);
+                            }
                             let dispatch = match self
                                 .external_open_attachments
                                 .start(client_id, accepted_at)
@@ -2612,23 +2617,10 @@ impl HeadlessServer {
                                 Err(crate::server::external_open::ExternalOpenAdmissionError::NotAuthorized) => {
                                     continue;
                                 }
-                                Err(crate::server::external_open::ExternalOpenAdmissionError::TooManyInProgress) => {
-                                    let outcome = crate::server::external_open::ExternalOpenTerminalOutcome::PreparationFailed(
-                                        crate::protocol::ExternalOpenPreparationFailure::TooManyOpensInProgress,
+                                Err(crate::server::external_open::ExternalOpenAdmissionError::Closed(closed)) => {
+                                    self.report_external_open_transition(
+                                        crate::server::external_open::ExternalOpenTransition::Closed(closed),
                                     );
-                                    if let Some(message) = outcome.notice_message() {
-                                        let _ = self.client_projections.apply(
-                                            client_id,
-                                            crate::server::client_projection::ClientProjectionAction::ShowNotice {
-                                                message,
-                                                now: accepted_at,
-                                            },
-                                        );
-                                    }
-                                    continue;
-                                }
-                                Err(crate::server::external_open::ExternalOpenAdmissionError::RequestIdsExhausted) => {
-                                    warn!("external-open request id space exhausted");
                                     continue;
                                 }
                             };
@@ -2677,7 +2669,7 @@ impl HeadlessServer {
         };
         let now = self.external_open_clock.now();
         info!(
-            request_id = closed.request_id,
+            request_id = %closed.terminal_id,
             lifecycle_phase = "terminal",
             outcome = closed.outcome.canonical_outcome(),
             elapsed_ms = closed.elapsed_ms(now),
@@ -2738,12 +2730,9 @@ impl HeadlessServer {
             .external_open_attachments
             .cancel_preparing_for_client(client_id);
         for closed in closed {
-            self.send_to_client(
-                client_id,
-                ServerMessage::ExternalOpenCancel {
-                    request_id: closed.request_id,
-                },
-            );
+            if let Some(request_id) = closed.wire_request_id() {
+                self.send_to_client(client_id, ServerMessage::ExternalOpenCancel { request_id });
+            }
             self.report_external_open_transition(
                 crate::server::external_open::ExternalOpenTransition::Closed(closed),
             );
@@ -4149,12 +4138,12 @@ impl HeadlessServer {
             if closed.outcome
                 == crate::server::external_open::ExternalOpenTerminalOutcome::TimedOutBeforeCommit
             {
-                self.send_to_client(
-                    closed.client_id,
-                    ServerMessage::ExternalOpenCancel {
-                        request_id: closed.request_id,
-                    },
-                );
+                if let Some(request_id) = closed.wire_request_id() {
+                    self.send_to_client(
+                        closed.client_id,
+                        ServerMessage::ExternalOpenCancel { request_id },
+                    );
+                }
             }
             changed |= self.report_external_open_transition(
                 crate::server::external_open::ExternalOpenTransition::Closed(closed),
@@ -4393,6 +4382,14 @@ async fn sleep_until_or_pending(deadline: Option<Instant>) {
 #[cfg(debug_assertions)]
 fn external_open_delivery_failure_armed_for_test() -> bool {
     let Some(path) = std::env::var_os("HERDR_TEST_EXTERNAL_OPEN_DELIVERY_FAILURE_PATH") else {
+        return false;
+    };
+    std::fs::remove_file(path).is_ok()
+}
+
+#[cfg(debug_assertions)]
+fn external_open_id_exhaustion_armed_for_test() -> bool {
+    let Some(path) = std::env::var_os("HERDR_TEST_EXTERNAL_OPEN_ID_EXHAUSTION_PATH") else {
         return false;
     };
     std::fs::remove_file(path).is_ok()
@@ -4705,6 +4702,140 @@ mod tests {
 
     use crate::app::AppState;
     use crate::protocol::CursorState;
+
+    #[derive(Clone, Default)]
+    struct CapturedTracingEvents(
+        std::sync::Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>,
+    );
+
+    impl<S> tracing_subscriber::Layer<S> for CapturedTracingEvents
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = std::collections::BTreeMap::new();
+            event.record(&mut TracingFieldVisitor(&mut fields));
+            self.0.lock().expect("captured tracing events").push(fields);
+        }
+    }
+
+    struct TracingFieldVisitor<'a>(&'a mut std::collections::BTreeMap<String, String>);
+
+    impl tracing::field::Visit for TracingFieldVisitor<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    fn capture_tracing_events(
+        capture: CapturedTracingEvents,
+        action: impl FnOnce(),
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        use tracing_subscriber::prelude::*;
+
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        tracing::subscriber::with_default(subscriber, action);
+        std::mem::take(&mut *capture.0.lock().expect("captured tracing events"))
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct TerminalTraceExpectation<'a> {
+        request_id: &'a str,
+        outcome: &'a str,
+        commit_state: &'a str,
+        forward_status: &'a str,
+    }
+
+    fn assert_terminal_traces(
+        events: Vec<std::collections::BTreeMap<String, String>>,
+        expected: &[TerminalTraceExpectation<'_>],
+    ) {
+        let terminal = events
+            .into_iter()
+            .filter(|fields| {
+                fields.get("message").map(String::as_str) == Some("external-open request settled")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            terminal.len(),
+            expected.len(),
+            "terminal traces: {terminal:?}"
+        );
+        for (fields, expected) in terminal.iter().zip(expected) {
+            assert_eq!(
+                fields
+                    .keys()
+                    .filter(|name| name.as_str() != "message")
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                vec![
+                    "commit_state",
+                    "elapsed_ms",
+                    "forward_status",
+                    "lifecycle_phase",
+                    "outcome",
+                    "request_id",
+                ],
+                "terminal trace schema changed: {fields:?}"
+            );
+            assert_eq!(
+                fields.get("request_id").map(String::as_str),
+                Some(expected.request_id)
+            );
+            assert_eq!(
+                fields.get("lifecycle_phase").map(String::as_str),
+                Some("terminal")
+            );
+            assert_eq!(
+                fields.get("outcome").map(String::as_str),
+                Some(expected.outcome)
+            );
+            assert_eq!(
+                fields.get("commit_state").map(String::as_str),
+                Some(expected.commit_state)
+            );
+            assert_eq!(
+                fields.get("forward_status").map(String::as_str),
+                Some(expected.forward_status)
+            );
+            assert!(
+                fields
+                    .get("elapsed_ms")
+                    .is_some_and(|value| value.parse::<u128>().is_ok()),
+                "elapsed_ms must be numeric: {fields:?}"
+            );
+        }
+
+        let captured = format!("{terminal:?}");
+        for forbidden in [
+            "https://private-sentinel.example:43177/path-sentinel?token=query-sentinel#fragment-sentinel",
+            "private-sentinel.example",
+            "43177",
+            "path-sentinel",
+            "query-sentinel",
+            "fragment-sentinel",
+            "browser-sentinel",
+            "ssh-target-sentinel",
+            "control-path-sentinel",
+            "argument-sentinel",
+            "raw-error-sentinel",
+            "PlatformOpenRejected",
+            "PreparationFailed(",
+        ] {
+            assert!(
+                !captured.contains(forbidden),
+                "terminal trace leaked {forbidden:?}: {captured}"
+            );
+        }
+    }
 
     fn test_headless_server() -> HeadlessServer {
         test_headless_server_with_event_hub(api::EventHub::default())
@@ -5165,21 +5296,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn wait_for_client_frame_writes(server: &mut HeadlessServer, client_ids: &[u64]) {
-        let mut pending: std::collections::BTreeSet<u64> = client_ids.iter().copied().collect();
-        while !pending.is_empty() {
-            let event = server
-                .server_event_rx
-                .blocking_recv()
-                .expect("client frame write event");
-            if let ServerEvent::ClientFrameWritten { client_id, .. } = &event {
-                pending.remove(client_id);
-            }
-            server.handle_server_event(event);
-        }
-    }
-
-    #[cfg(unix)]
     fn assert_client_writer_reaches_barrier_without_prior_message(
         server: &HeadlessServer,
         client_id: u64,
@@ -5617,6 +5733,245 @@ mod tests {
         );
     }
 
+    #[test]
+    fn terminal_external_open_trace_has_only_the_six_allowlisted_semantic_fields() {
+        let mut server = test_headless_server();
+        let (writer, control_rx, _render_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(writer),
+            ),
+        );
+        connect_client_projection(&mut server, 1, crate::protocol::ExternalOpenPolicy::Enabled);
+        let private_url = concat!(
+            "https://userinfo-sentinel@host-sentinel.example:43177/path-sentinel?",
+            "query=query-sentinel&browser=browser-sentinel&ssh_target=ssh-target-sentinel&",
+            "control_path=control-path-sentinel&args=argument-sentinel&",
+            "raw_error=raw-error-sentinel#fragment-sentinel"
+        );
+
+        let events = capture_tracing_events(CapturedTracingEvents::default(), || {
+            server.handle_host_actions(
+                1,
+                vec![crate::app::HostAction::OpenExternalUrl {
+                    url: private_url.to_owned(),
+                }],
+                Instant::now(),
+            );
+            let request_id = match read_server_message(control_rx.recv().expect("prepare")) {
+                ServerMessage::ExternalOpenPrepare { request_id, url } => {
+                    assert_eq!(url, private_url);
+                    request_id
+                }
+                other => panic!("expected prepare, got {other:?}"),
+            };
+            assert!(
+                server.handle_server_event(ServerEvent::ExternalOpenPreparationFailed {
+                    client_id: 1,
+                    request_id,
+                    reason: crate::protocol::ExternalOpenPreparationFailure::ForwardCommandRejected,
+                })
+            );
+        });
+
+        assert_eq!(events.len(), 1, "unexpected terminal events: {events:?}");
+        let fields = &events[0];
+        assert_eq!(
+            fields
+                .keys()
+                .filter(|name| name.as_str() != "message")
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "commit_state",
+                "elapsed_ms",
+                "forward_status",
+                "lifecycle_phase",
+                "outcome",
+                "request_id",
+            ]
+        );
+        assert_eq!(
+            fields.get("message").map(String::as_str),
+            Some("external-open request settled")
+        );
+        assert_eq!(fields.get("request_id").map(String::as_str), Some("1"));
+        assert_eq!(
+            fields.get("lifecycle_phase").map(String::as_str),
+            Some("terminal")
+        );
+        assert_eq!(
+            fields.get("outcome").map(String::as_str),
+            Some("forward_command_rejected")
+        );
+        assert_eq!(
+            fields.get("commit_state").map(String::as_str),
+            Some("uncommitted")
+        );
+        assert_eq!(fields.get("forward_status").map(String::as_str), Some("no"));
+        assert!(
+            fields
+                .get("elapsed_ms")
+                .is_some_and(|value| value.parse::<u128>().is_ok()),
+            "elapsed_ms must be numeric: {fields:?}"
+        );
+
+        let captured = format!("{events:?}");
+        for forbidden in [
+            private_url,
+            "https",
+            "userinfo-sentinel",
+            "host-sentinel.example",
+            "43177",
+            "path-sentinel",
+            "query-sentinel",
+            "fragment-sentinel",
+            "browser-sentinel",
+            "ssh-target-sentinel",
+            "control-path-sentinel",
+            "argument-sentinel",
+            "raw-error-sentinel",
+            "PreparationFailed(ForwardCommandRejected)",
+            "ForwardCommandRejected",
+        ] {
+            assert!(
+                !captured.contains(forbidden),
+                "trace leaked {forbidden:?}: {captured}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_and_vanished_source_settle_once_while_late_races_emit_nothing() {
+        use crate::server::external_open::{ExternalOpenTerminalOutcome, ExternalOpenTransition};
+
+        let mut cancelled_server = test_headless_server();
+        cancelled_server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                None,
+            ),
+        );
+        connect_client_projection(
+            &mut cancelled_server,
+            1,
+            crate::protocol::ExternalOpenPolicy::Enabled,
+        );
+        let cancelled = cancelled_server
+            .external_open_attachments
+            .start(1, Instant::now())
+            .expect("cancelled request");
+        let closed = cancelled_server
+            .external_open_attachments
+            .cancel_preparing_for_client(1)
+            .into_iter()
+            .find(|closed| closed.wire_request_id() == Some(cancelled.request_id()))
+            .expect("cancelled settlement");
+        assert_eq!(
+            closed.outcome,
+            ExternalOpenTerminalOutcome::CancelledBeforeCommit
+        );
+        let cancelled_events = capture_tracing_events(CapturedTracingEvents::default(), || {
+            assert!(!cancelled_server
+                .report_external_open_transition(ExternalOpenTransition::Closed(closed)));
+            let late = cancelled_server
+                .external_open_attachments
+                .preparation_failed(
+                    1,
+                    cancelled.request_id(),
+                    crate::protocol::ExternalOpenPreparationFailure::ForwardCommandRejected,
+                    Instant::now(),
+                );
+            assert_eq!(late, ExternalOpenTransition::Ignored);
+            assert!(!cancelled_server.report_external_open_transition(late));
+        });
+        assert_eq!(
+            cancelled_events
+                .iter()
+                .filter_map(|fields| fields.get("outcome").map(String::as_str))
+                .collect::<Vec<_>>(),
+            vec!["cancelled_before_commit"]
+        );
+        assert_eq!(client_projection_notice(&cancelled_server, 1), None);
+
+        let mut disconnected_server = test_headless_server();
+        disconnected_server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                None,
+            ),
+        );
+        connect_client_projection(
+            &mut disconnected_server,
+            1,
+            crate::protocol::ExternalOpenPolicy::Enabled,
+        );
+        let accepted_at = Instant::now();
+        let preparing = disconnected_server
+            .external_open_attachments
+            .start(1, accepted_at)
+            .expect("preparing disconnect request");
+        let committed = disconnected_server
+            .external_open_attachments
+            .start(1, accepted_at)
+            .expect("committed disconnect request");
+        assert_eq!(
+            disconnected_server.external_open_attachments.ready(
+                1,
+                committed.request_id(),
+                crate::protocol::ExternalOpenTarget::Direct,
+                accepted_at + Duration::from_millis(1),
+                |_| true,
+            ),
+            ExternalOpenTransition::Committed
+        );
+        let disconnected_events = capture_tracing_events(CapturedTracingEvents::default(), || {
+            assert!(!disconnected_server.remove_client(1));
+            let late = disconnected_server.external_open_attachments.result(
+                1,
+                preparing.request_id(),
+                crate::protocol::ExternalOpenResult::OpenedDirectly,
+                Instant::now(),
+            );
+            assert_eq!(late, ExternalOpenTransition::Ignored);
+            assert!(!disconnected_server.report_external_open_transition(late));
+        });
+        assert_eq!(
+            disconnected_events
+                .iter()
+                .filter_map(|fields| fields.get("outcome").map(String::as_str))
+                .collect::<Vec<_>>(),
+            vec![
+                "client_disconnected_before_commit",
+                "committed_outcome_unknown"
+            ]
+        );
+        assert_eq!(client_projection_notice(&disconnected_server, 1), None);
+        assert!(disconnected_server
+            .external_open_attachments
+            .next_deadline()
+            .is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn preparation_failure_notice_renders_only_on_initiating_socket_after_focus_change() {
@@ -5710,491 +6065,624 @@ mod tests {
         server.remove_all_clients();
     }
 
-    #[cfg(unix)]
     #[test]
-    fn terminal_external_open_categories_obey_source_local_notice_lifecycle() {
+    fn production_external_open_terminal_matrix_is_exhaustive() {
+        use crate::protocol::ExternalOpenPortStatus as PortStatus;
         use crate::protocol::ExternalOpenPreparationFailure as Failure;
-        use crate::server::external_open::{ExternalOpenTerminalOutcome, ExternalOpenTransition};
+        use crate::protocol::ExternalOpenResult as Result;
+        use crate::protocol::ExternalOpenTarget as Target;
 
-        fn assert_source_notice(
+        const PRIVATE_URL: &str = concat!(
+            "https://private-sentinel.example:43177/path-sentinel?",
+            "token=query-sentinel&browser=browser-sentinel&ssh_target=ssh-target-sentinel&",
+            "control_path=control-path-sentinel&args=argument-sentinel&",
+            "raw_error=raw-error-sentinel#fragment-sentinel"
+        );
+
+        fn connected_server() -> (HeadlessServer, std::sync::mpsc::Receiver<Vec<u8>>) {
+            let mut server = test_headless_server();
+            let (writer, control_rx, _render_rx) = test_client_writer();
+            server.clients.insert(
+                1,
+                ClientConnection::new(
+                    (80, 24),
+                    crate::kitty_graphics::HostCellSize::default(),
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    1,
+                    RenderEncoding::SemanticFrame,
+                    Some(writer),
+                ),
+            );
+            connect_client_projection(&mut server, 1, crate::protocol::ExternalOpenPolicy::Enabled);
+            (server, control_rx)
+        }
+
+        fn begin(
             server: &mut HeadlessServer,
-            source_id: u64,
-            source: &mut crate::ipc::LocalStream,
-            other: &mut crate::ipc::LocalStream,
-            expected: &str,
-        ) {
-            server.render_and_stream();
-            let frame =
-                match crate::protocol::read_message::<_, ServerMessage>(source, MAX_FRAME_SIZE)
-                    .expect("initiating client notice frame")
-                {
-                    ServerMessage::Frame(frame) => frame,
-                    message => panic!("expected initiating frame, got {message:?}"),
-                };
-            wait_for_client_frame_writes(server, &[source_id]);
-            let text = frame_text(&frame);
-            assert_eq!(text.matches(expected).count(), 1, "{text}");
-            for secret in [
-                "https://private.example:4317/path?token=secret#fragment",
-                "private.example",
-                "4317",
-                "token=secret",
-                "client-identity-7",
-                "raw platform error",
-            ] {
-                assert!(!text.contains(secret), "notice leaked {secret:?}: {text}");
+            control_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+            accepted_at: Instant,
+        ) -> u64 {
+            server.handle_host_actions(
+                1,
+                vec![crate::app::HostAction::OpenExternalUrl {
+                    url: PRIVATE_URL.to_owned(),
+                }],
+                accepted_at,
+            );
+            match read_server_message(control_rx.recv().expect("external-open prepare")) {
+                ServerMessage::ExternalOpenPrepare { request_id, url } => {
+                    assert_eq!(url, PRIVATE_URL);
+                    request_id
+                }
+                other => panic!("expected prepare, got {other:?}"),
             }
-            let other_id = server
-                .foreground_client_id
-                .expect("other client remains foreground");
-            assert_client_writer_reaches_barrier_without_prior_message(server, other_id, other);
         }
 
-        fn clear_source_notice(
-            server: &mut HeadlessServer,
-            source_id: u64,
-            source: &mut crate::ipc::LocalStream,
-            other: &mut crate::ipc::LocalStream,
+        fn expect_one(
+            events: Vec<std::collections::BTreeMap<String, String>>,
+            request_id: u64,
+            outcome: &str,
+            commit_state: &str,
+            forward_status: &str,
         ) {
-            assert!(server
-                .client_projections
-                .apply(
-                    source_id,
-                    crate::server::client_projection::ClientProjectionAction::DismissNotice,
-                )
-                .changed());
-            server.render_and_stream();
-            assert!(matches!(
-                crate::protocol::read_message::<_, ServerMessage>(source, MAX_FRAME_SIZE)
-                    .expect("notice-cleared source frame"),
-                ServerMessage::Frame(_)
-            ));
-            wait_for_client_frame_writes(server, &[source_id]);
-            let other_id = server
-                .foreground_client_id
-                .expect("other client remains foreground");
-            assert_client_writer_reaches_barrier_without_prior_message(server, other_id, other);
+            let request_id = request_id.to_string();
+            assert_terminal_traces(
+                events,
+                &[TerminalTraceExpectation {
+                    request_id: &request_id,
+                    outcome,
+                    commit_state,
+                    forward_status,
+                }],
+            );
         }
-
-        let mut server = test_headless_server();
-        let (source_id, mut source) =
-            connect_socket_app_client(&mut server, crate::protocol::ExternalOpenPolicy::Enabled);
-        let (other_id, mut other) =
-            connect_socket_app_client(&mut server, crate::protocol::ExternalOpenPolicy::Enabled);
-        server.render_and_stream();
-        assert!(matches!(
-            crate::protocol::read_message::<_, ServerMessage>(&mut source, MAX_FRAME_SIZE)
-                .expect("source baseline"),
-            ServerMessage::Frame(_)
-        ));
-        assert!(matches!(
-            crate::protocol::read_message::<_, ServerMessage>(&mut other, MAX_FRAME_SIZE)
-                .expect("other baseline"),
-            ServerMessage::Frame(_)
-        ));
-        wait_for_client_frame_writes(&mut server, &[source_id, other_id]);
-        server.promote_client_to_foreground(other_id);
 
         let preparation_cases = [
-            (
-                Failure::UnsupportedScheme,
-                "Couldn’t open link · link type isn’t supported",
-            ),
+            (Failure::UnsupportedScheme, "unsupported_scheme"),
             (
                 Failure::AuthorityUserinfoForbidden,
-                "Couldn’t open link · links with credentials aren’t allowed",
+                "authority_userinfo_forbidden",
             ),
-            (Failure::InvalidPort, "Couldn’t open link · link is invalid"),
-            (
-                Failure::InvalidAbsoluteUrl,
-                "Couldn’t open link · link is invalid",
-            ),
+            (Failure::InvalidPort, "invalid_port"),
+            (Failure::InvalidAbsoluteUrl, "invalid_absolute_url"),
             (
                 Failure::UnsupportedLoopbackForm,
-                "Couldn’t open link · link uses an unsupported local address",
+                "unsupported_loopback_form",
             ),
             (
                 Failure::LoopbackUnsupportedOnPlatform,
-                "Couldn’t open link · link uses an unsupported local address",
+                "loopback_unsupported_on_platform",
             ),
-            (
-                Failure::ManagedSshRequired,
-                "Couldn’t open link · managed SSH is required",
-            ),
-            (
-                Failure::ForwardingUnavailable,
-                "Couldn’t open link · local forwarding is unavailable",
-            ),
+            (Failure::ManagedSshRequired, "managed_ssh_required"),
+            (Failure::ForwardingUnavailable, "forwarding_unavailable"),
             (
                 Failure::TooManyOpensInProgress,
-                "Couldn’t open link · too many links are opening",
+                "too_many_opens_in_progress",
             ),
-            (
-                Failure::TooManyForwardRequests,
-                "Couldn’t open link · too many links are opening",
-            ),
-            (
-                Failure::TooManyMappingWaiters,
-                "Couldn’t open link · too many links are opening",
-            ),
+            (Failure::TooManyForwardRequests, "too_many_forward_requests"),
+            (Failure::TooManyMappingWaiters, "too_many_mapping_waiters"),
             (
                 Failure::ForwardCapacityExhausted,
-                "Couldn’t open link · local forwarding limit reached",
+                "forward_capacity_exhausted",
             ),
-            (
-                Failure::ForwardBindExhausted,
-                "Couldn’t open link · local forwarding failed",
-            ),
+            (Failure::ForwardBindExhausted, "forward_bind_exhausted"),
             (
                 Failure::AtomicForwardCreationFailed,
-                "Couldn’t open link · local forwarding failed",
+                "atomic_forward_creation_failed",
+            ),
+            (Failure::ForwardCommandRejected, "forward_command_rejected"),
+            (Failure::ForwardCommandTimedOut, "forward_command_timed_out"),
+        ];
+        let (mut preparation_server, preparation_rx) = connected_server();
+        for (reason, outcome) in preparation_cases {
+            let accepted_at = preparation_server.external_open_clock.now();
+            let request_id = begin(&mut preparation_server, &preparation_rx, accepted_at);
+            let events = capture_tracing_events(CapturedTracingEvents::default(), || {
+                preparation_server.handle_server_event(
+                    ServerEvent::ExternalOpenPreparationFailed {
+                        client_id: 1,
+                        request_id,
+                        reason,
+                    },
+                );
+            });
+            expect_one(events, request_id, outcome, "uncommitted", "no");
+        }
+
+        let committed_cases = [
+            (
+                Target::Direct,
+                Result::OpenedDirectly,
+                "opened_directly",
+                "no",
             ),
             (
-                Failure::ForwardCommandRejected,
-                "Couldn’t open link · local forwarding failed",
+                Target::Forwarded {
+                    port_status: PortStatus::SamePort,
+                },
+                Result::OpenedThroughForward {
+                    port_status: PortStatus::SamePort,
+                },
+                "opened_through_forward",
+                "same",
             ),
             (
-                Failure::ForwardCommandTimedOut,
-                "Couldn’t open link · local forwarding timed out",
+                Target::Forwarded {
+                    port_status: PortStatus::RemappedPort,
+                },
+                Result::OpenedThroughForward {
+                    port_status: PortStatus::RemappedPort,
+                },
+                "opened_through_forward",
+                "remapped",
+            ),
+            (
+                Target::Direct,
+                Result::PlatformOpenRejected,
+                "platform_open_rejected",
+                "no",
+            ),
+            (
+                Target::Direct,
+                Result::OpenedThroughForward {
+                    port_status: PortStatus::SamePort,
+                },
+                "invalid_client_result",
+                "no",
             ),
         ];
-        for (reason, expected) in preparation_cases {
-            let accepted_at = Instant::now();
-            let dispatch = server
-                .external_open_attachments
-                .start(source_id, accepted_at)
-                .expect("preparation case request");
-            let transition = server.external_open_attachments.preparation_failed(
-                source_id,
-                dispatch.request_id(),
-                reason,
-                accepted_at + Duration::from_millis(1),
-            );
-            assert!(server.report_external_open_transition(transition));
-            assert_eq!(server.foreground_client_id, Some(other_id));
-            assert_source_notice(&mut server, source_id, &mut source, &mut other, expected);
-            clear_source_notice(&mut server, source_id, &mut source, &mut other);
-        }
-
-        let accepted_at = Instant::now();
-        let delivery = server
-            .external_open_attachments
-            .start(source_id, accepted_at)
-            .expect("delivery request");
-        let transition = server
-            .external_open_attachments
-            .delivery_failed(source_id, delivery.request_id());
-        assert!(server.report_external_open_transition(transition));
-        assert_source_notice(
-            &mut server,
-            source_id,
-            &mut source,
-            &mut other,
-            "Couldn’t open link · client connection failed",
-        );
-        clear_source_notice(&mut server, source_id, &mut source, &mut other);
-
-        for (result, expected) in [
-            (
-                crate::protocol::ExternalOpenResult::PlatformOpenRejected,
-                "Couldn’t open link · device rejected the open request",
-            ),
-            (
-                crate::protocol::ExternalOpenResult::OpenedThroughForward {
-                    port_status: crate::protocol::ExternalOpenPortStatus::SamePort,
-                },
-                "Couldn’t open link · client response was invalid",
-            ),
-        ] {
-            let accepted_at = Instant::now();
-            let dispatch = server
-                .external_open_attachments
-                .start(source_id, accepted_at)
-                .expect("committed result request");
+        let (mut committed_server, committed_rx) = connected_server();
+        let mut stale_request_id = None;
+        for (target, result, outcome, forward_status) in committed_cases {
+            let accepted_at = committed_server.external_open_clock.now();
+            let request_id = begin(&mut committed_server, &committed_rx, accepted_at);
+            let ignored = capture_tracing_events(CapturedTracingEvents::default(), || {
+                committed_server.handle_server_event(ServerEvent::ExternalOpenResult {
+                    client_id: 99,
+                    request_id,
+                    result,
+                });
+                committed_server.handle_server_event(ServerEvent::ExternalOpenResult {
+                    client_id: 1,
+                    request_id: u64::MAX,
+                    result,
+                });
+                if let Some(stale) = stale_request_id {
+                    committed_server.handle_server_event(ServerEvent::ExternalOpenResult {
+                        client_id: 1,
+                        request_id: stale,
+                        result,
+                    });
+                }
+            });
+            assert_terminal_traces(ignored, &[]);
+            committed_server.handle_server_event(ServerEvent::ExternalOpenReady {
+                client_id: 1,
+                request_id,
+                target,
+            });
             assert_eq!(
-                server.external_open_attachments.ready(
-                    source_id,
-                    dispatch.request_id(),
-                    crate::protocol::ExternalOpenTarget::Direct,
-                    accepted_at + Duration::from_millis(1),
-                    |_| true,
-                ),
-                ExternalOpenTransition::Committed
+                read_server_message(committed_rx.recv().expect("external-open commit")),
+                ServerMessage::ExternalOpenCommit { request_id }
             );
-            let transition = server.external_open_attachments.result(
-                source_id,
-                dispatch.request_id(),
-                result,
-                accepted_at + Duration::from_millis(2),
-            );
-            assert!(server.report_external_open_transition(transition));
-            assert_source_notice(&mut server, source_id, &mut source, &mut other, expected);
-            clear_source_notice(&mut server, source_id, &mut source, &mut other);
+            let events = capture_tracing_events(CapturedTracingEvents::default(), || {
+                committed_server.handle_server_event(ServerEvent::ExternalOpenResult {
+                    client_id: 1,
+                    request_id,
+                    result,
+                });
+            });
+            expect_one(events, request_id, outcome, "committed", forward_status);
+            let duplicate = capture_tracing_events(CapturedTracingEvents::default(), || {
+                committed_server.handle_server_event(ServerEvent::ExternalOpenResult {
+                    client_id: 1,
+                    request_id,
+                    result,
+                });
+            });
+            assert_terminal_traces(duplicate, &[]);
+            stale_request_id = Some(request_id);
         }
 
-        let accepted_at = Instant::now();
-        let invalid_before_commit = server
-            .external_open_attachments
-            .start(source_id, accepted_at)
-            .expect("invalid pre-commit result request");
-        let transition = server.external_open_attachments.result(
-            source_id,
-            invalid_before_commit.request_id(),
-            crate::protocol::ExternalOpenResult::OpenedDirectly,
-            accepted_at + Duration::from_millis(1),
-        );
-        assert!(server.report_external_open_transition(transition));
-        assert_source_notice(
-            &mut server,
-            source_id,
-            &mut source,
-            &mut other,
-            "Couldn’t open link · client response was invalid",
-        );
-        clear_source_notice(&mut server, source_id, &mut source, &mut other);
-
-        let accepted_at = Instant::now();
-        let timed_out = server
-            .external_open_attachments
-            .start(source_id, accepted_at)
-            .expect("pre-commit timeout request");
-        let closed = server
-            .external_open_attachments
-            .expire_due(timed_out.deadline())
-            .pop()
-            .expect("pre-commit timeout");
-        assert!(server.report_external_open_transition(ExternalOpenTransition::Closed(closed)));
-        assert_source_notice(
-            &mut server,
-            source_id,
-            &mut source,
-            &mut other,
-            "Couldn’t open link · request timed out before opening",
-        );
-        clear_source_notice(&mut server, source_id, &mut source, &mut other);
-
-        let accepted_at = Instant::now();
-        let committed_unknown = server
-            .external_open_attachments
-            .start(source_id, accepted_at)
-            .expect("committed unknown request");
-        assert_eq!(
-            server.external_open_attachments.ready(
-                source_id,
-                committed_unknown.request_id(),
-                crate::protocol::ExternalOpenTarget::Direct,
-                accepted_at + Duration::from_millis(1),
-                |_| true,
-            ),
-            ExternalOpenTransition::Committed
-        );
-        let closed = server
-            .external_open_attachments
-            .expire_due(committed_unknown.deadline())
-            .pop()
-            .expect("committed unknown timeout");
-        assert!(server.report_external_open_transition(ExternalOpenTransition::Closed(closed)));
-        assert_source_notice(
-            &mut server,
-            source_id,
-            &mut source,
-            &mut other,
-            "Couldn’t confirm link opening · device may still have opened it",
+        let (mut invalid_server, invalid_rx) = connected_server();
+        let invalid_accepted_at = invalid_server.external_open_clock.now();
+        let invalid_id = begin(&mut invalid_server, &invalid_rx, invalid_accepted_at);
+        let invalid_events = capture_tracing_events(CapturedTracingEvents::default(), || {
+            invalid_server.handle_server_event(ServerEvent::ExternalOpenResult {
+                client_id: 1,
+                request_id: invalid_id,
+                result: Result::OpenedDirectly,
+            });
+        });
+        expect_one(
+            invalid_events,
+            invalid_id,
+            "invalid_client_result",
+            "uncommitted",
+            "no",
         );
 
-        let deadline = server
-            .next_client_notice_deadline()
-            .expect("external-open notice deadline");
-        assert!(!server.expire_client_notices(deadline - Duration::from_nanos(1)));
-        assert!(server.expire_client_notices(deadline));
-        server.render_and_stream();
-        assert!(matches!(
-            crate::protocol::read_message::<_, ServerMessage>(&mut source, MAX_FRAME_SIZE)
-                .expect("expired external-open notice frame"),
-            ServerMessage::Frame(_)
-        ));
-        wait_for_client_frame_writes(&mut server, &[source_id]);
-        assert_client_writer_reaches_barrier_without_prior_message(&server, other_id, &mut other);
-
-        let first = server
-            .external_open_attachments
-            .start(source_id, Instant::now())
-            .expect("replacement first");
-        let first_transition = server.external_open_attachments.preparation_failed(
-            source_id,
-            first.request_id(),
-            Failure::UnsupportedScheme,
-            Instant::now(),
-        );
-        assert!(server.report_external_open_transition(first_transition));
-        let second = server
-            .external_open_attachments
-            .start(source_id, Instant::now())
-            .expect("replacement second");
-        let second_transition = server.external_open_attachments.preparation_failed(
-            source_id,
-            second.request_id(),
-            Failure::ForwardingUnavailable,
-            Instant::now(),
-        );
-        assert!(server.report_external_open_transition(second_transition));
-        assert_eq!(
-            client_projection_notice(&server, source_id),
-            Some("Couldn’t open link · local forwarding is unavailable")
-        );
-        assert_source_notice(
-            &mut server,
-            source_id,
-            &mut source,
-            &mut other,
-            "Couldn’t open link · local forwarding is unavailable",
-        );
-
-        crate::protocol::write_message(
-            &mut source,
-            &crate::protocol::ClientMessage::InputEvents {
-                events: vec![crate::protocol::ClientInputEvent::Key {
-                    code: crate::protocol::ClientKeyCode::Esc,
-                    modifiers: 0,
-                    kind: crate::protocol::ClientKeyKind::Press,
+        let (mut delivery_server, _delivery_rx) = connected_server();
+        delivery_server.clients.get_mut(&1).expect("client").writer = None;
+        let delivery_events = capture_tracing_events(CapturedTracingEvents::default(), || {
+            delivery_server.handle_host_actions(
+                1,
+                vec![crate::app::HostAction::OpenExternalUrl {
+                    url: PRIVATE_URL.to_owned(),
                 }],
-            },
-        )
-        .expect("dismiss external-open notice");
-        loop {
-            let event = server
-                .server_event_rx
-                .blocking_recv()
-                .expect("dismissal input event");
-            let dismissal = matches!(
-                &event,
-                ServerEvent::ClientInputEvents { client_id, .. } if *client_id == source_id
-            );
-            let changed = server.handle_server_event(event);
-            if dismissal {
-                assert!(changed);
-                break;
-            }
-        }
-        server.render_and_stream();
-        let dismissed =
-            match crate::protocol::read_message::<_, ServerMessage>(&mut source, MAX_FRAME_SIZE)
-                .expect("dismissed external-open notice frame")
-            {
-                ServerMessage::Frame(frame) => frame,
-                message => panic!("expected dismissed source frame, got {message:?}"),
-            };
-        assert!(!frame_text(&dismissed).contains("Couldn’t open link"));
-        assert_client_writer_reaches_barrier_without_prior_message(&server, other_id, &mut other);
-
-        for (target, result) in [
-            (
-                crate::protocol::ExternalOpenTarget::Direct,
-                crate::protocol::ExternalOpenResult::OpenedDirectly,
-            ),
-            (
-                crate::protocol::ExternalOpenTarget::Forwarded {
-                    port_status: crate::protocol::ExternalOpenPortStatus::SamePort,
-                },
-                crate::protocol::ExternalOpenResult::OpenedThroughForward {
-                    port_status: crate::protocol::ExternalOpenPortStatus::SamePort,
-                },
-            ),
-            (
-                crate::protocol::ExternalOpenTarget::Forwarded {
-                    port_status: crate::protocol::ExternalOpenPortStatus::RemappedPort,
-                },
-                crate::protocol::ExternalOpenResult::OpenedThroughForward {
-                    port_status: crate::protocol::ExternalOpenPortStatus::RemappedPort,
-                },
-            ),
-        ] {
-            let accepted_at = Instant::now();
-            let dispatch = server
-                .external_open_attachments
-                .start(source_id, accepted_at)
-                .expect("successful request");
-            assert_eq!(
-                server.external_open_attachments.ready(
-                    source_id,
-                    dispatch.request_id(),
-                    target,
-                    accepted_at + Duration::from_millis(1),
-                    |_| true,
-                ),
-                ExternalOpenTransition::Committed
-            );
-            let transition = server.external_open_attachments.result(
-                source_id,
-                dispatch.request_id(),
-                result,
-                accepted_at + Duration::from_millis(2),
-            );
-            assert!(!server.report_external_open_transition(transition));
-        }
-        server.render_and_stream();
-        assert_client_writer_reaches_barrier_without_prior_message(&server, source_id, &mut source);
-        assert_client_writer_reaches_barrier_without_prior_message(&server, other_id, &mut other);
-
-        let cancelled = server
-            .external_open_attachments
-            .start(source_id, Instant::now())
-            .expect("cancelled request");
-        let closed = server
-            .external_open_attachments
-            .cancel_preparing_for_client(source_id)
-            .into_iter()
-            .find(|closed| closed.request_id == cancelled.request_id())
-            .expect("cancelled terminal outcome");
-        assert_eq!(
-            closed.outcome,
-            ExternalOpenTerminalOutcome::CancelledBeforeCommit
-        );
-        assert!(!server.report_external_open_transition(ExternalOpenTransition::Closed(closed)));
-        server.render_and_stream();
-        assert_client_writer_reaches_barrier_without_prior_message(&server, source_id, &mut source);
-        assert_client_writer_reaches_barrier_without_prior_message(&server, other_id, &mut other);
-
-        let preparing = server
-            .external_open_attachments
-            .start(source_id, Instant::now())
-            .expect("disconnect preparing request");
-        let committed = server
-            .external_open_attachments
-            .start(source_id, Instant::now())
-            .expect("disconnect committed request");
-        assert_eq!(
-            server.external_open_attachments.ready(
-                source_id,
-                committed.request_id(),
-                crate::protocol::ExternalOpenTarget::Direct,
                 Instant::now(),
-                |_| true,
-            ),
-            ExternalOpenTransition::Committed
-        );
-        drop(source);
-        loop {
-            let event = server
-                .server_event_rx
-                .blocking_recv()
-                .expect("source disconnect event");
-            let disconnected = matches!(
-                &event,
-                ServerEvent::ClientDisconnected { client_id } if *client_id == source_id
             );
-            server.handle_server_event(event);
-            if disconnected {
-                break;
-            }
-        }
-        assert!(!server.clients.contains_key(&source_id));
-        assert!(server.external_open_attachments.next_deadline().is_none());
-        assert_ne!(preparing.request_id(), committed.request_id());
-        assert_client_writer_reaches_barrier_without_prior_message(&server, other_id, &mut other);
+        });
+        expect_one(
+            delivery_events,
+            1,
+            "client_delivery_failed",
+            "uncommitted",
+            "no",
+        );
 
-        drop(other);
-        server.remove_all_clients();
+        let origin = Instant::now();
+        let (mut before_server, before_rx) = connected_server();
+        before_server.external_open_clock =
+            crate::server::monotonic_clock::MonotonicClock::for_test(origin);
+        let before_id = begin(&mut before_server, &before_rx, origin);
+        before_server.external_open_clock.set_for_test(
+            origin + crate::server::external_open::EXTERNAL_OPEN_DEADLINE - Duration::from_nanos(1),
+        );
+        before_server.handle_server_event(ServerEvent::ExternalOpenReady {
+            client_id: 1,
+            request_id: before_id,
+            target: Target::Direct,
+        });
+        assert_eq!(
+            read_server_message(before_rx.recv().expect("strict-before commit")),
+            ServerMessage::ExternalOpenCommit {
+                request_id: before_id
+            }
+        );
+        let before_events = capture_tracing_events(CapturedTracingEvents::default(), || {
+            before_server.handle_server_event(ServerEvent::ExternalOpenResult {
+                client_id: 1,
+                request_id: before_id,
+                result: Result::OpenedDirectly,
+            });
+        });
+        expect_one(
+            before_events,
+            before_id,
+            "opened_directly",
+            "committed",
+            "no",
+        );
+
+        let (mut equality_server, equality_rx) = connected_server();
+        equality_server.external_open_clock =
+            crate::server::monotonic_clock::MonotonicClock::for_test(origin);
+        let equality_id = begin(&mut equality_server, &equality_rx, origin);
+        equality_server
+            .external_open_clock
+            .set_for_test(origin + crate::server::external_open::EXTERNAL_OPEN_DEADLINE);
+        let equality_events = capture_tracing_events(CapturedTracingEvents::default(), || {
+            equality_server.handle_server_event(ServerEvent::ExternalOpenReady {
+                client_id: 1,
+                request_id: equality_id,
+                target: Target::Direct,
+            });
+        });
+        expect_one(
+            equality_events,
+            equality_id,
+            "timed_out_before_commit",
+            "uncommitted",
+            "no",
+        );
+        assert_eq!(
+            read_server_message(equality_rx.recv().expect("equality cancel")),
+            ServerMessage::ExternalOpenCancel {
+                request_id: equality_id
+            }
+        );
+        let late = capture_tracing_events(CapturedTracingEvents::default(), || {
+            equality_server.handle_server_event(ServerEvent::ExternalOpenResult {
+                client_id: 1,
+                request_id: equality_id,
+                result: Result::OpenedDirectly,
+            });
+        });
+        assert_terminal_traces(late, &[]);
+
+        let (mut cancellation_server, cancellation_rx) = connected_server();
+        let cancellation_accepted_at = cancellation_server.external_open_clock.now();
+        let cancellation_id = begin(
+            &mut cancellation_server,
+            &cancellation_rx,
+            cancellation_accepted_at,
+        );
+        let cancellation_events = capture_tracing_events(CapturedTracingEvents::default(), || {
+            cancellation_server.handle_server_event(ServerEvent::ExternalOpenPolicyUpdate {
+                client_id: 1,
+                policy: crate::protocol::ExternalOpenPolicy::Disabled,
+            });
+        });
+        expect_one(
+            cancellation_events,
+            cancellation_id,
+            "cancelled_before_commit",
+            "uncommitted",
+            "no",
+        );
+        assert_eq!(
+            read_server_message(cancellation_rx.recv().expect("policy cancel")),
+            ServerMessage::ExternalOpenCancel {
+                request_id: cancellation_id
+            }
+        );
+
+        let (mut disconnect_server, disconnect_rx) = connected_server();
+        let disconnect_at = disconnect_server.external_open_clock.now();
+        let preparing_id = begin(&mut disconnect_server, &disconnect_rx, disconnect_at);
+        let committed_id = begin(&mut disconnect_server, &disconnect_rx, disconnect_at);
+        disconnect_server.handle_server_event(ServerEvent::ExternalOpenReady {
+            client_id: 1,
+            request_id: committed_id,
+            target: Target::Forwarded {
+                port_status: PortStatus::RemappedPort,
+            },
+        });
+        assert_eq!(
+            read_server_message(disconnect_rx.recv().expect("disconnect commit")),
+            ServerMessage::ExternalOpenCommit {
+                request_id: committed_id
+            }
+        );
+        let disconnect_events = capture_tracing_events(CapturedTracingEvents::default(), || {
+            disconnect_server.remove_client(1);
+        });
+        let preparing_text = preparing_id.to_string();
+        let committed_text = committed_id.to_string();
+        assert_terminal_traces(
+            disconnect_events,
+            &[
+                TerminalTraceExpectation {
+                    request_id: &preparing_text,
+                    outcome: "client_disconnected_before_commit",
+                    commit_state: "uncommitted",
+                    forward_status: "no",
+                },
+                TerminalTraceExpectation {
+                    request_id: &committed_text,
+                    outcome: "committed_outcome_unknown",
+                    commit_state: "committed",
+                    forward_status: "remapped",
+                },
+            ],
+        );
+        let disconnected_late = capture_tracing_events(CapturedTracingEvents::default(), || {
+            disconnect_server.handle_server_event(ServerEvent::ExternalOpenResult {
+                client_id: 1,
+                request_id: committed_id,
+                result: Result::OpenedThroughForward {
+                    port_status: PortStatus::RemappedPort,
+                },
+            });
+        });
+        assert_terminal_traces(disconnected_late, &[]);
+
+        let (mut cleanup_server, _cleanup_rx) = connected_server();
+        cleanup_server.handle_server_event(ServerEvent::ExternalOpenPolicyUpdate {
+            client_id: 1,
+            policy: crate::protocol::ExternalOpenPolicy::Disabled,
+        });
+        let cleanup_events = capture_tracing_events(CapturedTracingEvents::default(), || {
+            cleanup_server.handle_server_event(ServerEvent::ExternalOpenPolicyReloadFailed {
+                client_id: 1,
+                effective_policy: crate::protocol::ExternalOpenPolicy::Disabled,
+                cleanup_incomplete: true,
+            });
+        });
+        assert_terminal_traces(cleanup_events, &[]);
+        assert_eq!(
+            client_projection_notice(&cleanup_server, 1),
+            Some("Remote link opening turned off · some local forwards couldn’t be removed")
+        );
+    }
+
+    #[test]
+    fn admission_rejections_settle_through_the_terminal_reporter_without_wire_authority() {
+        fn connected_server() -> (HeadlessServer, std::sync::mpsc::Receiver<Vec<u8>>) {
+            let mut server = test_headless_server();
+            let (writer, control_rx, _render_rx) = test_client_writer();
+            server.clients.insert(
+                1,
+                ClientConnection::new(
+                    (80, 24),
+                    crate::kitty_graphics::HostCellSize::default(),
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    1,
+                    RenderEncoding::SemanticFrame,
+                    Some(writer),
+                ),
+            );
+            connect_client_projection(&mut server, 1, crate::protocol::ExternalOpenPolicy::Enabled);
+            (server, control_rx)
+        }
+
+        let (mut capped, capped_rx) = connected_server();
+        capped.handle_host_actions(
+            1,
+            (0..32)
+                .map(|index| crate::app::HostAction::OpenExternalUrl {
+                    url: format!("https://example.test/admitted/{index}"),
+                })
+                .collect(),
+            Instant::now(),
+        );
+        for _ in 0..32 {
+            assert!(matches!(
+                read_server_message(capped_rx.recv().expect("admitted prepare")),
+                ServerMessage::ExternalOpenPrepare { .. }
+            ));
+        }
+        let cap_events = capture_tracing_events(CapturedTracingEvents::default(), || {
+            capped.handle_host_actions(
+                1,
+                vec![
+                    crate::app::HostAction::OpenExternalUrl {
+                        url: "https://example.test/rejected/one".to_owned(),
+                    },
+                    crate::app::HostAction::OpenExternalUrl {
+                        url: "https://example.test/rejected/two".to_owned(),
+                    },
+                ],
+                Instant::now(),
+            );
+        });
+        assert_eq!(cap_events.len(), 2, "admission must not emit side warnings");
+        assert_terminal_traces(
+            cap_events,
+            &[
+                TerminalTraceExpectation {
+                    request_id: "admission:1",
+                    outcome: "too_many_opens_in_progress",
+                    commit_state: "uncommitted",
+                    forward_status: "no",
+                },
+                TerminalTraceExpectation {
+                    request_id: "admission:2",
+                    outcome: "too_many_opens_in_progress",
+                    commit_state: "uncommitted",
+                    forward_status: "no",
+                },
+            ],
+        );
+        assert!(capped_rx.try_recv().is_err());
+        assert_eq!(
+            capped
+                .external_open_attachments
+                .active_request_count_for_test(
+                    crate::protocol::ExternalOpenAttachmentId::for_test(1),
+                ),
+            32,
+            "rejected attempts must not affect active requests"
+        );
+        assert_eq!(
+            client_projection_notice(&capped, 1),
+            Some("Couldn’t open link · too many links are opening")
+        );
+
+        let (mut exhausted, exhausted_rx) = connected_server();
+        exhausted
+            .external_open_attachments
+            .exhaust_request_ids_for_test(1);
+        let exhaustion_events = capture_tracing_events(CapturedTracingEvents::default(), || {
+            exhausted.handle_host_actions(
+                1,
+                vec![
+                    crate::app::HostAction::OpenExternalUrl {
+                        url: "https://example.test/exhausted/one".to_owned(),
+                    },
+                    crate::app::HostAction::OpenExternalUrl {
+                        url: "https://example.test/exhausted/two".to_owned(),
+                    },
+                ],
+                Instant::now(),
+            );
+        });
+        assert_eq!(
+            exhaustion_events.len(),
+            2,
+            "ID exhaustion must not emit side warnings"
+        );
+        assert_terminal_traces(
+            exhaustion_events,
+            &[
+                TerminalTraceExpectation {
+                    request_id: "admission:1",
+                    outcome: "too_many_opens_in_progress",
+                    commit_state: "uncommitted",
+                    forward_status: "no",
+                },
+                TerminalTraceExpectation {
+                    request_id: "admission:2",
+                    outcome: "too_many_opens_in_progress",
+                    commit_state: "uncommitted",
+                    forward_status: "no",
+                },
+            ],
+        );
+        assert!(exhausted_rx.try_recv().is_err());
+        assert_eq!(
+            exhausted
+                .external_open_attachments
+                .active_request_count_for_test(
+                    crate::protocol::ExternalOpenAttachmentId::for_test(1),
+                ),
+            0,
+            "exhausted attempts must not create active requests"
+        );
+        assert_eq!(
+            client_projection_notice(&exhausted, 1),
+            Some("Couldn’t open link · too many links are opening")
+        );
+        let (second_writer, second_rx, _second_render_rx) = test_client_writer();
+        exhausted.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(second_writer),
+            ),
+        );
+        connect_client_projection(
+            &mut exhausted,
+            2,
+            crate::protocol::ExternalOpenPolicy::Enabled,
+        );
+        exhausted
+            .external_open_attachments
+            .exhaust_request_ids_for_test(2);
+        let other_attachment_events =
+            capture_tracing_events(CapturedTracingEvents::default(), || {
+                exhausted.handle_host_actions(
+                    2,
+                    vec![crate::app::HostAction::OpenExternalUrl {
+                        url: "https://example.test/exhausted/other-attachment".to_owned(),
+                    }],
+                    Instant::now(),
+                );
+            });
+        assert_eq!(other_attachment_events.len(), 1);
+        assert_terminal_traces(
+            other_attachment_events,
+            &[TerminalTraceExpectation {
+                request_id: "admission:3",
+                outcome: "too_many_opens_in_progress",
+                commit_state: "uncommitted",
+                forward_status: "no",
+            }],
+        );
+        assert!(second_rx.try_recv().is_err());
+
+        let (mut unauthorized, unauthorized_rx) = connected_server();
+        unauthorized.external_open_attachments = Default::default();
+        let unauthorized_events = capture_tracing_events(CapturedTracingEvents::default(), || {
+            unauthorized.handle_host_actions(
+                1,
+                vec![crate::app::HostAction::OpenExternalUrl {
+                    url: "https://example.test/unauthorized".to_owned(),
+                }],
+                Instant::now(),
+            );
+        });
+        assert_terminal_traces(unauthorized_events, &[]);
+        assert!(unauthorized_rx.try_recv().is_err());
+        assert_eq!(client_projection_notice(&unauthorized, 1), None);
     }
 
     #[test]
@@ -6515,6 +7003,10 @@ mod tests {
                 crate::protocol::ExternalOpenPolicy::Enabled,
             );
         }
+        let pending_open = server
+            .external_open_attachments
+            .start(1, Instant::now())
+            .expect("pending request before disable");
         let request = begin_presented_policy_mutation(&mut server, 1);
         assert_eq!(
             request.requested_policy,
@@ -6529,6 +7021,16 @@ mod tests {
             server.client_projections.confirmed_policy(1),
             Some(crate::protocol::ExternalOpenPolicy::Disabled)
         );
+        assert!(server.external_open_attachments.next_deadline().is_none());
+        assert_eq!(client_projection_notice(&server, 1), None);
+        assert!(
+            !server.handle_server_event(ServerEvent::ExternalOpenPreparationFailed {
+                client_id: 1,
+                request_id: pending_open.request_id(),
+                reason: crate::protocol::ExternalOpenPreparationFailure::ForwardCommandRejected,
+            })
+        );
+        assert_eq!(client_projection_notice(&server, 1), None);
 
         assert!(
             server.handle_server_event(ServerEvent::ExternalOpenPolicyMutationResult {

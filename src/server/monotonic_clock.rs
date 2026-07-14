@@ -15,6 +15,8 @@ enum DebugClockSource {
         path: std::path::PathBuf,
         last_elapsed: std::time::Duration,
     },
+    #[cfg(test)]
+    Test(Instant),
 }
 
 impl Default for MonotonicClock {
@@ -41,6 +43,18 @@ impl Default for MonotonicClock {
 }
 
 impl MonotonicClock {
+    #[cfg(test)]
+    pub(crate) fn for_test(now: Instant) -> Self {
+        Self {
+            source: DebugClockSource::Test(now),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_for_test(&mut self, now: Instant) {
+        self.source = DebugClockSource::Test(now);
+    }
+
     pub(crate) fn now(&mut self) -> Instant {
         #[cfg(debug_assertions)]
         {
@@ -63,6 +77,8 @@ impl MonotonicClock {
                     *last_elapsed = elapsed;
                     now
                 }
+                #[cfg(test)]
+                DebugClockSource::Test(now) => *now,
             }
         }
 
