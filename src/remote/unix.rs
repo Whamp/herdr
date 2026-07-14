@@ -172,7 +172,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         .manage_ssh_config;
     let remote_ssh = RemoteSsh::new(remote.target.clone(), manage_ssh_config);
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let forwarding_authority = remote_ssh.forwarding_authority();
+    let forwarding_launch = remote_ssh.forwarding_launch();
     let prepared_remote = prepare_remote_herdr(&remote_ssh, remote.live_handoff)?;
     ensure_remote_server_ready(
         &remote_ssh,
@@ -195,7 +195,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         &local_socket,
         &reattach_command,
         remote.keybindings,
-        forwarding_authority,
+        forwarding_launch,
     );
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -461,6 +461,13 @@ impl Drop for ManagedSshConfig {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+enum ForwardingLaunch {
+    Available(crate::remote::forwarding::ControlAuthority),
+    ManagedSshRequired,
+    Unavailable,
+}
+
 struct RemoteSsh {
     target: String,
     managed_config: Option<ManagedSshConfig>,
@@ -493,20 +500,33 @@ impl RemoteSsh {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn forwarding_authority(&self) -> Option<crate::remote::forwarding::ControlAuthority> {
-        self.forwarding_authority_for_support(local_openssh_supports_forwarding())
+    fn forwarding_launch(&self) -> ForwardingLaunch {
+        self.forwarding_launch_for_support(local_openssh_supports_forwarding())
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn forwarding_launch_for_support(&self, supported: bool) -> ForwardingLaunch {
+        let Some(options) = self.options() else {
+            return ForwardingLaunch::ManagedSshRequired;
+        };
+        if !supported {
+            return ForwardingLaunch::Unavailable;
+        }
+        ForwardingLaunch::Available(crate::remote::forwarding::ControlAuthority::new(
+            self.target.clone(),
+            options.control_path.clone(),
+        ))
+    }
+
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     fn forwarding_authority_for_support(
         &self,
         supported: bool,
     ) -> Option<crate::remote::forwarding::ControlAuthority> {
-        let options = supported.then(|| self.options()).flatten()?;
-        Some(crate::remote::forwarding::ControlAuthority::new(
-            self.target.clone(),
-            options.control_path.clone(),
-        ))
+        match self.forwarding_launch_for_support(supported) {
+            ForwardingLaunch::Available(authority) => Some(authority),
+            ForwardingLaunch::ManagedSshRequired | ForwardingLaunch::Unavailable => None,
+        }
     }
 
     fn command(&self) -> Command {
@@ -2002,7 +2022,9 @@ fn client_process_command(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    command.env_remove(crate::remote::forwarding::INHERITED_BROKER_FD_ENV);
+    command
+        .env_remove(crate::remote::forwarding::INHERITED_BROKER_FD_ENV)
+        .env_remove(crate::remote::forwarding::FORWARDING_LAUNCH_STATUS_ENV);
     Ok(command)
 }
 
@@ -2011,9 +2033,27 @@ fn run_client_process(
     local_socket: &Path,
     reattach_command: &str,
     keybindings: RemoteKeybindings,
-    forwarding_authority: Option<crate::remote::forwarding::ControlAuthority>,
+    forwarding_launch: ForwardingLaunch,
 ) -> io::Result<()> {
     let mut command = client_process_command(local_socket, reattach_command, keybindings)?;
+    let (forwarding_authority, launch_status) = match forwarding_launch {
+        ForwardingLaunch::Available(authority) => (
+            Some(authority),
+            crate::remote::forwarding::FORWARDING_STATUS_AVAILABLE,
+        ),
+        ForwardingLaunch::ManagedSshRequired => (
+            None,
+            crate::remote::forwarding::FORWARDING_STATUS_MANAGED_SSH_REQUIRED,
+        ),
+        ForwardingLaunch::Unavailable => (
+            None,
+            crate::remote::forwarding::FORWARDING_STATUS_UNAVAILABLE,
+        ),
+    };
+    command.env(
+        crate::remote::forwarding::FORWARDING_LAUNCH_STATUS_ENV,
+        launch_status,
+    );
     let pending_broker = forwarding_authority
         .map(crate::remote::forwarding::PendingBroker::new)
         .transpose()?;
@@ -2274,6 +2314,32 @@ mod tests {
     }
 
     #[test]
+    fn forwarding_launch_status_distinguishes_unmanaged_from_unavailable_openssh() {
+        let unmanaged = RemoteSsh {
+            target: "unmanaged.example".to_string(),
+            managed_config: None,
+        };
+        assert!(matches!(
+            unmanaged.forwarding_launch_for_support(true),
+            ForwardingLaunch::ManagedSshRequired
+        ));
+
+        let managed_config = write_managed_ssh_config().expect("write managed config");
+        let managed = RemoteSsh {
+            target: "managed.example".to_string(),
+            managed_config: Some(managed_config),
+        };
+        assert!(matches!(
+            managed.forwarding_launch_for_support(false),
+            ForwardingLaunch::Unavailable
+        ));
+        assert!(matches!(
+            managed.forwarding_launch_for_support(true),
+            ForwardingLaunch::Available(_)
+        ));
+    }
+
+    #[test]
     fn client_process_command_removes_unassigned_forwarding_capability() {
         let command = client_process_command(
             Path::new("/tmp/herdr-client.sock"),
@@ -2282,9 +2348,14 @@ mod tests {
         )
         .expect("client command");
 
-        assert!(command.get_envs().any(|(name, value)| {
-            name == std::ffi::OsStr::new("HERDR_FORWARDING_BROKER_FD") && value.is_none()
-        }));
+        for name in [
+            "HERDR_FORWARDING_BROKER_FD",
+            "HERDR_FORWARDING_LAUNCH_STATUS",
+        ] {
+            assert!(command.get_envs().any(|(candidate, value)| {
+                candidate == std::ffi::OsStr::new(name) && value.is_none()
+            }));
+        }
     }
 
     #[test]

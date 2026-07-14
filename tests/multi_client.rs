@@ -1068,6 +1068,14 @@ fn send_external_ready_direct(stream: &mut UnixStream, request_id: u64) {
     send_client_message(stream, payload);
 }
 
+fn send_external_ready_forwarded(stream: &mut UnixStream, request_id: u64, remapped: bool) {
+    let mut payload = encode_varint_u32(11); // ClientMessage::ExternalOpenReady
+    payload.extend_from_slice(&encode_varint_u32(u32::try_from(request_id).unwrap()));
+    payload.extend_from_slice(&encode_varint_u32(1)); // ExternalOpenTarget::Forwarded
+    payload.extend_from_slice(&encode_varint_u32(u32::from(remapped))); // port status
+    send_client_message(stream, payload);
+}
+
 fn send_external_opened_directly(stream: &mut UnixStream, request_id: u64) {
     let mut payload = encode_varint_u32(13); // ClientMessage::ExternalOpenResult
     payload.extend_from_slice(&encode_varint_u32(u32::try_from(request_id).unwrap()));
@@ -1080,6 +1088,13 @@ fn send_external_opened_through_same_port(stream: &mut UnixStream, request_id: u
     payload.extend_from_slice(&encode_varint_u32(u32::try_from(request_id).unwrap()));
     payload.extend_from_slice(&encode_varint_u32(1)); // OpenedThroughForward
     payload.extend_from_slice(&encode_varint_u32(0)); // SamePort
+    send_client_message(stream, payload);
+}
+
+fn send_external_opener_rejected(stream: &mut UnixStream, request_id: u64) {
+    let mut payload = encode_varint_u32(13); // ClientMessage::ExternalOpenResult
+    payload.extend_from_slice(&encode_varint_u32(u32::try_from(request_id).unwrap()));
+    payload.extend_from_slice(&encode_varint_u32(2)); // PlatformOpenRejected
     send_client_message(stream, payload);
 }
 
@@ -1710,6 +1725,85 @@ fn external_open_routes_only_to_source_full_app_across_focus_and_connection_kind
     );
     assert_no_server_opener_calls(&config_home);
 
+    cleanup_spawned_herdr(server, base);
+}
+
+#[test]
+fn external_open_socket_lifecycle_covers_forwarded_success_preparation_failure_and_opener_rejection(
+) {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let server = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+
+    let (_, link_pane, _) =
+        create_workspace_and_root_terminal(&api_socket, "external-open-forwarded-lifecycle");
+    let mut source = connect_full_app_client(&client_socket, 100, 30, true);
+    assert!(wait_for_frame(&mut source, Duration::from_secs(3)));
+
+    let url = "http://127.0.0.1:8080/private?a=%2F#frag";
+    pane_send_input(&api_socket, &link_pane, &format!("echo {url}"));
+    let (column, row) = wait_for_text_position(&mut source, url, Duration::from_secs(8))
+        .expect("source should render numeric loopback URL");
+    let mut opener = RecordingOpener::default();
+
+    send_ctrl_click(&mut source, column, row);
+    let (same_port_id, prepared_url) =
+        read_external_prepare(&mut source, Duration::from_secs(3)).expect("same-port prepare");
+    assert_eq!(prepared_url, url);
+    assert!(opener.request_ids().is_empty());
+    send_external_ready_forwarded(&mut source, same_port_id, false);
+    opener
+        .invoke_after_next_commit(&mut source, same_port_id)
+        .expect("forwarded readiness commits");
+    send_external_opened_through_same_port(&mut source, same_port_id);
+    wait_for_external_open_settlement(
+        &server_log_path(&config_home),
+        same_port_id,
+        "opened_through_forward",
+        Duration::from_secs(3),
+    );
+
+    send_ctrl_click(&mut source, column, row);
+    let (failed_id, prepared_url) =
+        read_external_prepare(&mut source, Duration::from_secs(3)).expect("failed prepare");
+    assert_eq!(prepared_url, url);
+    send_external_preparation_failed(&mut source, failed_id, 14); // ForwardCommandRejected
+    wait_for_external_open_settlement(
+        &server_log_path(&config_home),
+        failed_id,
+        "forward_command_rejected",
+        Duration::from_secs(3),
+    );
+    assert_eq!(
+        opener.request_ids(),
+        &[same_port_id],
+        "preparation failure must not invoke the opener"
+    );
+
+    send_ctrl_click(&mut source, column, row);
+    let (rejected_id, prepared_url) =
+        read_external_prepare(&mut source, Duration::from_secs(3)).expect("remapped prepare");
+    assert_eq!(prepared_url, url);
+    send_external_ready_forwarded(&mut source, rejected_id, true);
+    opener
+        .invoke_after_next_commit(&mut source, rejected_id)
+        .expect("remapped readiness commits");
+    send_external_opener_rejected(&mut source, rejected_id);
+    wait_for_external_open_settlement(
+        &server_log_path(&config_home),
+        rejected_id,
+        "platform_open_rejected",
+        Duration::from_secs(3),
+    );
+
+    assert_eq!(opener.request_ids(), &[same_port_id, rejected_id]);
+    assert_no_server_opener_calls(&config_home);
     cleanup_spawned_herdr(server, base);
 }
 

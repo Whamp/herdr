@@ -12,6 +12,100 @@ pub(crate) enum LoopbackTarget {
     Ipv6,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForwardingPreparationError {
+    TooManyRequests,
+    BindExhausted,
+    CommandRejected,
+    CommandTimedOut,
+    Unavailable,
+}
+
+pub(crate) trait ForwardingPreparation: Send {
+    fn poll(&mut self) -> Option<Result<std::num::NonZeroU16, ForwardingPreparationError>>;
+
+    fn cancel(&mut self);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForwardingPolicySettlement {
+    pub(crate) requested: bool,
+    pub(crate) effective: bool,
+    pub(crate) result: Result<(), ForwardingPreparationError>,
+}
+
+pub(crate) trait ForwardingPolicyChange: Send {
+    fn poll(&mut self) -> Option<ForwardingPolicySettlement>;
+
+    fn cancel(&mut self);
+}
+
+pub(crate) trait ForwardingController: Send + Sync {
+    fn begin_prepare_numeric(
+        &self,
+        target: LoopbackTarget,
+        remote_port: std::num::NonZeroU16,
+    ) -> Result<Box<dyn ForwardingPreparation>, ForwardingPreparationError>;
+
+    fn begin_set_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<Box<dyn ForwardingPolicyChange>, ForwardingPreparationError>;
+}
+
+pub(crate) enum ExternalOpenForwarding {
+    ManagedSshRequired,
+    Unavailable,
+    Available(std::sync::Arc<dyn ForwardingController>),
+}
+
+impl ExternalOpenForwarding {
+    pub(crate) fn available(controller: std::sync::Arc<dyn ForwardingController>) -> Self {
+        Self::Available(controller)
+    }
+
+    pub(crate) fn begin_prepare_numeric(
+        &self,
+        target: LoopbackTarget,
+        remote_port: std::num::NonZeroU16,
+    ) -> Result<Box<dyn ForwardingPreparation>, crate::protocol::ExternalOpenPreparationFailure>
+    {
+        match self {
+            Self::ManagedSshRequired => {
+                Err(crate::protocol::ExternalOpenPreparationFailure::ManagedSshRequired)
+            }
+            Self::Unavailable => {
+                Err(crate::protocol::ExternalOpenPreparationFailure::ForwardingUnavailable)
+            }
+            Self::Available(controller) => controller
+                .begin_prepare_numeric(target, remote_port)
+                .map_err(crate::protocol::ExternalOpenPreparationFailure::from),
+        }
+    }
+
+    pub(crate) fn begin_set_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<Option<Box<dyn ForwardingPolicyChange>>, ForwardingPreparationError> {
+        match self {
+            Self::Available(controller) => controller.begin_set_enabled(enabled).map(Some),
+            Self::ManagedSshRequired | Self::Unavailable => Ok(None),
+        }
+    }
+}
+
+impl From<ForwardingPreparationError> for crate::protocol::ExternalOpenPreparationFailure {
+    fn from(error: ForwardingPreparationError) -> Self {
+        match error {
+            ForwardingPreparationError::TooManyRequests => Self::TooManyForwardRequests,
+            ForwardingPreparationError::BindExhausted => Self::ForwardBindExhausted,
+            ForwardingPreparationError::CommandRejected => Self::ForwardCommandRejected,
+            ForwardingPreparationError::CommandTimedOut => Self::ForwardCommandTimedOut,
+            ForwardingPreparationError::Unavailable => Self::ForwardingUnavailable,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValidatedLoopbackUrl<'a> {
     original_url: &'a str,
@@ -326,6 +420,37 @@ fn parse_canonical_ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forwarding_preparation_errors_have_one_exhaustive_external_failure_translation() {
+        for (error, expected) in [
+            (
+                ForwardingPreparationError::TooManyRequests,
+                crate::protocol::ExternalOpenPreparationFailure::TooManyForwardRequests,
+            ),
+            (
+                ForwardingPreparationError::BindExhausted,
+                crate::protocol::ExternalOpenPreparationFailure::ForwardBindExhausted,
+            ),
+            (
+                ForwardingPreparationError::CommandRejected,
+                crate::protocol::ExternalOpenPreparationFailure::ForwardCommandRejected,
+            ),
+            (
+                ForwardingPreparationError::CommandTimedOut,
+                crate::protocol::ExternalOpenPreparationFailure::ForwardCommandTimedOut,
+            ),
+            (
+                ForwardingPreparationError::Unavailable,
+                crate::protocol::ExternalOpenPreparationFailure::ForwardingUnavailable,
+            ),
+        ] {
+            assert_eq!(
+                crate::protocol::ExternalOpenPreparationFailure::from(error),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn ordinary_web_urls_preserve_input_bytes() {

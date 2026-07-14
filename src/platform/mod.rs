@@ -72,24 +72,18 @@ impl InheritedPeerIdentity {
     }
 }
 
-pub(crate) struct InheritedForwardingCapability {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    _client: Option<crate::remote::forwarding::ForwardingClient>,
-}
-
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn adopt_inherited_forwarding_capability(
     initial_policy: bool,
-) -> std::io::Result<InheritedForwardingCapability> {
-    crate::remote::forwarding::adopt_inherited_capability(initial_policy)
-        .map(|client| InheritedForwardingCapability { _client: client })
+) -> std::io::Result<crate::external_open::ExternalOpenForwarding> {
+    crate::remote::forwarding::adopt_external_open_forwarding(initial_policy)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn adopt_inherited_forwarding_capability(
     _initial_policy: bool,
-) -> std::io::Result<InheritedForwardingCapability> {
-    Ok(InheritedForwardingCapability {})
+) -> std::io::Result<crate::external_open::ExternalOpenForwarding> {
+    Ok(crate::external_open::ExternalOpenForwarding::Unavailable)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

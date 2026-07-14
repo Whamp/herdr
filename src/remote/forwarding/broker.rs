@@ -108,38 +108,39 @@ impl ForwardingClient {
     }
 
     pub(crate) fn assert_policy(&self, enabled: bool) -> io::Result<()> {
-        let response = self.call(PendingKind::Policy, |id| ClientMessage::AssertPolicy {
-            id,
-            enabled,
-        })?;
-        if !matches!(
-            response,
-            ServerMessage::PolicyAcknowledged {
-                enabled: acknowledged,
-                ..
-            } if acknowledged == enabled
-        ) {
-            self.close();
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "forwarding broker policy acknowledgement rejected",
-            ));
-        }
-        self.inner.active.store(enabled, Ordering::Release);
-        Ok(())
+        let (effective, result) = self.begin_assert_policy(enabled)?.wait()?;
+        self.inner.active.store(effective, Ordering::Release);
+        result.map_err(|_| io::Error::other("forwarding broker policy update failed"))
     }
 
-    pub(crate) fn forward(&self, spec: ForwardSpec) -> Result<(), ForwardFailure> {
-        self.begin_forward(spec)?.wait()
+    pub(crate) fn begin_assert_policy(&self, enabled: bool) -> io::Result<PolicyCall> {
+        let (_id, receiver) = self.start_call(PendingKind::Policy, |id| {
+            ClientMessage::AssertPolicy { id, enabled }
+        })?;
+        Ok(PolicyCall {
+            requested: enabled,
+            receiver: Some(receiver),
+            inner: Arc::clone(&self.inner),
+            settled: false,
+        })
     }
 
     pub(crate) fn begin_forward(&self, spec: ForwardSpec) -> Result<ForwardCall, ForwardFailure> {
+        self.begin_mapping_call(PendingKind::Forward, |id| ClientMessage::Forward {
+            id,
+            spec,
+        })
+    }
+
+    fn begin_mapping_call(
+        &self,
+        kind: PendingKind,
+        message: impl FnOnce(CorrelationId) -> ClientMessage,
+    ) -> Result<ForwardCall, ForwardFailure> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(ForwardFailure::CapabilityClosed);
         }
-        let (id, receiver) = match self.start_call(PendingKind::Forward, |id| {
-            ClientMessage::Forward { id, spec }
-        }) {
+        let (id, receiver) = match self.start_call(kind, message) {
             Ok(call) => call,
             Err(_) => {
                 self.close();
@@ -151,6 +152,7 @@ impl ForwardingClient {
             receiver: Some(receiver),
             inner: Arc::clone(&self.inner),
             settled: false,
+            cancelled: false,
         })
     }
 
@@ -260,33 +262,128 @@ pub(crate) struct ForwardCall {
     receiver: Option<mpsc::Receiver<ServerMessage>>,
     inner: Arc<ClientInner>,
     settled: bool,
+    cancelled: bool,
 }
 
-// Follow-up external-open routing waits on this call handle.
-#[allow(dead_code)]
 impl ForwardCall {
+    #[cfg(test)]
     pub(crate) fn wait(mut self) -> Result<(), ForwardFailure> {
         let response = self
             .receiver
             .take()
             .and_then(|receiver| receiver.recv().ok());
         self.settled = true;
-        match response {
-            Some(ServerMessage::ForwardSettled { result, .. }) => result,
-            Some(ServerMessage::Cancelled { .. }) => Err(ForwardFailure::Cancelled),
-            _ => Err(ForwardFailure::CapabilityClosed),
+        forward_response(response)
+    }
+
+    pub(crate) fn try_wait(&mut self) -> Option<Result<(), ForwardFailure>> {
+        let response = match self.receiver.as_ref()?.try_recv() {
+            Ok(response) => response,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.receiver = None;
+                self.settled = true;
+                return Some(Err(ForwardFailure::CapabilityClosed));
+            }
+        };
+        self.receiver = None;
+        self.settled = true;
+        Some(forward_response(Some(response)))
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        if self.settled || self.cancelled {
+            return;
         }
+        let client = ForwardingClient {
+            inner: Arc::clone(&self.inner),
+        };
+        client.cancel(self.id);
+        self.cancelled = true;
+    }
+}
+
+fn forward_response(response: Option<ServerMessage>) -> Result<(), ForwardFailure> {
+    match response {
+        Some(ServerMessage::ForwardSettled { result, .. }) => result,
+        Some(ServerMessage::Cancelled { .. }) => Err(ForwardFailure::Cancelled),
+        _ => Err(ForwardFailure::CapabilityClosed),
     }
 }
 
 impl Drop for ForwardCall {
     fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+pub(crate) struct PolicyCall {
+    requested: bool,
+    receiver: Option<mpsc::Receiver<ServerMessage>>,
+    inner: Arc<ClientInner>,
+    settled: bool,
+}
+
+impl PolicyCall {
+    fn wait(mut self) -> io::Result<(bool, Result<(), ForwardFailure>)> {
+        let response = self
+            .receiver
+            .take()
+            .and_then(|receiver| receiver.recv().ok());
+        self.settled = true;
+        let settled = policy_response(self.requested, response)?;
+        self.inner.active.store(settled.0, Ordering::Release);
+        Ok(settled)
+    }
+
+    pub(crate) fn try_wait(&mut self) -> Option<(bool, Result<(), ForwardFailure>)> {
+        let response = match self.receiver.as_ref()?.try_recv() {
+            Ok(response) => response,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.receiver = None;
+                self.settled = true;
+                return Some((false, Err(ForwardFailure::CapabilityClosed)));
+            }
+        };
+        self.receiver = None;
+        self.settled = true;
+        let settled = policy_response(self.requested, Some(response))
+            .unwrap_or((false, Err(ForwardFailure::CapabilityClosed)));
+        self.inner.active.store(settled.0, Ordering::Release);
+        Some(settled)
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        self.receiver = None;
+        self.settled = true;
+    }
+}
+
+fn policy_response(
+    requested: bool,
+    response: Option<ServerMessage>,
+) -> io::Result<(bool, Result<(), ForwardFailure>)> {
+    match response {
+        Some(ServerMessage::PolicyAcknowledged {
+            requested: acknowledged,
+            effective,
+            result,
+            ..
+        }) if acknowledged == requested => Ok((effective, result)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "forwarding broker policy acknowledgement rejected",
+        )),
+    }
+}
+
+impl Drop for PolicyCall {
+    fn drop(&mut self) {
         if !self.settled {
-            let client = ForwardingClient {
-                inner: Arc::clone(&self.inner),
-            };
-            client.cancel(self.id);
+            self.cancel();
         }
+        let _ = &self.inner;
     }
 }
 
@@ -366,6 +463,40 @@ enum BrokerState {
     AwaitPolicy,
     Disabled,
     Active,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReadyMapping {
+    pub(super) spec: ForwardSpec,
+}
+
+#[derive(Default)]
+pub(super) struct MappingRegistry {
+    ready: BTreeMap<ForwardSpec, ReadyMapping>,
+}
+
+impl MappingRegistry {
+    fn owns_destination(&self, spec: ForwardSpec) -> bool {
+        self.ready
+            .keys()
+            .any(|owned| same_destination(*owned, spec))
+    }
+
+    fn insert_ready(&mut self, spec: ForwardSpec) {
+        self.ready.insert(spec, ReadyMapping { spec });
+    }
+
+    fn collides_with_ready(&self, spec: ForwardSpec) -> bool {
+        self.ready.keys().any(|ready| {
+            ready.local_address == spec.local_address
+                && ready.local_port == spec.local_port
+                && *ready != spec
+        })
+    }
+}
+
+fn same_destination(left: ForwardSpec, right: ForwardSpec) -> bool {
+    left.remote_address == right.remote_address && left.remote_port == right.remote_port
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -460,22 +591,29 @@ fn run_broker(
     let mut state = BrokerState::AwaitHello;
     let mut highest_id = 0_u64;
     let mut live = BTreeMap::<u64, ForwardSpec>::new();
+    let mut mappings = MappingRegistry::default();
     let mut queue = VecDeque::<QueuedJob>::new();
     let mut active: Option<QueuedJob> = None;
     let mut pending_disable_ack = None;
 
-    loop {
+    'broker: loop {
         while let Ok(result) = worker.try_recv() {
             let Some(completed) = active.take() else {
-                return;
+                break 'broker;
             };
             if completed.job.id != result.id || completed.job.operation != result.operation {
-                return;
+                break 'broker;
             }
             if completed.respond {
                 live.remove(&result.id.get());
                 let result = match result.result {
-                    ControlResult::Succeeded => Ok(()),
+                    ControlResult::Succeeded => {
+                        if let ControlOperation::Forward(spec) = completed.job.operation {
+                            mappings.insert_ready(spec);
+                        }
+                        Ok(())
+                    }
+                    ControlResult::BindFailed => Err(ForwardFailure::BindFailed),
                     ControlResult::Rejected => Err(ForwardFailure::CommandRejected),
                     ControlResult::TimedOut => Err(ForwardFailure::CommandTimedOut),
                 };
@@ -488,7 +626,7 @@ fn run_broker(
                 )
                 .is_err()
                 {
-                    return;
+                    break 'broker;
                 }
             } else if matches!(completed.job.operation, ControlOperation::Forward(_))
                 && result.result == ControlResult::Succeeded
@@ -506,17 +644,22 @@ fn run_broker(
                 });
             }
             if dispatch_next(&worker, &mut queue, &mut active).is_err() {
-                return;
+                break 'broker;
             }
             if active.is_none() {
                 if let Some(id) = pending_disable_ack.take() {
                     if protocol::write_message(
                         &mut stream,
-                        &ServerMessage::PolicyAcknowledged { id, enabled: false },
+                        &ServerMessage::PolicyAcknowledged {
+                            id,
+                            requested: false,
+                            effective: false,
+                            result: Ok(()),
+                        },
                     )
                     .is_err()
                     {
-                        return;
+                        break 'broker;
                     }
                 }
             }
@@ -527,7 +670,7 @@ fn run_broker(
                 let id = message.correlation_id();
                 if !matches!(message, ClientMessage::Cancel { .. }) {
                     if id.get() <= highest_id {
-                        return;
+                        break 'broker;
                     }
                     highest_id = id.get();
                 }
@@ -546,7 +689,7 @@ fn run_broker(
                         )
                         .is_err()
                         {
-                            return;
+                            break 'broker;
                         }
                     }
                     ClientMessage::AssertPolicy { id, enabled }
@@ -556,24 +699,37 @@ fn run_broker(
                             state = BrokerState::Active;
                             if protocol::write_message(
                                 &mut stream,
-                                &ServerMessage::PolicyAcknowledged { id, enabled: true },
+                                &ServerMessage::PolicyAcknowledged {
+                                    id,
+                                    requested: true,
+                                    effective: true,
+                                    result: Ok(()),
+                                },
                             )
                             .is_err()
                             {
-                                return;
+                                break 'broker;
                             }
                         } else {
                             state = BrokerState::Disabled;
-                            cancel_all(&mut stream, &mut live, &mut queue, &mut active);
+                            cancel_uncommitted(&mut stream, &mut live, &mut queue, &mut active);
+                            if active.is_none() {
+                                let _ = dispatch_next(&worker, &mut queue, &mut active);
+                            }
                             if active.is_some() {
                                 pending_disable_ack = Some(id);
                             } else if protocol::write_message(
                                 &mut stream,
-                                &ServerMessage::PolicyAcknowledged { id, enabled: false },
+                                &ServerMessage::PolicyAcknowledged {
+                                    id,
+                                    requested: false,
+                                    effective: false,
+                                    result: Ok(()),
+                                },
                             )
                             .is_err()
                             {
-                                return;
+                                break 'broker;
                             }
                         }
                     }
@@ -591,7 +747,37 @@ fn run_broker(
                             )
                             .is_err()
                             {
-                                return;
+                                break 'broker;
+                            }
+                            continue;
+                        }
+                        if live.values().any(|owned| same_destination(*owned, spec))
+                            || mappings.owns_destination(spec)
+                        {
+                            if protocol::write_message(
+                                &mut stream,
+                                &ServerMessage::ForwardSettled {
+                                    id,
+                                    result: Err(ForwardFailure::AlreadyOwned),
+                                },
+                            )
+                            .is_err()
+                            {
+                                break 'broker;
+                            }
+                            continue;
+                        }
+                        if mappings.collides_with_ready(spec) {
+                            if protocol::write_message(
+                                &mut stream,
+                                &ServerMessage::ForwardSettled {
+                                    id,
+                                    result: Err(ForwardFailure::BindFailed),
+                                },
+                            )
+                            .is_err()
+                            {
+                                break 'broker;
                             }
                             continue;
                         }
@@ -605,7 +791,7 @@ fn run_broker(
                             )
                             .is_err()
                             {
-                                return;
+                                break 'broker;
                             }
                             continue;
                         }
@@ -618,17 +804,57 @@ fn run_broker(
                             respond: true,
                         });
                         if dispatch_next(&worker, &mut queue, &mut active).is_err() {
-                            return;
+                            break 'broker;
                         }
                     }
                     ClientMessage::Cancel { id } if state != BrokerState::AwaitHello => {
                         cancel_one(&mut stream, id, &mut live, &mut queue, &mut active);
                     }
-                    _ => return,
+                    _ => break 'broker,
                 }
             }
-            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break 'broker,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+
+    cleanup_on_disconnect(&worker, &mut stream, &mut live, &mut queue, &mut active);
+}
+
+fn cleanup_on_disconnect(
+    worker: &ControlWorker,
+    stream: &mut UnixStream,
+    live: &mut BTreeMap<u64, ForwardSpec>,
+    queue: &mut VecDeque<QueuedJob>,
+    active: &mut Option<QueuedJob>,
+) {
+    cancel_uncommitted(stream, live, queue, active);
+    if active.is_none() {
+        let _ = dispatch_next(worker, queue, active);
+    }
+    while let Some(completed) = active.take() {
+        let Ok(result) = worker.recv() else {
+            break;
+        };
+        if result.id != completed.job.id || result.operation != completed.job.operation {
+            break;
+        }
+        if matches!(completed.job.operation, ControlOperation::Forward(_))
+            && result.result == ControlResult::Succeeded
+        {
+            let spec = match completed.job.operation {
+                ControlOperation::Forward(spec) | ControlOperation::Cancel(spec) => spec,
+            };
+            queue.push_front(QueuedJob {
+                job: WorkerJob {
+                    id: completed.job.id,
+                    operation: ControlOperation::Cancel(spec),
+                },
+                respond: false,
+            });
+        }
+        if dispatch_next(worker, queue, active).is_err() {
+            break;
         }
     }
 }
@@ -666,7 +892,7 @@ fn cancel_one(
     let _ = protocol::write_message(stream, &ServerMessage::Cancelled { id });
 }
 
-fn cancel_all(
+fn cancel_uncommitted(
     stream: &mut UnixStream,
     live: &mut BTreeMap<u64, ForwardSpec>,
     queue: &mut VecDeque<QueuedJob>,
@@ -698,6 +924,43 @@ mod tests {
         delay: Duration,
     }
 
+    struct RecordingRunner {
+        operations: Mutex<Vec<String>>,
+        results: Mutex<VecDeque<ControlResult>>,
+        delay: Duration,
+    }
+
+    impl RecordingRunner {
+        fn new(results: impl IntoIterator<Item = ControlResult>) -> Self {
+            Self::with_delay(results, Duration::ZERO)
+        }
+
+        fn with_delay(results: impl IntoIterator<Item = ControlResult>, delay: Duration) -> Self {
+            Self {
+                operations: Mutex::new(Vec::new()),
+                results: Mutex::new(results.into_iter().collect()),
+                delay,
+            }
+        }
+    }
+
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, invocation: &ControlInvocation, _timeout: Duration) -> ControlResult {
+            let operation = invocation
+                .args
+                .windows(2)
+                .find_map(|args| (args[0] == "-O").then(|| args[1].clone()))
+                .expect("control operation");
+            self.operations.lock().expect("operations").push(operation);
+            std::thread::sleep(self.delay);
+            self.results
+                .lock()
+                .expect("results")
+                .pop_front()
+                .expect("queued control result")
+        }
+    }
+
     impl CommandRunner for CountingRunner {
         fn run(&self, _invocation: &ControlInvocation, _timeout: Duration) -> ControlResult {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -711,11 +974,15 @@ mod tests {
     }
 
     fn spec_for_port(port: u16) -> ForwardSpec {
+        spec_for_mapping(port, port)
+    }
+
+    fn spec_for_mapping(local_port: u16, remote_port: u16) -> ForwardSpec {
         ForwardSpec {
             local_address: LoopbackAddress::Ipv4([127, 0, 0, 1]),
-            local_port: port,
+            local_port,
             remote_address: LoopbackAddress::Ipv4([127, 0, 0, 1]),
-            remote_port: port,
+            remote_port,
         }
     }
 
@@ -724,6 +991,10 @@ mod tests {
             "secret-target".to_string(),
             PathBuf::from("/secret/control"),
         )
+    }
+
+    fn settle_forward(client: &ForwardingClient, spec: ForwardSpec) -> Result<(), ForwardFailure> {
+        client.begin_forward(spec)?.wait()
     }
 
     #[test]
@@ -745,13 +1016,106 @@ mod tests {
             ForwardingClient::from_stream_for_test(child, false).expect("client handshake");
 
         assert!(!client.is_active());
-        assert_eq!(client.forward(spec()), Err(ForwardFailure::Disabled));
+        assert_eq!(
+            settle_forward(&client, spec()),
+            Err(ForwardFailure::Disabled)
+        );
         assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
 
         client.assert_policy(true).expect("activate policy");
         assert!(client.is_active());
-        assert_eq!(client.forward(spec()), Ok(()));
+        assert_eq!(settle_forward(&client, spec()), Ok(()));
         assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn creating_mapping_is_reported_as_owned_without_coalescing_or_another_command() {
+        let runner = Arc::new(CountingRunner {
+            calls: AtomicUsize::new(0),
+            delay: Duration::from_millis(80),
+        });
+        let (parent, child) = UnixStream::pair().expect("broker pair");
+        let _broker = BrokerServer::start_with_runner(
+            parent,
+            crate::platform::InheritedPeerIdentity::current_process(),
+            authority(),
+            runner.clone(),
+            Duration::from_secs(10),
+        )
+        .expect("broker server");
+        let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
+
+        let first = client
+            .begin_forward(spec_for_mapping(43_123, 8080))
+            .expect("first forward");
+        let repeated = client.begin_forward(spec()).expect("repeated destination");
+
+        assert_eq!(repeated.wait(), Err(ForwardFailure::AlreadyOwned));
+        assert_eq!(first.wait(), Ok(()));
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn ready_mapping_remains_owned_without_cleanup_on_disable() {
+        let runner = Arc::new(RecordingRunner::new([ControlResult::Succeeded]));
+        let (parent, child) = UnixStream::pair().expect("broker pair");
+        let _broker = BrokerServer::start_with_runner(
+            parent,
+            crate::platform::InheritedPeerIdentity::current_process(),
+            authority(),
+            runner.clone(),
+            Duration::from_secs(10),
+        )
+        .expect("broker server");
+        let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
+
+        assert_eq!(
+            settle_forward(&client, spec_for_mapping(43_123, 8080)),
+            Ok(())
+        );
+        assert_eq!(
+            settle_forward(&client, spec()),
+            Err(ForwardFailure::AlreadyOwned)
+        );
+        client.assert_policy(false).expect("disable policy");
+        client.assert_policy(true).expect("re-enable policy");
+        assert_eq!(
+            settle_forward(&client, spec()),
+            Err(ForwardFailure::AlreadyOwned)
+        );
+
+        assert_eq!(
+            *runner.operations.lock().expect("operations"),
+            vec!["forward"]
+        );
+    }
+
+    #[test]
+    fn attachment_disconnect_does_not_cancel_ready_mappings_individually() {
+        let runner = Arc::new(RecordingRunner::new([
+            ControlResult::Succeeded,
+            ControlResult::Succeeded,
+        ]));
+        let (parent, child) = UnixStream::pair().expect("broker pair");
+        let broker = BrokerServer::start_with_runner(
+            parent,
+            crate::platform::InheritedPeerIdentity::current_process(),
+            authority(),
+            runner.clone(),
+            Duration::from_secs(10),
+        )
+        .expect("broker server");
+        let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
+        assert_eq!(settle_forward(&client, spec_for_port(8080)), Ok(()));
+        assert_eq!(settle_forward(&client, spec_for_port(8081)), Ok(()));
+
+        drop(client);
+        broker.close();
+
+        assert_eq!(
+            *runner.operations.lock().expect("operations"),
+            vec!["forward", "forward"]
+        );
     }
 
     #[test]
@@ -886,7 +1250,7 @@ mod tests {
         let calls = (0..8)
             .map(|offset| {
                 let client = client.clone();
-                std::thread::spawn(move || client.forward(spec_for_port(8100 + offset)))
+                std::thread::spawn(move || settle_forward(&client, spec_for_port(8100 + offset)))
             })
             .collect::<Vec<_>>();
 
@@ -956,6 +1320,41 @@ mod tests {
             .expect("disable ack");
         assert!(!client.is_active());
         assert_eq!(runner.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn in_flight_cancellation_failure_does_not_change_disable_settlement() {
+        let runner = Arc::new(RecordingRunner::with_delay(
+            [ControlResult::Succeeded, ControlResult::Rejected],
+            Duration::from_millis(75),
+        ));
+        let (parent, child) = UnixStream::pair().expect("broker pair");
+        let _broker = BrokerServer::start_with_runner(
+            parent,
+            crate::platform::InheritedPeerIdentity::current_process(),
+            authority(),
+            runner.clone(),
+            Duration::from_secs(10),
+        )
+        .expect("broker server");
+        let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
+        let call = client.begin_forward(spec()).expect("forward call");
+        while runner.operations.lock().expect("operations").is_empty() {
+            std::thread::yield_now();
+        }
+        let policy_client = client.clone();
+        let disable = std::thread::spawn(move || policy_client.assert_policy(false));
+
+        assert_eq!(call.wait(), Err(ForwardFailure::Cancelled));
+        disable
+            .join()
+            .expect("disable thread")
+            .expect("disable remains confirmed");
+        assert!(!client.is_active());
+        assert_eq!(
+            *runner.operations.lock().expect("operations"),
+            vec!["forward", "cancel"]
+        );
     }
 
     #[test]
