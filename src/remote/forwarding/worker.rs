@@ -77,20 +77,6 @@ impl LocalhostPairSpec {
     pub(super) const fn local_port(self) -> u16 {
         self.ipv4.local_port
     }
-
-    pub(super) const fn remote_port(self) -> u16 {
-        self.ipv4.remote_port
-    }
-
-    #[cfg(test)]
-    pub(super) const fn ipv4(self) -> ForwardSpec {
-        self.ipv4
-    }
-
-    #[cfg(test)]
-    pub(super) const fn ipv6(self) -> ForwardSpec {
-        self.ipv6
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,33 +100,6 @@ pub(super) enum ControlResult {
     PairSecondFailed,
     PairCancellationSucceeded,
     PairCancellationFailed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PairControlResult {
-    Succeeded,
-    FirstBindFailed,
-    FirstFailed,
-    FirstTimedOut,
-    SecondFailed,
-}
-
-impl PairControlResult {
-    pub(super) const fn from_control(result: ControlResult) -> Option<Self> {
-        match result {
-            ControlResult::PairSucceeded => Some(Self::Succeeded),
-            ControlResult::PairFirstBindFailed => Some(Self::FirstBindFailed),
-            ControlResult::PairFirstFailed => Some(Self::FirstFailed),
-            ControlResult::PairFirstTimedOut => Some(Self::FirstTimedOut),
-            ControlResult::PairSecondFailed => Some(Self::SecondFailed),
-            ControlResult::Succeeded
-            | ControlResult::BindFailed
-            | ControlResult::Rejected
-            | ControlResult::TimedOut
-            | ControlResult::PairCancellationSucceeded
-            | ControlResult::PairCancellationFailed => None,
-        }
-    }
 }
 
 pub(super) trait CommandRunner: Send + Sync + 'static {
@@ -291,6 +250,7 @@ impl ControlWorker {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "forwarding worker closed"))
     }
 
+    #[cfg(test)]
     pub(super) fn recv(&self) -> io::Result<WorkerResult> {
         self.results
             .recv()

@@ -791,6 +791,50 @@ mod tests {
     }
 
     #[test]
+    fn shared_mapping_port_rewrites_each_waiters_original_url_only_after_its_commit() {
+        let local_port = NonZeroU16::new(43_123).expect("port");
+        let controller = Arc::new(FakeForwardingController::with_results([
+            Some(Ok(local_port)),
+            Some(Ok(local_port)),
+        ]));
+        let mut external_open = ClientExternalOpen::new(
+            ExternalOpenPolicy::Enabled,
+            ExternalOpenForwarding::available(controller),
+        );
+        let opened = RefCell::new(Vec::new());
+
+        for (request_id, url) in [
+            (51, "http://127.0.0.42:8080/first?token=A%2BB#One"),
+            (52, "HTTPS://127.0.0.42:8080/second%2Fpath?token=C%2BD#Two"),
+        ] {
+            assert!(external_open
+                .prepare(request_id, url.to_owned(), ExternalOpenPlatform::Linux)
+                .is_none());
+        }
+        assert_eq!(external_open.poll().len(), 2);
+        assert!(opened.borrow().is_empty());
+
+        for request_id in [52, 51] {
+            external_open
+                .commit(request_id)
+                .expect("individual commit")
+                .execute(|url| {
+                    opened.borrow_mut().push(url.to_owned());
+                    Ok(())
+                });
+        }
+        assert_eq!(
+            *opened.borrow(),
+            vec![
+                "HTTPS://127.0.0.42:43123/second%2Fpath?token=C%2BD#Two",
+                "http://127.0.0.42:43123/first?token=A%2BB#One",
+            ]
+        );
+        assert!(external_open.commit(51).is_none());
+        assert!(external_open.commit(52).is_none());
+    }
+
+    #[test]
     fn atomic_pair_failure_never_becomes_committable_or_invokes_opener() {
         let controller = Arc::new(FakeForwardingController::with_results([Some(Err(
             ForwardingPreparationError::AtomicCreationFailed,

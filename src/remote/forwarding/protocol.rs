@@ -5,7 +5,7 @@ use std::num::NonZeroU64;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-pub(super) const BROKER_PROTOCOL_VERSION: u16 = 3;
+pub(super) const BROKER_PROTOCOL_VERSION: u16 = 4;
 pub(super) const MAX_PAYLOAD_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -135,7 +135,7 @@ pub(super) enum ServerMessage {
     },
     ForwardSettled {
         id: CorrelationId,
-        result: Result<(), ForwardFailure>,
+        result: Result<u16, ForwardFailure>,
     },
     ForwardLocalhostSettled {
         id: CorrelationId,
