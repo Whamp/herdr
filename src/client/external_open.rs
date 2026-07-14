@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 
+use crate::config::SavedPortForwardLimit;
 use crate::external_open::{
     validate_external_open_url, ExternalOpenForwarding, ExternalOpenPlatform, ExternalOpenUrlError,
     ForwardingPolicyChange, ForwardingPolicySettlement, ForwardingPreparation,
@@ -25,18 +26,21 @@ struct PreparedExternalOpen {
 
 enum PendingPolicyReply {
     Mutation(ClientMessage),
-    Reload,
+    Reload { report_section_failure: bool },
 }
 
 struct PendingPolicyChange {
     requested: ExternalOpenPolicy,
+    requested_saved_mapping_limit: SavedPortForwardLimit,
     prior_effective: ExternalOpenPolicy,
+    prior_saved_mapping_limit: SavedPortForwardLimit,
     reply: PendingPolicyReply,
     operation: Box<dyn ForwardingPolicyChange>,
 }
 
 pub(super) struct ClientExternalOpen {
     policy: ExternalOpenPolicy,
+    saved_mapping_limit: SavedPortForwardLimit,
     forwarding: ExternalOpenForwarding,
     preparing: BTreeMap<u64, PreparingExternalOpen>,
     prepared: HashMap<u64, PreparedExternalOpen>,
@@ -44,9 +48,14 @@ pub(super) struct ClientExternalOpen {
 }
 
 impl ClientExternalOpen {
-    pub(super) fn new(policy: ExternalOpenPolicy, forwarding: ExternalOpenForwarding) -> Self {
+    pub(super) fn new(
+        policy: ExternalOpenPolicy,
+        saved_mapping_limit: SavedPortForwardLimit,
+        forwarding: ExternalOpenForwarding,
+    ) -> Self {
         Self {
             policy,
+            saved_mapping_limit,
             forwarding,
             preparing: BTreeMap::new(),
             prepared: HashMap::new(),
@@ -56,6 +65,10 @@ impl ClientExternalOpen {
 
     pub(super) fn policy(&self) -> ExternalOpenPolicy {
         self.policy
+    }
+
+    pub(super) fn saved_mapping_limit(&self) -> SavedPortForwardLimit {
+        self.saved_mapping_limit
     }
 
     pub(super) fn prepare(
@@ -127,62 +140,94 @@ impl ClientExternalOpen {
             || *persisted_policy != Some(requested_policy)
             || *effective_policy != requested_policy
         {
-            self.apply_policy(*effective_policy);
+            self.apply_configuration(*effective_policy, self.saved_mapping_limit);
             return vec![result];
         }
-        self.begin_policy_change(requested_policy, PendingPolicyReply::Mutation(result))
+        self.begin_policy_change(
+            requested_policy,
+            self.saved_mapping_limit,
+            PendingPolicyReply::Mutation(result),
+        )
     }
 
     pub(super) fn begin_policy_reload(
         &mut self,
         requested: ExternalOpenPolicy,
+        saved_mapping_limit: SavedPortForwardLimit,
+        report_section_failure: bool,
     ) -> Vec<ClientMessage> {
-        self.begin_policy_change(requested, PendingPolicyReply::Reload)
+        self.begin_policy_change(
+            requested,
+            saved_mapping_limit,
+            PendingPolicyReply::Reload {
+                report_section_failure,
+            },
+        )
     }
 
     fn begin_policy_change(
         &mut self,
         requested: ExternalOpenPolicy,
+        requested_saved_mapping_limit: SavedPortForwardLimit,
         reply: PendingPolicyReply,
     ) -> Vec<ClientMessage> {
         if self.policy_change.is_some() {
             return policy_change_failed(reply, self.policy);
         }
         let prior_effective = self.policy;
+        let prior_saved_mapping_limit = self.saved_mapping_limit;
         if requested == ExternalOpenPolicy::Disabled {
-            self.apply_policy(ExternalOpenPolicy::Disabled);
+            self.apply_configuration(ExternalOpenPolicy::Disabled, self.saved_mapping_limit);
         }
         let enabled = requested == ExternalOpenPolicy::Enabled;
-        match self.forwarding.begin_set_enabled(enabled) {
+        match self
+            .forwarding
+            .begin_set_enabled(enabled, requested_saved_mapping_limit)
+        {
             Ok(Some(operation)) => {
                 self.policy_change = Some(PendingPolicyChange {
                     requested,
+                    requested_saved_mapping_limit,
                     prior_effective,
+                    prior_saved_mapping_limit,
                     reply,
                     operation,
                 });
                 Vec::new()
             }
-            Ok(None) => {
-                self.apply_policy(requested);
+            Ok(None) if requested_saved_mapping_limit == prior_saved_mapping_limit => {
+                self.apply_configuration(requested, prior_saved_mapping_limit);
                 policy_change_succeeded(reply, requested)
+            }
+            Ok(None) => {
+                self.apply_configuration(requested, prior_saved_mapping_limit);
+                policy_change_without_broker(reply, requested)
             }
             Err(error) => policy_change_settled(
                 reply,
                 requested,
+                requested_saved_mapping_limit,
                 prior_effective,
                 ForwardingPolicySettlement {
                     requested: enabled,
                     effective: prior_effective == ExternalOpenPolicy::Enabled,
+                    requested_saved_mapping_limit,
+                    effective_saved_mapping_limit: prior_saved_mapping_limit,
                     result: Err(error),
                 },
-                |policy| self.apply_policy(policy),
+                prior_saved_mapping_limit,
+                |policy, limit| self.apply_configuration(policy, limit),
             ),
         }
     }
 
-    fn apply_policy(&mut self, policy: ExternalOpenPolicy) {
+    fn apply_configuration(
+        &mut self,
+        policy: ExternalOpenPolicy,
+        saved_mapping_limit: SavedPortForwardLimit,
+    ) {
         self.policy = policy;
+        self.saved_mapping_limit = saved_mapping_limit;
         if policy == ExternalOpenPolicy::Disabled {
             for preparing in self.preparing.values_mut() {
                 preparing.operation.cancel();
@@ -251,9 +296,11 @@ impl ClientExternalOpen {
             messages.extend(policy_change_settled(
                 pending.reply,
                 pending.requested,
+                pending.requested_saved_mapping_limit,
                 pending.prior_effective,
                 settlement,
-                |policy| self.apply_policy(policy),
+                pending.prior_saved_mapping_limit,
+                |policy, limit| self.apply_configuration(policy, limit),
             ));
         }
         messages
@@ -300,9 +347,34 @@ fn policy_change_succeeded(
 ) -> Vec<ClientMessage> {
     match reply {
         PendingPolicyReply::Mutation(result) => vec![result],
-        PendingPolicyReply::Reload => {
-            vec![ClientMessage::ExternalOpenPolicyUpdate { policy: effective }]
+        PendingPolicyReply::Reload {
+            report_section_failure,
+        } => {
+            let mut messages = vec![ClientMessage::ExternalOpenPolicyUpdate { policy: effective }];
+            if report_section_failure {
+                messages.push(ClientMessage::ExternalOpenPolicyReloadFailed {
+                    effective_policy: effective,
+                });
+            }
+            messages
         }
+    }
+}
+
+fn policy_change_without_broker(
+    reply: PendingPolicyReply,
+    effective: ExternalOpenPolicy,
+) -> Vec<ClientMessage> {
+    match reply {
+        PendingPolicyReply::Mutation(result) => {
+            vec![mutation_forwarding_failed(result, effective)]
+        }
+        PendingPolicyReply::Reload { .. } => vec![
+            ClientMessage::ExternalOpenPolicyUpdate { policy: effective },
+            ClientMessage::ExternalOpenPolicyReloadFailed {
+                effective_policy: effective,
+            },
+        ],
     }
 }
 
@@ -314,21 +386,38 @@ fn policy_change_failed(
         PendingPolicyReply::Mutation(result) => {
             vec![mutation_forwarding_failed(result, effective)]
         }
-        PendingPolicyReply::Reload => vec![ClientMessage::ExternalOpenPolicyReloadFailed {
-            effective_policy: effective,
-        }],
+        PendingPolicyReply::Reload { .. } => {
+            vec![ClientMessage::ExternalOpenPolicyReloadFailed {
+                effective_policy: effective,
+            }]
+        }
     }
 }
 
 fn policy_change_settled(
     reply: PendingPolicyReply,
     requested: ExternalOpenPolicy,
+    requested_saved_mapping_limit: SavedPortForwardLimit,
     prior_effective: ExternalOpenPolicy,
     settlement: ForwardingPolicySettlement,
-    mut apply: impl FnMut(ExternalOpenPolicy),
+    prior_saved_mapping_limit: SavedPortForwardLimit,
+    mut apply: impl FnMut(ExternalOpenPolicy, SavedPortForwardLimit),
 ) -> Vec<ClientMessage> {
     if requested == ExternalOpenPolicy::Disabled {
-        apply(ExternalOpenPolicy::Disabled);
+        let acknowledged_limit = !settlement.requested
+            && settlement.requested_saved_mapping_limit == requested_saved_mapping_limit
+            && settlement.effective_saved_mapping_limit == requested_saved_mapping_limit
+            && settlement.result.is_ok();
+        if requested_saved_mapping_limit != prior_saved_mapping_limit && !acknowledged_limit {
+            apply(ExternalOpenPolicy::Disabled, prior_saved_mapping_limit);
+            return policy_change_failed(reply, ExternalOpenPolicy::Disabled);
+        }
+        let retained_limit = if acknowledged_limit {
+            requested_saved_mapping_limit
+        } else {
+            prior_saved_mapping_limit
+        };
+        apply(ExternalOpenPolicy::Disabled, retained_limit);
         return policy_change_succeeded(reply, ExternalOpenPolicy::Disabled);
     }
 
@@ -339,10 +428,12 @@ fn policy_change_settled(
     };
     let expected_requested = requested == ExternalOpenPolicy::Enabled;
     if settlement.requested == expected_requested
+        && settlement.requested_saved_mapping_limit == requested_saved_mapping_limit
+        && settlement.effective_saved_mapping_limit == requested_saved_mapping_limit
         && settlement.result.is_ok()
         && effective == requested
     {
-        apply(requested);
+        apply(requested, requested_saved_mapping_limit);
         return policy_change_succeeded(reply, requested);
     }
 
@@ -351,7 +442,7 @@ fn policy_change_settled(
     } else {
         prior_effective
     };
-    apply(retained);
+    apply(retained, prior_saved_mapping_limit);
     policy_change_failed(reply, retained)
 }
 
@@ -428,9 +519,12 @@ mod tests {
     use std::num::NonZeroU16;
     use std::sync::{Arc, Mutex};
 
+    use crate::config::SavedPortForwardLimit;
     use crate::external_open::{
         ForwardingController, ForwardingPreparation, ForwardingPreparationError, LoopbackTarget,
     };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use crate::remote::forwarding::ForwardingBrokerTestHarness;
 
     use super::*;
 
@@ -491,6 +585,10 @@ mod tests {
         }
     }
 
+    fn saved_limit(value: u8) -> SavedPortForwardLimit {
+        SavedPortForwardLimit::new(value).expect("valid saved mapping limit")
+    }
+
     fn persisted_mutation(request_id: u64, requested: ExternalOpenPolicy) -> ClientMessage {
         ClientMessage::ExternalOpenPolicyMutationResult {
             request_id,
@@ -523,6 +621,7 @@ mod tests {
         fn begin_set_enabled(
             &self,
             enabled: bool,
+            saved_mapping_limit: SavedPortForwardLimit,
         ) -> Result<Box<dyn ForwardingPolicyChange>, ForwardingPreparationError> {
             let result = self
                 .policy_result
@@ -532,6 +631,8 @@ mod tests {
                 .unwrap_or(ForwardingPolicySettlement {
                     requested: enabled,
                     effective: enabled,
+                    requested_saved_mapping_limit: saved_mapping_limit,
+                    effective_saved_mapping_limit: saved_mapping_limit,
                     result: Ok(()),
                 });
             Ok(Box::new(FakePolicyChange {
@@ -549,6 +650,7 @@ mod tests {
         ]));
         let mut external_open = ClientExternalOpen::new(
             ExternalOpenPolicy::Enabled,
+            SavedPortForwardLimit::DEFAULT,
             ExternalOpenForwarding::available(controller),
         );
 
@@ -582,6 +684,7 @@ mod tests {
         let cancellations = Arc::clone(&controller.cancellations);
         let mut external_open = ClientExternalOpen::new(
             ExternalOpenPolicy::Enabled,
+            SavedPortForwardLimit::DEFAULT,
             ExternalOpenForwarding::available(controller),
         );
         assert!(external_open
@@ -605,6 +708,7 @@ mod tests {
         let cancellations = Arc::clone(&controller.cancellations);
         let mut external_open = ClientExternalOpen::new(
             ExternalOpenPolicy::Enabled,
+            SavedPortForwardLimit::DEFAULT,
             ExternalOpenForwarding::available(controller),
         );
         assert!(external_open
@@ -637,6 +741,7 @@ mod tests {
         {
             let mut external_open = ClientExternalOpen::new(
                 ExternalOpenPolicy::Enabled,
+                SavedPortForwardLimit::DEFAULT,
                 ExternalOpenForwarding::available(controller),
             );
             assert!(external_open
@@ -659,6 +764,7 @@ mod tests {
         {
             let mut external_open = ClientExternalOpen::new(
                 ExternalOpenPolicy::Enabled,
+                SavedPortForwardLimit::DEFAULT,
                 ExternalOpenForwarding::available(controller),
             );
             for request_id in [41, 42] {
@@ -675,16 +781,75 @@ mod tests {
     }
 
     #[test]
+    fn partial_config_reload_applies_valid_policy_and_reports_invalid_remote_section() {
+        let controller = Arc::new(FakeForwardingController::with_results([]));
+        let mut external_open = ClientExternalOpen::new(
+            ExternalOpenPolicy::Enabled,
+            SavedPortForwardLimit::DEFAULT,
+            ExternalOpenForwarding::available(controller),
+        );
+
+        assert!(external_open
+            .begin_policy_reload(
+                ExternalOpenPolicy::Disabled,
+                SavedPortForwardLimit::DEFAULT,
+                true,
+            )
+            .is_empty());
+        assert_eq!(
+            external_open.poll(),
+            vec![
+                ClientMessage::ExternalOpenPolicyUpdate {
+                    policy: ExternalOpenPolicy::Disabled,
+                },
+                ClientMessage::ExternalOpenPolicyReloadFailed {
+                    effective_policy: ExternalOpenPolicy::Disabled,
+                },
+            ]
+        );
+        assert_eq!(external_open.policy(), ExternalOpenPolicy::Disabled);
+    }
+
+    #[test]
+    fn unavailable_broker_retains_saved_limit_and_reports_one_reload_failure() {
+        let mut external_open = ClientExternalOpen::new(
+            ExternalOpenPolicy::Enabled,
+            SavedPortForwardLimit::DEFAULT,
+            ExternalOpenForwarding::Unavailable,
+        );
+
+        assert_eq!(
+            external_open.begin_policy_reload(ExternalOpenPolicy::Enabled, saved_limit(64), false),
+            vec![
+                ClientMessage::ExternalOpenPolicyUpdate {
+                    policy: ExternalOpenPolicy::Enabled,
+                },
+                ClientMessage::ExternalOpenPolicyReloadFailed {
+                    effective_policy: ExternalOpenPolicy::Enabled,
+                },
+            ]
+        );
+        assert_eq!(
+            external_open.saved_mapping_limit(),
+            SavedPortForwardLimit::DEFAULT
+        );
+        assert!(external_open.poll().is_empty());
+    }
+
+    #[test]
     fn activation_failure_uses_the_existing_mutation_result_and_notice_stage() {
         let controller = Arc::new(FakeForwardingController::with_results([]));
         *controller.policy_result.lock().expect("policy result") =
             Some(ForwardingPolicySettlement {
                 requested: true,
                 effective: false,
+                requested_saved_mapping_limit: SavedPortForwardLimit::DEFAULT,
+                effective_saved_mapping_limit: SavedPortForwardLimit::DEFAULT,
                 result: Err(ForwardingPreparationError::CommandRejected),
             });
         let mut external_open = ClientExternalOpen::new(
             ExternalOpenPolicy::Disabled,
+            SavedPortForwardLimit::DEFAULT,
             ExternalOpenForwarding::available(controller),
         );
 
@@ -705,16 +870,132 @@ mod tests {
     }
 
     #[test]
+    fn acknowledged_limit_increase_and_decrease_become_effective_only_after_poll() {
+        let controller = Arc::new(FakeForwardingController::with_results([]));
+        let mut external_open = ClientExternalOpen::new(
+            ExternalOpenPolicy::Enabled,
+            SavedPortForwardLimit::DEFAULT,
+            ExternalOpenForwarding::available(controller),
+        );
+
+        for requested in [saved_limit(64), saved_limit(1)] {
+            assert!(external_open
+                .begin_policy_reload(ExternalOpenPolicy::Enabled, requested, false)
+                .is_empty());
+            assert_ne!(external_open.saved_mapping_limit(), requested);
+            assert_eq!(
+                external_open.poll(),
+                vec![ClientMessage::ExternalOpenPolicyUpdate {
+                    policy: ExternalOpenPolicy::Enabled,
+                }]
+            );
+            assert_eq!(external_open.saved_mapping_limit(), requested);
+        }
+    }
+
+    #[test]
+    fn failed_or_mismatched_limit_acknowledgements_retain_the_entire_remote_limit() {
+        let cases = [
+            ForwardingPolicySettlement {
+                requested: true,
+                effective: true,
+                requested_saved_mapping_limit: saved_limit(64),
+                effective_saved_mapping_limit: saved_limit(64),
+                result: Err(ForwardingPreparationError::Unavailable),
+            },
+            ForwardingPolicySettlement {
+                requested: true,
+                effective: true,
+                requested_saved_mapping_limit: saved_limit(64),
+                effective_saved_mapping_limit: saved_limit(64),
+                result: Err(ForwardingPreparationError::CommandTimedOut),
+            },
+            ForwardingPolicySettlement {
+                requested: false,
+                effective: true,
+                requested_saved_mapping_limit: saved_limit(64),
+                effective_saved_mapping_limit: saved_limit(64),
+                result: Ok(()),
+            },
+            ForwardingPolicySettlement {
+                requested: true,
+                effective: true,
+                requested_saved_mapping_limit: saved_limit(63),
+                effective_saved_mapping_limit: saved_limit(63),
+                result: Ok(()),
+            },
+        ];
+
+        for settlement in cases {
+            let controller = Arc::new(FakeForwardingController::with_results([]));
+            *controller.policy_result.lock().expect("policy result") = Some(settlement);
+            let mut external_open = ClientExternalOpen::new(
+                ExternalOpenPolicy::Enabled,
+                SavedPortForwardLimit::DEFAULT,
+                ExternalOpenForwarding::available(controller),
+            );
+            assert!(external_open
+                .begin_policy_reload(ExternalOpenPolicy::Enabled, saved_limit(64), false)
+                .is_empty());
+            assert_eq!(
+                external_open.poll(),
+                vec![ClientMessage::ExternalOpenPolicyReloadFailed {
+                    effective_policy: ExternalOpenPolicy::Enabled,
+                }]
+            );
+            assert_eq!(
+                external_open.saved_mapping_limit(),
+                SavedPortForwardLimit::DEFAULT
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_policy_limit_cleanup_failure_retains_prior_limit() {
+        let controller = Arc::new(FakeForwardingController::with_results([]));
+        *controller.policy_result.lock().expect("policy result") =
+            Some(ForwardingPolicySettlement {
+                requested: false,
+                effective: false,
+                requested_saved_mapping_limit: saved_limit(64),
+                effective_saved_mapping_limit: saved_limit(64),
+                result: Err(ForwardingPreparationError::CommandRejected),
+            });
+        let mut external_open = ClientExternalOpen::new(
+            ExternalOpenPolicy::Disabled,
+            SavedPortForwardLimit::DEFAULT,
+            ExternalOpenForwarding::available(controller),
+        );
+
+        assert!(external_open
+            .begin_policy_reload(ExternalOpenPolicy::Disabled, saved_limit(64), false)
+            .is_empty());
+        assert_eq!(
+            external_open.poll(),
+            vec![ClientMessage::ExternalOpenPolicyReloadFailed {
+                effective_policy: ExternalOpenPolicy::Disabled,
+            }]
+        );
+        assert_eq!(
+            external_open.saved_mapping_limit(),
+            SavedPortForwardLimit::DEFAULT
+        );
+    }
+
+    #[test]
     fn confirmed_disable_emits_one_truthful_mutation_without_reload_failure() {
         let controller = Arc::new(FakeForwardingController::with_results([]));
         *controller.policy_result.lock().expect("policy result") =
             Some(ForwardingPolicySettlement {
                 requested: false,
                 effective: false,
+                requested_saved_mapping_limit: SavedPortForwardLimit::DEFAULT,
+                effective_saved_mapping_limit: SavedPortForwardLimit::DEFAULT,
                 result: Err(ForwardingPreparationError::CommandRejected),
             });
         let mut external_open = ClientExternalOpen::new(
             ExternalOpenPolicy::Enabled,
+            SavedPortForwardLimit::DEFAULT,
             ExternalOpenForwarding::available(controller),
         );
 
@@ -733,6 +1014,7 @@ mod tests {
         let controller = Arc::new(FakeForwardingController::with_results([]));
         let mut external_open = ClientExternalOpen::new(
             ExternalOpenPolicy::Enabled,
+            SavedPortForwardLimit::DEFAULT,
             ExternalOpenForwarding::available(controller.clone()),
         );
 
@@ -758,6 +1040,7 @@ mod tests {
         ))]));
         let mut external_open = ClientExternalOpen::new(
             ExternalOpenPolicy::Enabled,
+            SavedPortForwardLimit::DEFAULT,
             ExternalOpenForwarding::available(controller.clone()),
         );
         let opened = RefCell::new(Vec::new());
@@ -799,6 +1082,7 @@ mod tests {
         ]));
         let mut external_open = ClientExternalOpen::new(
             ExternalOpenPolicy::Enabled,
+            SavedPortForwardLimit::DEFAULT,
             ExternalOpenForwarding::available(controller),
         );
         let opened = RefCell::new(Vec::new());
@@ -841,6 +1125,7 @@ mod tests {
         ))]));
         let mut external_open = ClientExternalOpen::new(
             ExternalOpenPolicy::Enabled,
+            SavedPortForwardLimit::DEFAULT,
             ExternalOpenForwarding::available(controller),
         );
         let opened = RefCell::new(Vec::<String>::new());
@@ -870,6 +1155,7 @@ mod tests {
         ))]));
         let mut external_open = ClientExternalOpen::new(
             ExternalOpenPolicy::Enabled,
+            SavedPortForwardLimit::DEFAULT,
             ExternalOpenForwarding::available(controller),
         );
         let opened = RefCell::new(Vec::new());
@@ -914,8 +1200,11 @@ mod tests {
         ];
         for (offset, (forwarding, expected)) in immediate.into_iter().enumerate() {
             let request_id = 60 + u64::try_from(offset).expect("small offset");
-            let mut external_open =
-                ClientExternalOpen::new(ExternalOpenPolicy::Enabled, forwarding);
+            let mut external_open = ClientExternalOpen::new(
+                ExternalOpenPolicy::Enabled,
+                SavedPortForwardLimit::DEFAULT,
+                forwarding,
+            );
             assert_eq!(
                 external_open.prepare(
                     request_id,
@@ -934,6 +1223,14 @@ mod tests {
             (
                 ForwardingPreparationError::TooManyRequests,
                 ExternalOpenPreparationFailure::TooManyForwardRequests,
+            ),
+            (
+                ForwardingPreparationError::TooManyWaiters,
+                ExternalOpenPreparationFailure::TooManyMappingWaiters,
+            ),
+            (
+                ForwardingPreparationError::CapacityExhausted,
+                ExternalOpenPreparationFailure::ForwardCapacityExhausted,
             ),
             (
                 ForwardingPreparationError::BindExhausted,
@@ -968,6 +1265,7 @@ mod tests {
                     70 + u64::try_from(offset * 2 + phase_offset).expect("small offset");
                 let mut external_open = ClientExternalOpen::new(
                     ExternalOpenPolicy::Enabled,
+                    SavedPortForwardLimit::DEFAULT,
                     ExternalOpenForwarding::available(controller),
                 );
                 let immediate = external_open.prepare(
@@ -991,11 +1289,231 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn collect_messages(
+        external_open: &mut ClientExternalOpen,
+        expected_count: usize,
+    ) -> Vec<ClientMessage> {
+        let mut messages = Vec::new();
+        for _ in 0..100_000 {
+            messages.extend(external_open.poll());
+            if messages.len() >= expected_count {
+                return messages;
+            }
+            std::thread::yield_now();
+        }
+        panic!("external-open messages did not settle");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ninth_real_mapping_waiter_settles_once_without_open_authority() {
+        const VALID_WAITER_COUNT: usize = 8;
+        let mut broker = ForwardingBrokerTestHarness::blocked(saved_limit(64));
+        let mut external_open = ClientExternalOpen::new(
+            ExternalOpenPolicy::Enabled,
+            saved_limit(64),
+            ExternalOpenForwarding::available(broker.controller()),
+        );
+        let valid_request_ids = 700..708;
+
+        for request_id in valid_request_ids.clone() {
+            assert_eq!(
+                external_open.prepare(
+                    request_id,
+                    format!("http://127.0.0.1:8080/waiter-{request_id}"),
+                    ExternalOpenPlatform::Linux,
+                ),
+                None
+            );
+            if request_id == valid_request_ids.start {
+                broker.wait_until_blocked();
+            }
+        }
+
+        let rejected_request_id = valid_request_ids.end;
+        let opened = RefCell::new(Vec::new());
+        assert_eq!(
+            external_open.prepare(
+                rejected_request_id,
+                "http://127.0.0.1:8080/rejected-ninth".to_owned(),
+                ExternalOpenPlatform::Linux,
+            ),
+            None
+        );
+        let rejection = collect_messages(&mut external_open, 1);
+        assert!(matches!(
+            rejection.as_slice(),
+            [ClientMessage::ExternalOpenPreparationFailed {
+                request_id,
+                reason: ExternalOpenPreparationFailure::TooManyMappingWaiters,
+            }] if *request_id == rejected_request_id
+        ));
+        if let Some(committed) = external_open.commit(rejected_request_id) {
+            committed.execute(|url| {
+                opened.borrow_mut().push(url.to_owned());
+                Ok(())
+            });
+        }
+        assert!(opened.borrow().is_empty());
+        assert_eq!(broker.operations(), vec!["forward"]);
+
+        broker.release_blocked();
+        let readiness = collect_messages(&mut external_open, VALID_WAITER_COUNT);
+        assert_eq!(readiness.len(), VALID_WAITER_COUNT);
+        for request_id in valid_request_ids.clone() {
+            assert!(readiness.contains(&ClientMessage::ExternalOpenReady {
+                request_id,
+                target: ExternalOpenTarget::Forwarded {
+                    port_status: ExternalOpenPortStatus::SamePort,
+                },
+            }));
+        }
+        assert!(external_open.poll().is_empty());
+        assert!(external_open.commit(rejected_request_id).is_none());
+        assert_eq!(broker.operations(), vec!["forward"]);
+        for request_id in (valid_request_ids.start + 1)..valid_request_ids.end {
+            assert!(
+                external_open.commit(request_id).is_some(),
+                "valid waiter {request_id} lost commit authority"
+            );
+        }
+        assert!(opened.borrow().is_empty());
+
+        external_open
+            .commit(valid_request_ids.start)
+            .expect("valid waiter retains commit authority")
+            .execute(|url| {
+                opened.borrow_mut().push(url.to_owned());
+                Ok(())
+            });
+        assert_eq!(*opened.borrow(), vec!["http://127.0.0.1:8080/waiter-700"]);
+        assert!(external_open.commit(rejected_request_id).is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn settle_numeric_mapping(
+        controller: &Arc<dyn ForwardingController>,
+        remote_port: u16,
+    ) -> NonZeroU16 {
+        let mut operation = controller
+            .begin_prepare_numeric(
+                LoopbackTarget::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+                NonZeroU16::new(remote_port).expect("nonzero remote port"),
+            )
+            .expect("mapping preparation begins");
+        for _ in 0..100_000 {
+            if let Some(result) = operation.poll() {
+                return result.expect("successful listener settlement");
+            }
+            std::thread::yield_now();
+        }
+        panic!("numeric mapping did not settle");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn real_listener_exhaustion_rejects_new_work_but_preserves_commit_gated_ready_reuse() {
+        const FIRST_REMOTE_PORT: u16 = 20_000;
+        const LISTENER_CEILING: u16 = 128;
+        let broker = ForwardingBrokerTestHarness::succeeding(saved_limit(1));
+        let controller = broker.controller();
+
+        for offset in 0..LISTENER_CEILING {
+            let remote_port = FIRST_REMOTE_PORT + offset;
+            assert_eq!(
+                settle_numeric_mapping(&controller, remote_port).get(),
+                remote_port
+            );
+        }
+        assert_eq!(
+            broker.operation_count("forward"),
+            usize::from(LISTENER_CEILING)
+        );
+        assert_eq!(
+            broker.operation_count("cancel"),
+            usize::from(LISTENER_CEILING - 1)
+        );
+        let operations_at_exhaustion = broker.total_operations();
+
+        let retained_port = FIRST_REMOTE_PORT + LISTENER_CEILING - 1;
+        let rejected_request_id = 900;
+        let opened = RefCell::new(Vec::new());
+        let mut external_open = ClientExternalOpen::new(
+            ExternalOpenPolicy::Enabled,
+            saved_limit(1),
+            ExternalOpenForwarding::available(controller),
+        );
+        assert_eq!(
+            external_open.prepare(
+                rejected_request_id,
+                "http://127.0.0.1:30000/rejected-at-capacity".to_owned(),
+                ExternalOpenPlatform::Linux,
+            ),
+            None
+        );
+        let rejection = collect_messages(&mut external_open, 1);
+        assert!(matches!(
+            rejection.as_slice(),
+            [ClientMessage::ExternalOpenPreparationFailed {
+                request_id,
+                reason: ExternalOpenPreparationFailure::ForwardCapacityExhausted,
+            }] if *request_id == rejected_request_id
+        ));
+        if let Some(committed) = external_open.commit(rejected_request_id) {
+            committed.execute(|url| {
+                opened.borrow_mut().push(url.to_owned());
+                Ok(())
+            });
+        }
+        assert!(opened.borrow().is_empty());
+        assert!(external_open.poll().is_empty());
+        assert_eq!(broker.total_operations(), operations_at_exhaustion);
+
+        let retained_request_id = 901;
+        assert_eq!(
+            external_open.prepare(
+                retained_request_id,
+                format!("http://127.0.0.1:{retained_port}/retained-ready"),
+                ExternalOpenPlatform::Linux,
+            ),
+            None
+        );
+        let readiness = collect_messages(&mut external_open, 1);
+        assert!(matches!(
+            readiness.as_slice(),
+            [ClientMessage::ExternalOpenReady {
+                request_id,
+                target: ExternalOpenTarget::Forwarded {
+                    port_status: ExternalOpenPortStatus::SamePort,
+                },
+            }] if *request_id == retained_request_id
+        ));
+        assert_eq!(broker.total_operations(), operations_at_exhaustion);
+        assert!(external_open.commit(rejected_request_id).is_none());
+        assert!(opened.borrow().is_empty());
+        external_open
+            .commit(retained_request_id)
+            .expect("server commit grants retained Ready mapping authority")
+            .execute(|url| {
+                opened.borrow_mut().push(url.to_owned());
+                Ok(())
+            });
+        assert_eq!(
+            *opened.borrow(),
+            vec![format!("http://127.0.0.1:{retained_port}/retained-ready")]
+        );
+        assert!(external_open.poll().is_empty());
+        assert!(external_open.commit(rejected_request_id).is_none());
+        assert_eq!(broker.total_operations(), operations_at_exhaustion);
+    }
+
     #[test]
     fn ordinary_url_remains_immediately_ready_without_forwarding() {
         let original = "https://example.com/a%2Fb?token=A%2BB#Frag";
         let mut external_open = ClientExternalOpen::new(
             ExternalOpenPolicy::Enabled,
+            SavedPortForwardLimit::DEFAULT,
             ExternalOpenForwarding::Unavailable,
         );
 

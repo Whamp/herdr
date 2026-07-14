@@ -449,6 +449,7 @@ pub(crate) enum ServerEvent {
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
         direct_attach_requested: bool,
         external_open_policy: Option<crate::protocol::ExternalOpenPolicy>,
+        external_open_attachment_id: Option<crate::protocol::ExternalOpenAttachmentId>,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -666,6 +667,7 @@ pub(crate) fn handle_client_handshake(
         keybindings,
         direct_attach_requested,
         external_open_policy,
+        external_open_attachment_id,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -677,6 +679,7 @@ pub(crate) fn handle_client_handshake(
             keybindings,
             launch_mode,
             external_open_policy,
+            external_open_attachment_id,
         } => {
             // Version check.
             match protocol::check_client_version(version) {
@@ -706,10 +709,14 @@ pub(crate) fn handle_client_handshake(
                 }
             };
 
-            let direct_attach_requested = match (launch_mode, external_open_policy) {
-                (ClientLaunchMode::App, Some(_)) => false,
-                (ClientLaunchMode::TerminalAttach, None) => true,
-                (ClientLaunchMode::App, None) => {
+            let direct_attach_requested = match (
+                launch_mode,
+                external_open_policy,
+                external_open_attachment_id,
+            ) {
+                (ClientLaunchMode::App, Some(_), Some(_)) => false,
+                (ClientLaunchMode::TerminalAttach, None, None) => true,
+                (ClientLaunchMode::App, None, _) => {
                     let welcome = ServerMessage::Welcome {
                         version: PROTOCOL_VERSION,
                         encoding: RenderEncoding::SemanticFrame,
@@ -720,7 +727,19 @@ pub(crate) fn handle_client_handshake(
                     let _ = protocol::write_message(&mut stream, &welcome);
                     return Ok(());
                 }
-                (ClientLaunchMode::TerminalAttach, Some(_)) => {
+                (ClientLaunchMode::App, Some(_), None) => {
+                    let welcome = ServerMessage::Welcome {
+                        version: PROTOCOL_VERSION,
+                        encoding: RenderEncoding::SemanticFrame,
+                        error: Some(
+                            "full app client must advertise external-open attachment identity"
+                                .to_owned(),
+                        ),
+                    };
+                    let _ = protocol::write_message(&mut stream, &welcome);
+                    return Ok(());
+                }
+                (ClientLaunchMode::TerminalAttach, _, _) => {
                     let welcome = ServerMessage::Welcome {
                         version: PROTOCOL_VERSION,
                         encoding: RenderEncoding::SemanticFrame,
@@ -745,6 +764,7 @@ pub(crate) fn handle_client_handshake(
                 keybindings,
                 direct_attach_requested,
                 external_open_policy,
+                external_open_attachment_id,
             )
         }
         _ => {
@@ -800,6 +820,7 @@ pub(crate) fn handle_client_handshake(
         keybindings,
         direct_attach_requested,
         external_open_policy,
+        external_open_attachment_id,
         writer,
     });
 
@@ -1414,6 +1435,9 @@ new_tab = "ctrl+notakey"
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
                 external_open_policy: Some(crate::protocol::ExternalOpenPolicy::Disabled),
+                external_open_attachment_id: Some(
+                    crate::protocol::ExternalOpenAttachmentId::for_test(1),
+                ),
             },
         )
         .expect("write hello");
@@ -1447,6 +1471,7 @@ new_tab = "ctrl+notakey"
                 keybindings,
                 direct_attach_requested,
                 external_open_policy,
+                external_open_attachment_id,
                 writer,
             } => {
                 assert_eq!(client_id, 42);
@@ -1458,6 +1483,10 @@ new_tab = "ctrl+notakey"
                 assert_eq!(
                     external_open_policy,
                     Some(crate::protocol::ExternalOpenPolicy::Disabled)
+                );
+                assert_eq!(
+                    external_open_attachment_id,
+                    Some(crate::protocol::ExternalOpenAttachmentId::for_test(1))
                 );
                 drop(writer);
             }
@@ -1495,6 +1524,7 @@ new_tab = "ctrl+notakey"
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::TerminalAttach,
                 external_open_policy: None,
+                external_open_attachment_id: None,
             },
         )
         .expect("write hello");
@@ -1541,17 +1571,39 @@ new_tab = "ctrl+notakey"
 
     #[test]
     fn handshake_rejects_policy_presence_for_the_wrong_connection_kind() {
-        for (name, launch_mode, external_open_policy, expected_error) in [
+        for (
+            name,
+            launch_mode,
+            external_open_policy,
+            external_open_attachment_id,
+            expected_error,
+        ) in [
             (
                 "app-missing-policy",
                 ClientLaunchMode::App,
                 None,
+                Some(crate::protocol::ExternalOpenAttachmentId::for_test(1)),
                 "full app client must advertise external-open policy",
+            ),
+            (
+                "app-missing-attachment",
+                ClientLaunchMode::App,
+                Some(crate::protocol::ExternalOpenPolicy::Enabled),
+                None,
+                "full app client must advertise external-open attachment identity",
             ),
             (
                 "terminal-advertises-policy",
                 ClientLaunchMode::TerminalAttach,
                 Some(crate::protocol::ExternalOpenPolicy::Enabled),
+                Some(crate::protocol::ExternalOpenAttachmentId::for_test(1)),
+                "terminal connection must not advertise external-open policy",
+            ),
+            (
+                "terminal-spoofs-attachment",
+                ClientLaunchMode::TerminalAttach,
+                None,
+                Some(crate::protocol::ExternalOpenAttachmentId::for_test(1)),
                 "terminal connection must not advertise external-open policy",
             ),
         ] {
@@ -1574,6 +1626,7 @@ new_tab = "ctrl+notakey"
                     keybindings: ClientKeybindings::Server,
                     launch_mode,
                     external_open_policy,
+                    external_open_attachment_id,
                 },
             )
             .expect("write invalid hello");

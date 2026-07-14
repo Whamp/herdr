@@ -75,13 +75,18 @@ impl InheritedPeerIdentity {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn adopt_inherited_forwarding_capability(
     initial_policy: bool,
+    initial_saved_mapping_limit: crate::config::SavedPortForwardLimit,
 ) -> std::io::Result<crate::external_open::ExternalOpenForwarding> {
-    crate::remote::forwarding::adopt_external_open_forwarding(initial_policy)
+    crate::remote::forwarding::adopt_external_open_forwarding(
+        initial_policy,
+        initial_saved_mapping_limit,
+    )
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn adopt_inherited_forwarding_capability(
     _initial_policy: bool,
+    _initial_saved_mapping_limit: crate::config::SavedPortForwardLimit,
 ) -> std::io::Result<crate::external_open::ExternalOpenForwarding> {
     Ok(crate::external_open::ExternalOpenForwarding::Unavailable)
 }

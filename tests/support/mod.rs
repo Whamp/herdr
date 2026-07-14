@@ -230,19 +230,24 @@ pub fn client_handshake(
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
 
+    static NEXT_ATTACHMENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let attachment = NEXT_ATTACHMENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let hello_payload = encode_varint_enum(
         0,
         &[
             &encode_varint_u32(version),
             &encode_varint_u16(cols),
             &encode_varint_u16(rows),
-            &encode_varint_u32(8),  // cell_width_px
-            &encode_varint_u32(16), // cell_height_px
-            &encode_varint_u32(0),  // RenderEncoding::SemanticFrame
-            &encode_varint_u32(0),  // ClientKeybindings::Server
-            &encode_varint_u32(0),  // ClientLaunchMode::App
-            &encode_varint_u32(1),  // Some external-open policy
-            &encode_varint_u32(0),  // ExternalOpenPolicy::Disabled
+            &encode_varint_u32(8),          // cell_width_px
+            &encode_varint_u32(16),         // cell_height_px
+            &encode_varint_u32(0),          // RenderEncoding::SemanticFrame
+            &encode_varint_u32(0),          // ClientKeybindings::Server
+            &encode_varint_u32(0),          // ClientLaunchMode::App
+            &encode_varint_u32(1),          // Some external-open policy
+            &encode_varint_u32(0),          // ExternalOpenPolicy::Disabled
+            &encode_varint_u32(1),          // Some external-open attachment
+            &encode_varint_u32(1),          // ExternalOpenAttachmentId high u64
+            &encode_varint_u32(attachment), // ExternalOpenAttachmentId low u64
         ],
     );
     let framed = frame_message(&hello_payload);

@@ -3,6 +3,53 @@ mod unix;
 
 pub(crate) mod forwarding;
 
+pub(crate) const EXTERNAL_OPEN_ATTACHMENT_ENV_VAR: &str = "HERDR_EXTERNAL_OPEN_ATTACHMENT_ID";
+
+pub(crate) fn new_external_open_attachment_id() -> crate::protocol::ExternalOpenAttachmentId {
+    use sha2::Digest as _;
+
+    static NEXT_ATTACHMENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let sequence = NEXT_ATTACHMENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut digest = sha2::Sha256::new();
+    digest.update(std::process::id().to_le_bytes());
+    digest.update(sequence.to_le_bytes());
+    digest.update(now.to_le_bytes());
+    let bytes = digest.finalize();
+    let mut high = [0_u8; 8];
+    let mut low = [0_u8; 8];
+    high.copy_from_slice(&bytes[..8]);
+    low.copy_from_slice(&bytes[8..16]);
+    crate::protocol::ExternalOpenAttachmentId::from_parts([
+        u64::from_le_bytes(high),
+        u64::from_le_bytes(low),
+    ])
+}
+
+pub(crate) fn take_external_open_attachment_id(
+) -> std::io::Result<crate::protocol::ExternalOpenAttachmentId> {
+    let value = std::env::var_os(EXTERNAL_OPEN_ATTACHMENT_ENV_VAR);
+    std::env::remove_var(EXTERNAL_OPEN_ATTACHMENT_ENV_VAR);
+    let Some(value) = value else {
+        return Ok(new_external_open_attachment_id());
+    };
+    let value = value.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid external-open attachment identity",
+        )
+    })?;
+    crate::protocol::ExternalOpenAttachmentId::from_env_value(value).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid external-open attachment identity",
+        )
+    })
+}
+
 #[cfg(unix)]
 pub(crate) use unix::*;
 
@@ -192,6 +239,24 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_owner_issues_distinct_opaque_roundtrippable_identities() {
+        let first = new_external_open_attachment_id();
+        let second = new_external_open_attachment_id();
+
+        assert_ne!(first, second);
+        assert_eq!(
+            crate::protocol::ExternalOpenAttachmentId::from_env_value(&first.to_env_value()),
+            Some(first)
+        );
+        assert_eq!(
+            crate::protocol::ExternalOpenAttachmentId::from_env_value(
+                "00000000000000000000000000000000"
+            ),
+            None
+        );
+    }
 
     #[test]
     fn remote_auth_error_matches_ssh_auth_denied() {

@@ -61,6 +61,37 @@ pub enum ClientLaunchMode {
     TerminalAttach,
 }
 
+/// Stable opaque identity of one external-open attachment lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ExternalOpenAttachmentId([u64; 2]);
+
+impl ExternalOpenAttachmentId {
+    pub(crate) const fn from_parts(parts: [u64; 2]) -> Self {
+        Self(parts)
+    }
+
+    // Keep stable serialization available to cross-target roundtrip tests even
+    // though only Unix launchers export the attachment identity at runtime.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) fn to_env_value(self) -> String {
+        format!("{:016x}{:016x}", self.0[0], self.0[1])
+    }
+
+    pub(crate) fn from_env_value(value: &str) -> Option<Self> {
+        if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let high = u64::from_str_radix(&value[..16], 16).ok()?;
+        let low = u64::from_str_radix(&value[16..], 16).ok()?;
+        (high != 0 || low != 0).then_some(Self([high, low]))
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self([0x4845_5244_525f_4154, value])
+    }
+}
+
 /// Effective device-local policy advertised by a full app connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExternalOpenPolicy {
@@ -383,6 +414,8 @@ pub enum ClientMessage {
         launch_mode: ClientLaunchMode,
         /// Effective local policy for full app connections; absent for terminal connections.
         external_open_policy: Option<ExternalOpenPolicy>,
+        /// Stable external-open attachment authority; absent for terminal connections.
+        external_open_attachment_id: Option<ExternalOpenAttachmentId>,
     },
 
     /// Raw input bytes read from the client's stdin.
@@ -1049,6 +1082,17 @@ mod tests {
     use super::*;
     use ratatui::style::{Color, Modifier};
 
+    #[test]
+    fn external_open_attachment_id_has_stable_environment_roundtrip() {
+        let id =
+            ExternalOpenAttachmentId::from_parts([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]);
+
+        let encoded = id.to_env_value();
+
+        assert_eq!(encoded, "0123456789abcdeffedcba9876543210");
+        assert_eq!(ExternalOpenAttachmentId::from_env_value(&encoded), Some(id));
+    }
+
     // ---- Round-trip: ClientMessage ----
 
     #[test]
@@ -1063,6 +1107,7 @@ mod tests {
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
             external_open_policy: Some(ExternalOpenPolicy::Enabled),
+            external_open_attachment_id: Some(ExternalOpenAttachmentId::for_test(1)),
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -1082,6 +1127,7 @@ mod tests {
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::TerminalAttach,
             external_open_policy: None,
+            external_open_attachment_id: None,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -1120,6 +1166,7 @@ mod tests {
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
                 external_open_policy: Some(ExternalOpenPolicy::Disabled),
+                external_open_attachment_id: Some(ExternalOpenAttachmentId::for_test(1)),
             }),
             0
         );
@@ -1806,6 +1853,7 @@ mod tests {
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
             external_open_policy: Some(ExternalOpenPolicy::Disabled),
+            external_open_attachment_id: Some(ExternalOpenAttachmentId::for_test(1)),
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -1881,6 +1929,7 @@ mod tests {
                     keybindings: ClientKeybindings::Server,
                     launch_mode: ClientLaunchMode::App,
                     external_open_policy: Some(ExternalOpenPolicy::Disabled),
+                    external_open_attachment_id: Some(ExternalOpenAttachmentId::for_test(1)),
                 },
                 1 => ClientMessage::Input {
                     data: vec![(i % 256) as u8; (i as usize % 50) + 1],
@@ -2318,6 +2367,7 @@ mod tests {
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
             external_open_policy: Some(ExternalOpenPolicy::Disabled),
+            external_open_attachment_id: Some(ExternalOpenAttachmentId::for_test(1)),
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -2355,6 +2405,7 @@ mod tests {
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
                 external_open_policy: Some(ExternalOpenPolicy::Disabled),
+                external_open_attachment_id: Some(ExternalOpenAttachmentId::for_test(1)),
             },
             ClientMessage::Input {
                 data: b"hello world".to_vec(),

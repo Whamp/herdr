@@ -1022,6 +1022,12 @@
           "type": "boolean",
           "default": "true",
           "description": "Add keepalive fallbacks and private connection reuse for `herdr --remote`. Set false to run plain ssh unchanged."
+        },
+        {
+          "key": "remote.saved_port_forward_limit",
+          "type": "integer",
+          "default": "12",
+          "description": "Maximum Creating and Ready port-forward mappings retained per remote attachment. Accepts integer values from 1 through 64; invalid values are rejected rather than clamped."
         }
       ]
     },

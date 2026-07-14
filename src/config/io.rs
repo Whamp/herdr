@@ -133,6 +133,10 @@ impl Config {
                 }
             }
             Err(err) => {
+                if let Some(loaded) = load_initial_with_remote_defaults(&content) {
+                    warn!(err = %err, "invalid remote config, using remote defaults");
+                    return loaded;
+                }
                 warn!(err = %err, "config parse error, using defaults");
                 LoadedConfig {
                     config: Self::default(),
@@ -142,6 +146,29 @@ impl Config {
             }
         }
     }
+}
+
+fn load_initial_with_remote_defaults(content: &str) -> Option<LoadedConfig> {
+    let mut value = content.parse::<toml::Value>().ok()?;
+    let table = value.as_table_mut()?;
+    let remote = table.get("remote")?.clone();
+    let remote_error = remote
+        .try_into::<super::model::RemoteConfig>()
+        .err()?
+        .to_string();
+    table.remove("remote");
+    let mut config = value.try_into::<Config>().ok()?;
+    config.remote = super::model::RemoteConfig::default();
+    let mut diagnostics = unknown_top_level_section_diagnostics_from_str(content);
+    diagnostics.push(format!(
+        "invalid remote config: {remote_error}; using remote defaults"
+    ));
+    diagnostics.extend(config.collect_diagnostics());
+    Some(LoadedConfig {
+        config,
+        diagnostics,
+        invalid_sections: vec!["remote".to_string()],
+    })
 }
 
 pub(super) fn resolve_config_relative_path(path: &Path) -> PathBuf {
@@ -175,10 +202,9 @@ pub fn config_diagnostic_summary(diagnostics: &[String]) -> Option<String> {
     let read_error = diagnostics
         .iter()
         .any(|diagnostic| diagnostic.starts_with("config read error:"));
-    let impact = if diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.contains("using defaults"))
-    {
+    let impact = if diagnostics.iter().any(|diagnostic| {
+        diagnostic.contains("using defaults") || diagnostic.contains("using remote defaults")
+    }) {
         if read_error {
             " unreadable; using defaults"
         } else {
@@ -610,6 +636,7 @@ mod tests {
 
     #[test]
     fn config_diagnostic_summary_uses_compact_actionable_banner() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let diagnostics = vec![
             "one".to_string(),
             "two".to_string(),
@@ -626,6 +653,7 @@ mod tests {
 
     #[test]
     fn config_diagnostic_summary_reports_default_fallback() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let diagnostics = vec![
             "config parse error: TOML parse error at line 33, column 8\n   |\n33 | type = \"popup\"\n   |        ^^^^^^^\nunknown variant `popup`; using defaults"
                 .to_string(),
@@ -639,6 +667,7 @@ mod tests {
 
     #[test]
     fn config_diagnostic_summary_reports_unreadable_config_impact() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let startup = vec!["config read error: permission denied; using defaults".to_string()];
         assert_eq!(
             config_diagnostic_summary(&startup).as_deref(),
@@ -655,6 +684,7 @@ mod tests {
 
     #[test]
     fn config_diagnostic_summary_reports_retained_live_config() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let diagnostics = vec![
             "config parse error: TOML parse error at line 7, column 4; keeping current config"
                 .to_string(),
@@ -689,6 +719,61 @@ mod tests {
 
         std::env::remove_var(CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn invalid_initial_remote_section_uses_remote_defaults_atomically() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-invalid-initial-remote-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "[experimental]\nopen_remote_links_on_client = true\n\n[remote]\nmanage_ssh_config = false\nsaved_port_forward_limit = 0\n",
+        )
+        .unwrap();
+        std::env::set_var(CONFIG_PATH_ENV_VAR, &path);
+
+        let loaded = Config::load();
+
+        assert!(loaded.config.experimental.open_remote_links_on_client);
+        assert!(loaded.config.remote.manage_ssh_config);
+        assert_eq!(loaded.config.remote.saved_port_forward_limit.get(), 12);
+        assert!(loaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("using remote defaults")));
+        std::env::remove_var(CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn valid_live_remote_section_projects_both_values_together() {
+        let loaded = load_live_config_from_str(
+            "[remote]\nmanage_ssh_config = false\nsaved_port_forward_limit = 64\n",
+        )
+        .expect("valid live config");
+
+        assert!(loaded.invalid_sections.is_empty());
+        assert!(!loaded.config.remote.manage_ssh_config);
+        assert_eq!(loaded.config.remote.saved_port_forward_limit.get(), 64);
+    }
+
+    #[test]
+    fn invalid_live_remote_section_is_atomic_and_identified_for_retention() {
+        let loaded = load_live_config_from_str(
+            "[remote]\nmanage_ssh_config = false\nsaved_port_forward_limit = 65\n",
+        )
+        .expect("top-level TOML remains readable");
+
+        assert_eq!(loaded.invalid_sections, vec!["remote"]);
+        assert!(loaded.config.remote.manage_ssh_config);
+        assert_eq!(loaded.config.remote.saved_port_forward_limit.get(), 12);
+        assert!(loaded.diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("invalid remote config")
+                && diagnostic.contains("keeping current remote settings")
+        }));
     }
 
     #[test]

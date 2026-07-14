@@ -1,9 +1,17 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::protocol::{ExternalOpenResult, ExternalOpenTarget};
 
 pub(crate) const EXTERNAL_OPEN_DEADLINE: Duration = Duration::from_secs(10);
+const MAX_EXTERNAL_OPENS_PER_ATTACHMENT: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExternalOpenAdmissionError {
+    NotAuthorized,
+    TooManyInProgress,
+    RequestIdsExhausted,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExternalOpenDispatch {
@@ -189,6 +197,159 @@ struct ExternalOpenRequest {
     phase: ExternalOpenPhase,
 }
 
+#[derive(Default)]
+struct ExternalOpenAttachment {
+    connections: HashSet<u64>,
+    requests: ExternalOpenRequests,
+}
+
+/// Owns external-open ledgers at the attachment seam while preserving exact
+/// source-connection routing inside each ledger.
+#[derive(Default)]
+pub(crate) struct ExternalOpenAttachments {
+    attachments: HashMap<crate::protocol::ExternalOpenAttachmentId, ExternalOpenAttachment>,
+    client_attachments: HashMap<u64, crate::protocol::ExternalOpenAttachmentId>,
+}
+
+impl ExternalOpenAttachments {
+    pub(crate) fn connect(
+        &mut self,
+        client_id: u64,
+        attachment_id: crate::protocol::ExternalOpenAttachmentId,
+    ) -> bool {
+        if let Some(bound) = self.client_attachments.get(&client_id) {
+            return *bound == attachment_id;
+        }
+        self.client_attachments.insert(client_id, attachment_id);
+        self.attachments
+            .entry(attachment_id)
+            .or_default()
+            .connections
+            .insert(client_id)
+    }
+
+    pub(crate) fn disconnect(&mut self, client_id: u64) -> Vec<ExternalOpenClosed> {
+        let Some(attachment_id) = self.client_attachments.remove(&client_id) else {
+            return Vec::new();
+        };
+        let Some(attachment) = self.attachments.get_mut(&attachment_id) else {
+            return Vec::new();
+        };
+        let closed = attachment.requests.connection_lost(client_id);
+        attachment.connections.remove(&client_id);
+        if attachment.connections.is_empty() && attachment.requests.is_empty() {
+            self.attachments.remove(&attachment_id);
+        }
+        closed
+    }
+
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.attachments
+            .values()
+            .filter_map(|attachment| attachment.requests.next_deadline())
+            .min()
+    }
+
+    pub(crate) fn expire_due(&mut self, now: Instant) -> Vec<ExternalOpenClosed> {
+        let mut closed = self
+            .attachments
+            .values_mut()
+            .flat_map(|attachment| attachment.requests.expire_due(now))
+            .collect::<Vec<_>>();
+        closed.sort_by_key(|request| (request.accepted_at, request.request_id));
+        closed
+    }
+
+    pub(crate) fn cancel_preparing_for_client(
+        &mut self,
+        client_id: u64,
+    ) -> Vec<ExternalOpenClosed> {
+        self.requests_for_client_mut(client_id)
+            .map(|requests| requests.cancel_preparing_for_client(client_id))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn start(
+        &mut self,
+        client_id: u64,
+        accepted_at: Instant,
+    ) -> Result<ExternalOpenDispatch, ExternalOpenAdmissionError> {
+        self.requests_for_client_mut(client_id)
+            .ok_or(ExternalOpenAdmissionError::NotAuthorized)?
+            .start(client_id, accepted_at)
+    }
+
+    pub(crate) fn ready(
+        &mut self,
+        client_id: u64,
+        request_id: u64,
+        target: ExternalOpenTarget,
+        now: Instant,
+        queue_commit: impl FnOnce(u64) -> bool,
+    ) -> ExternalOpenTransition {
+        self.requests_for_client_mut(client_id)
+            .map(|requests| requests.ready(client_id, request_id, target, now, queue_commit))
+            .unwrap_or(ExternalOpenTransition::Ignored)
+    }
+
+    pub(crate) fn delivery_failed(
+        &mut self,
+        client_id: u64,
+        request_id: u64,
+    ) -> ExternalOpenTransition {
+        self.requests_for_client_mut(client_id)
+            .map(|requests| requests.delivery_failed(client_id, request_id))
+            .unwrap_or(ExternalOpenTransition::Ignored)
+    }
+
+    pub(crate) fn preparation_failed(
+        &mut self,
+        client_id: u64,
+        request_id: u64,
+        reason: crate::protocol::ExternalOpenPreparationFailure,
+        now: Instant,
+    ) -> ExternalOpenTransition {
+        self.requests_for_client_mut(client_id)
+            .map(|requests| requests.preparation_failed(client_id, request_id, reason, now))
+            .unwrap_or(ExternalOpenTransition::Ignored)
+    }
+
+    pub(crate) fn result(
+        &mut self,
+        client_id: u64,
+        request_id: u64,
+        result: ExternalOpenResult,
+        now: Instant,
+    ) -> ExternalOpenTransition {
+        self.requests_for_client_mut(client_id)
+            .map(|requests| requests.result(client_id, request_id, result, now))
+            .unwrap_or(ExternalOpenTransition::Ignored)
+    }
+
+    fn requests_for_client_mut(&mut self, client_id: u64) -> Option<&mut ExternalOpenRequests> {
+        let attachment_id = *self.client_attachments.get(&client_id)?;
+        self.attachments
+            .get_mut(&attachment_id)
+            .map(|attachment| &mut attachment.requests)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attachment_count_for_test(&self) -> usize {
+        self.attachments.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_request_count_for_test(
+        &self,
+        attachment_id: crate::protocol::ExternalOpenAttachmentId,
+    ) -> usize {
+        self.attachments
+            .get(&attachment_id)
+            .map(|attachment| attachment.requests.requests.len())
+            .unwrap_or(0)
+    }
+}
+
 pub(crate) struct ExternalOpenRequests {
     next_request_id: u64,
     requests: HashMap<u64, ExternalOpenRequest>,
@@ -204,6 +365,10 @@ impl Default for ExternalOpenRequests {
 }
 
 impl ExternalOpenRequests {
+    fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.requests.values().map(|request| request.deadline).min()
     }
@@ -291,10 +456,13 @@ impl ExternalOpenRequests {
         &mut self,
         client_id: u64,
         accepted_at: Instant,
-    ) -> Option<ExternalOpenDispatch> {
+    ) -> Result<ExternalOpenDispatch, ExternalOpenAdmissionError> {
+        if self.requests.len() >= MAX_EXTERNAL_OPENS_PER_ATTACHMENT {
+            return Err(ExternalOpenAdmissionError::TooManyInProgress);
+        }
         let request_id = self.next_request_id;
         if request_id == 0 {
-            return None;
+            return Err(ExternalOpenAdmissionError::RequestIdsExhausted);
         }
         self.next_request_id = request_id.checked_add(1).unwrap_or(0);
         let deadline = accepted_at + EXTERNAL_OPEN_DEADLINE;
@@ -306,7 +474,7 @@ impl ExternalOpenRequests {
                 phase: ExternalOpenPhase::Preparing,
             },
         );
-        Some(ExternalOpenDispatch {
+        Ok(ExternalOpenDispatch {
             request_id,
             deadline,
         })
@@ -759,6 +927,55 @@ mod tests {
                 (1_234, "committed", "remapped"),
             ],
         );
+    }
+
+    #[test]
+    fn one_attachment_shares_32_lifecycles_across_clients_until_terminal_settlement() {
+        let accepted_at = Instant::now();
+        let mut attachment = ExternalOpenRequests::default();
+        let admitted = (0..32)
+            .map(|index| {
+                attachment
+                    .start(7 + (index % 2), accepted_at)
+                    .expect("within attachment cap")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            attachment.start(7, accepted_at),
+            Err(ExternalOpenAdmissionError::TooManyInProgress)
+        );
+        assert_eq!(
+            attachment.start(8, accepted_at),
+            Err(ExternalOpenAdmissionError::TooManyInProgress)
+        );
+        let mut distinct_attachment = ExternalOpenRequests::default();
+        assert!(distinct_attachment.start(7, accepted_at).is_ok());
+        assert_eq!(
+            attachment.ready(
+                7,
+                admitted[0].request_id(),
+                ExternalOpenTarget::Direct,
+                accepted_at + Duration::from_secs(1),
+                |_| true,
+            ),
+            ExternalOpenTransition::Committed
+        );
+        assert_eq!(
+            attachment.start(8, accepted_at),
+            Err(ExternalOpenAdmissionError::TooManyInProgress),
+            "committed-pending work still owns its attachment slot"
+        );
+        assert!(matches!(
+            attachment.result(
+                7,
+                admitted[0].request_id(),
+                ExternalOpenResult::OpenedDirectly,
+                accepted_at + Duration::from_secs(2),
+            ),
+            ExternalOpenTransition::Closed(_)
+        ));
+        assert!(attachment.start(8, accepted_at).is_ok());
     }
 
     #[test]

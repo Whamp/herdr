@@ -15,6 +15,9 @@ use super::worker::{ControlOperation, LocalhostPairSpec};
 const FALLBACK_CANDIDATES: usize = 5;
 const QUARANTINE_DURATION: Duration = Duration::from_secs(5 * 60);
 const QUARANTINE_LIMIT: usize = 64;
+const MAX_FORWARD_REQUESTS: usize = 32;
+const MAX_MAPPING_WAITERS: usize = 8;
+const LIFETIME_LISTENER_LIMIT: u16 = 128;
 
 trait MonotonicClock: Send + Sync {
     fn now(&self) -> Duration;
@@ -127,6 +130,13 @@ impl ListenerSpec {
             Self::Localhost(pair) => pair.local_port(),
         }
     }
+
+    const fn listener_slots(self) -> ListenerSlots {
+        match self {
+            Self::Scalar(_) => ListenerSlots::SCALAR,
+            Self::Localhost(_) => ListenerSlots::ATOMIC_PAIR,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +145,7 @@ pub(super) struct MappingAttempt {
     identity: MappingIdentity,
     generation: u64,
     spec: ListenerSpec,
+    listener_reservation: Option<ListenerReservation>,
 }
 
 impl MappingAttempt {
@@ -166,6 +177,38 @@ impl MappingAttempt {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SavedLimitChange {
+    pub(super) controller_id: CorrelationId,
+    pub(super) requested_limit: crate::config::SavedPortForwardLimit,
+    pub(super) cancellations: Vec<MappingCancellation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingSavedLimit {
+    controller_id: CorrelationId,
+    requested_limit: crate::config::SavedPortForwardLimit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MappingCancellation {
+    controller_id: CorrelationId,
+    spec: ListenerSpec,
+}
+
+impl MappingCancellation {
+    pub(super) const fn operation(self) -> ControlOperation {
+        match self.spec {
+            ListenerSpec::Scalar(spec) => ControlOperation::Cancel(spec),
+            ListenerSpec::Localhost(pair) => ControlOperation::CancelPair(pair),
+        }
+    }
+
+    pub(super) const fn controller_id(self) -> CorrelationId {
+        self.controller_id
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct MappingSettlement {
     pub(super) id: CorrelationId,
@@ -191,7 +234,13 @@ impl MappingSettlement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum MappingRequest {
     Ready(MappingSettlement),
-    Pending { attempt: Option<MappingAttempt> },
+    Pending {
+        attempt: Option<MappingAttempt>,
+    },
+    Replacing {
+        attempt: MappingAttempt,
+        cancellation: MappingCancellation,
+    },
     Failed(MappingSettlement),
 }
 
@@ -225,7 +274,36 @@ pub(super) enum WaiterCancellation {
 pub(super) struct MappingCompletion {
     pub(super) attempt: Option<MappingAttempt>,
     pub(super) cancellation: Option<MappingAttempt>,
+    pub(super) cancellation_policy: Option<CorrelationId>,
     pub(super) settlements: Vec<MappingSettlement>,
+    pub(super) invariant_error: Option<ListenerLedgerInvariant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RequestOrder(u128);
+
+#[derive(Debug)]
+struct RequestOrderSequence {
+    next: RequestOrder,
+}
+
+impl Default for RequestOrderSequence {
+    fn default() -> Self {
+        Self {
+            next: RequestOrder(1),
+        }
+    }
+}
+
+impl RequestOrderSequence {
+    fn issue(&mut self) -> RequestOrder {
+        let issued = self.next;
+        self.next = match issued.0.checked_add(1) {
+            Some(next) => RequestOrder(next),
+            None => panic!("mapping request order space exhausted"),
+        };
+        issued
+    }
 }
 
 #[derive(Debug)]
@@ -236,10 +314,12 @@ enum MappingState {
         fallback_attempts: usize,
         started: bool,
         revoked: bool,
+        last_requested: RequestOrder,
     },
     Ready {
         spec: ListenerSpec,
         generation: u64,
+        last_requested: RequestOrder,
     },
 }
 
@@ -249,8 +329,142 @@ struct QuarantinedPort {
     expires_at: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListenerSlots(u8);
+
+impl ListenerSlots {
+    const SCALAR: Self = Self(1);
+    const ATOMIC_PAIR: Self = Self(2);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ListenerReservationId(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListenerReservation {
+    id: ListenerReservationId,
+    slots: ListenerSlots,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ListenerLedgerInvariant {
+    ReservationIdsExhausted,
+    UnknownReservation,
+    SuccessfulListenersExceedReservation,
+    AccountingOverflow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerReservationError {
+    CapacityExhausted,
+    Invariant(ListenerLedgerInvariant),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListenerSettlement {
+    consumed_success: u8,
+    released_unused: u8,
+}
+
+#[derive(Debug)]
+struct LifetimeLedger {
+    available: u16,
+    consumed_success: u16,
+    next_reservation_id: u64,
+    reserved: BTreeMap<ListenerReservationId, ListenerSlots>,
+}
+
+impl Default for LifetimeLedger {
+    fn default() -> Self {
+        Self {
+            available: LIFETIME_LISTENER_LIMIT,
+            consumed_success: 0,
+            next_reservation_id: 1,
+            reserved: BTreeMap::new(),
+        }
+    }
+}
+
+impl LifetimeLedger {
+    fn reserve(
+        &mut self,
+        slots: ListenerSlots,
+    ) -> Result<ListenerReservation, ListenerReservationError> {
+        let requested = u16::from(slots.0);
+        if self.available < requested {
+            return Err(ListenerReservationError::CapacityExhausted);
+        }
+        let id = ListenerReservationId(self.next_reservation_id);
+        self.next_reservation_id =
+            self.next_reservation_id
+                .checked_add(1)
+                .ok_or(ListenerReservationError::Invariant(
+                    ListenerLedgerInvariant::ReservationIdsExhausted,
+                ))?;
+        self.available -= requested;
+        if self.reserved.insert(id, slots).is_some() {
+            return Err(ListenerReservationError::Invariant(
+                ListenerLedgerInvariant::AccountingOverflow,
+            ));
+        }
+        Ok(ListenerReservation { id, slots })
+    }
+
+    fn settle(
+        &mut self,
+        reservation: ListenerReservation,
+        successful: u8,
+    ) -> Result<ListenerSettlement, ListenerLedgerInvariant> {
+        let Some(reserved) = self.reserved.get(&reservation.id).copied() else {
+            return Err(ListenerLedgerInvariant::UnknownReservation);
+        };
+        if reserved != reservation.slots || successful > reserved.0 {
+            return Err(ListenerLedgerInvariant::SuccessfulListenersExceedReservation);
+        }
+        let released_unused = reserved.0 - successful;
+        let consumed_success = self
+            .consumed_success
+            .checked_add(u16::from(successful))
+            .ok_or(ListenerLedgerInvariant::AccountingOverflow)?;
+        let available = self
+            .available
+            .checked_add(u16::from(released_unused))
+            .ok_or(ListenerLedgerInvariant::AccountingOverflow)?;
+        if consumed_success > LIFETIME_LISTENER_LIMIT || available > LIFETIME_LISTENER_LIMIT {
+            return Err(ListenerLedgerInvariant::AccountingOverflow);
+        }
+        self.reserved.remove(&reservation.id);
+        self.consumed_success = consumed_success;
+        self.available = available;
+        Ok(ListenerSettlement {
+            consumed_success: successful,
+            released_unused,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_consumed(consumed_success: u16) -> Self {
+        Self {
+            available: LIFETIME_LISTENER_LIMIT - consumed_success,
+            consumed_success,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn counts(&self) -> (u16, u16, u16) {
+        let reserved = self.reserved.values().map(|slots| u16::from(slots.0)).sum();
+        (self.available, reserved, self.consumed_success)
+    }
+}
+
 pub(super) struct MappingRegistry {
     mappings: BTreeMap<MappingIdentity, MappingState>,
+    active_requests: BTreeSet<CorrelationId>,
+    saved_limit: crate::config::SavedPortForwardLimit,
+    pending_saved_limit: Option<PendingSavedLimit>,
+    request_order: RequestOrderSequence,
+    lifetime_ledger: LifetimeLedger,
     quarantine: VecDeque<QuarantinedPort>,
     candidates: Arc<dyn PortCandidates>,
     clock: Arc<dyn MonotonicClock>,
@@ -262,6 +476,11 @@ impl Default for MappingRegistry {
     fn default() -> Self {
         Self {
             mappings: BTreeMap::new(),
+            active_requests: BTreeSet::new(),
+            saved_limit: crate::config::SavedPortForwardLimit::DEFAULT,
+            pending_saved_limit: None,
+            request_order: RequestOrderSequence::default(),
+            lifetime_ledger: LifetimeLedger::default(),
             quarantine: VecDeque::new(),
             candidates: Arc::new(SystemPortCandidates),
             clock: Arc::new(SystemMonotonicClock::default()),
@@ -290,7 +509,7 @@ impl MappingRegistry {
             remote_address: address,
             remote_port,
         });
-        self.request(id, identity, spec, 0)
+        self.request(id, identity, spec, 0, None)
     }
 
     pub(super) fn request_localhost(
@@ -307,16 +526,41 @@ impl MappingRegistry {
         if let Some(request) = self.request_existing(id, identity) {
             return request;
         }
+        if let Err(failure) = self.distinct_admission(id) {
+            return MappingRequest::Failed(MappingSettlement::failed(id, failure));
+        }
+        let reservation = match self.lifetime_ledger.reserve(ListenerSlots::ATOMIC_PAIR) {
+            Ok(reservation) => reservation,
+            Err(ListenerReservationError::CapacityExhausted) => {
+                return MappingRequest::Failed(MappingSettlement::failed(
+                    id,
+                    ForwardFailure::CapacityExhausted,
+                ));
+            }
+            Err(ListenerReservationError::Invariant(_)) => {
+                return MappingRequest::Failed(MappingSettlement::failed(
+                    id,
+                    ForwardFailure::CapabilityClosed,
+                ));
+            }
+        };
         let (spec, fallback_attempts) = if self.is_quarantined(remote_port) {
             let mut fallback_attempts = 0;
-            match self.fresh_attempt(id, identity, &mut fallback_attempts) {
+            match self.fresh_attempt(id, identity, &mut fallback_attempts, Some(reservation)) {
                 Ok(attempt) => (attempt.spec, fallback_attempts),
                 Err(failure) => {
+                    if self.lifetime_ledger.settle(reservation, 0).is_err() {
+                        return MappingRequest::Failed(MappingSettlement::failed(
+                            id,
+                            ForwardFailure::CapabilityClosed,
+                        ));
+                    }
                     return MappingRequest::Failed(MappingSettlement::failed(id, failure));
                 }
             }
         } else {
             let Some(pair) = LocalhostPairSpec::new(remote_port, remote_port) else {
+                let _ = self.lifetime_ledger.settle(reservation, 0);
                 return MappingRequest::Failed(MappingSettlement::failed(
                     id,
                     ForwardFailure::CommandRejected,
@@ -324,7 +568,7 @@ impl MappingRegistry {
             };
             (ListenerSpec::Localhost(pair), 0)
         };
-        self.request(id, identity, spec, fallback_attempts)
+        self.request(id, identity, spec, fallback_attempts, Some(reservation))
     }
 
     fn request_existing(
@@ -338,21 +582,56 @@ impl MappingRegistry {
                 ForwardFailure::CapabilityClosed,
             )));
         }
-        self.mappings
-            .get_mut(&identity)
-            .map(|mapping| match mapping {
-                MappingState::Creating { waiters, .. } => {
-                    waiters.insert(id);
-                    MappingRequest::Pending { attempt: None }
-                }
-                MappingState::Ready { spec, generation } if *generation == self.generation => {
-                    MappingRequest::Ready(MappingSettlement::ready(id, spec.local_port()))
-                }
-                MappingState::Ready { .. } => MappingRequest::Failed(MappingSettlement::failed(
+        if !self.mappings.contains_key(&identity) {
+            return None;
+        }
+        let request_order = self.request_order.issue();
+        if let Some(MappingState::Ready {
+            spec, generation, ..
+        }) = self.mappings.get(&identity)
+        {
+            if *generation != self.generation {
+                return Some(MappingRequest::Failed(MappingSettlement::failed(
                     id,
                     ForwardFailure::CapabilityClosed,
-                )),
-            })
+                )));
+            }
+            let local_port = spec.local_port();
+            if let Some(MappingState::Ready { last_requested, .. }) =
+                self.mappings.get_mut(&identity)
+            {
+                *last_requested = request_order;
+            }
+            return Some(MappingRequest::Ready(MappingSettlement::ready(
+                id, local_port,
+            )));
+        }
+        let MappingState::Creating {
+            waiters,
+            last_requested,
+            ..
+        } = self.mappings.get_mut(&identity)?
+        else {
+            return None;
+        };
+        *last_requested = request_order;
+        if waiters.contains(&id) {
+            return Some(MappingRequest::Pending { attempt: None });
+        }
+        if waiters.len() >= MAX_MAPPING_WAITERS {
+            return Some(MappingRequest::Failed(MappingSettlement::failed(
+                id,
+                ForwardFailure::TooManyWaiters,
+            )));
+        }
+        if self.active_requests.len() >= MAX_FORWARD_REQUESTS || !self.active_requests.insert(id) {
+            return Some(MappingRequest::Failed(MappingSettlement::failed(
+                id,
+                ForwardFailure::TooManyRequests,
+            )));
+        }
+        waiters.insert(id);
+        Some(MappingRequest::Pending { attempt: None })
     }
 
     fn request(
@@ -361,16 +640,78 @@ impl MappingRegistry {
         identity: MappingIdentity,
         initial_spec: ListenerSpec,
         fallback_attempts: usize,
+        pre_reserved_listeners: Option<ListenerReservation>,
     ) -> MappingRequest {
         if let Some(request) = self.request_existing(id, identity) {
+            if let Some(reservation) = pre_reserved_listeners {
+                let _ = self.lifetime_ledger.settle(reservation, 0);
+            }
             return request;
         }
+        let replacement_identity = match self.distinct_admission(id) {
+            Ok(replacement) => replacement,
+            Err(failure) => {
+                if let Some(reservation) = pre_reserved_listeners {
+                    let _ = self.lifetime_ledger.settle(reservation, 0);
+                }
+                return MappingRequest::Failed(MappingSettlement::failed(id, failure));
+            }
+        };
+        if !self.active_requests.insert(id) {
+            if let Some(reservation) = pre_reserved_listeners {
+                let _ = self.lifetime_ledger.settle(reservation, 0);
+            }
+            return MappingRequest::Failed(MappingSettlement::failed(
+                id,
+                ForwardFailure::TooManyRequests,
+            ));
+        }
+        let required_listeners = initial_spec.listener_slots();
+        let listener_reservation = match pre_reserved_listeners {
+            Some(reservation) if reservation.slots == required_listeners => reservation,
+            Some(reservation) => {
+                let _ = self.lifetime_ledger.settle(reservation, 0);
+                self.active_requests.remove(&id);
+                return MappingRequest::Failed(MappingSettlement::failed(
+                    id,
+                    ForwardFailure::CommandRejected,
+                ));
+            }
+            None => match self.lifetime_ledger.reserve(required_listeners) {
+                Ok(reservation) => reservation,
+                Err(ListenerReservationError::CapacityExhausted) => {
+                    self.active_requests.remove(&id);
+                    return MappingRequest::Failed(MappingSettlement::failed(
+                        id,
+                        ForwardFailure::CapacityExhausted,
+                    ));
+                }
+                Err(ListenerReservationError::Invariant(_)) => {
+                    self.active_requests.remove(&id);
+                    return MappingRequest::Failed(MappingSettlement::failed(
+                        id,
+                        ForwardFailure::CapabilityClosed,
+                    ));
+                }
+            },
+        };
         let attempt = MappingAttempt {
             controller_id: id,
             identity,
             generation: self.generation,
             spec: initial_spec,
+            listener_reservation: Some(listener_reservation),
         };
+        let replacement = replacement_identity.and_then(|identity| {
+            let MappingState::Ready { spec, .. } = self.mappings.remove(&identity)? else {
+                return None;
+            };
+            Some(MappingCancellation {
+                controller_id: id,
+                spec,
+            })
+        });
+        let last_requested = self.request_order.issue();
         self.mappings.insert(
             identity,
             MappingState::Creating {
@@ -379,11 +720,132 @@ impl MappingRegistry {
                 fallback_attempts,
                 started: false,
                 revoked: false,
+                last_requested,
             },
         );
-        MappingRequest::Pending {
-            attempt: Some(attempt),
+        if let Some(cancellation) = replacement {
+            MappingRequest::Replacing {
+                attempt,
+                cancellation,
+            }
+        } else {
+            MappingRequest::Pending {
+                attempt: Some(attempt),
+            }
         }
+    }
+
+    fn distinct_admission(
+        &self,
+        id: CorrelationId,
+    ) -> Result<Option<MappingIdentity>, ForwardFailure> {
+        if self.active_requests.len() >= MAX_FORWARD_REQUESTS || self.active_requests.contains(&id)
+        {
+            return Err(ForwardFailure::TooManyRequests);
+        }
+        if self.pending_saved_limit.is_some() {
+            return Err(ForwardFailure::TooManyRequests);
+        }
+        if self.saved_limit.admits_count(self.mappings.len()) {
+            return Ok(None);
+        }
+        if self.saved_limit.is_reached_by(self.mappings.len()) {
+            return self
+                .least_recent_ready()
+                .map(Some)
+                .ok_or(ForwardFailure::TooManyRequests);
+        }
+        Err(ForwardFailure::TooManyRequests)
+    }
+
+    fn least_recent_ready(&self) -> Option<MappingIdentity> {
+        self.mappings
+            .iter()
+            .filter_map(|(identity, mapping)| match mapping {
+                MappingState::Ready { last_requested, .. } => {
+                    Some(((*last_requested, *identity), *identity))
+                }
+                MappingState::Creating { .. } => None,
+            })
+            .min_by_key(|(order, _)| *order)
+            .map(|(_, identity)| identity)
+    }
+
+    pub(super) fn begin_saved_limit_change(
+        &mut self,
+        saved_limit: crate::config::SavedPortForwardLimit,
+        controller_id: CorrelationId,
+    ) -> SavedLimitChange {
+        let mut cancellations = Vec::new();
+        while saved_limit.is_exceeded_by(self.mappings.len()) {
+            let Some(identity) = self.least_recent_ready() else {
+                break;
+            };
+            let Some(MappingState::Ready { spec, .. }) = self.mappings.remove(&identity) else {
+                continue;
+            };
+            cancellations.push(MappingCancellation {
+                controller_id,
+                spec,
+            });
+        }
+        self.pending_saved_limit = Some(PendingSavedLimit {
+            controller_id,
+            requested_limit: saved_limit,
+        });
+        SavedLimitChange {
+            controller_id,
+            requested_limit: saved_limit,
+            cancellations,
+        }
+    }
+
+    pub(super) fn saved_limit_change_converged(&self, change: &SavedLimitChange) -> bool {
+        self.pending_saved_limit
+            == Some(PendingSavedLimit {
+                controller_id: change.controller_id,
+                requested_limit: change.requested_limit,
+            })
+            && !change.requested_limit.is_exceeded_by(self.mappings.len())
+    }
+
+    pub(super) fn commit_saved_limit(&mut self, change: &SavedLimitChange) -> bool {
+        if !self.clear_pending_saved_limit(change) {
+            return false;
+        }
+        self.saved_limit = change.requested_limit;
+        true
+    }
+
+    pub(super) fn abort_saved_limit_change(&mut self, change: &SavedLimitChange) -> bool {
+        self.clear_pending_saved_limit(change)
+    }
+
+    fn clear_pending_saved_limit(&mut self, change: &SavedLimitChange) -> bool {
+        let expected = PendingSavedLimit {
+            controller_id: change.controller_id,
+            requested_limit: change.requested_limit,
+        };
+        if self.pending_saved_limit != Some(expected) {
+            return false;
+        }
+        self.pending_saved_limit = None;
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_saved_limit(
+        &mut self,
+        saved_limit: crate::config::SavedPortForwardLimit,
+        controller_id: CorrelationId,
+    ) -> Vec<MappingCancellation> {
+        let change = self.begin_saved_limit_change(saved_limit, controller_id);
+        let _ = self.commit_saved_limit(&change);
+        change.cancellations
+    }
+
+    pub(super) const fn saved_limit(&self) -> crate::config::SavedPortForwardLimit {
+        self.saved_limit
     }
 
     pub(super) fn start(&mut self, attempt: MappingAttempt) -> bool {
@@ -402,6 +864,7 @@ impl MappingRegistry {
         true
     }
 
+    #[cfg(test)]
     pub(super) fn waiter_count(&self) -> usize {
         self.mappings
             .values()
@@ -426,6 +889,9 @@ impl MappingRegistry {
                     localhost: attempt.is_localhost(),
                     settlement: MappingSettlement::failed(id, ForwardFailure::Cancelled),
                 }));
+                for id in waiters.iter() {
+                    self.active_requests.remove(id);
+                }
                 waiters.clear();
                 *revoked = true;
             }
@@ -436,6 +902,8 @@ impl MappingRegistry {
     pub(super) fn master_died(&mut self) -> Vec<MappingSettlement> {
         self.master_live = false;
         self.quarantine.clear();
+        self.active_requests.clear();
+        self.lifetime_ledger = LifetimeLedger::default();
         let mappings = std::mem::take(&mut self.mappings);
         mappings
             .into_values()
@@ -455,6 +923,8 @@ impl MappingRegistry {
             return false;
         };
         self.mappings.clear();
+        self.active_requests.clear();
+        self.lifetime_ledger = LifetimeLedger::default();
         self.quarantine.clear();
         self.generation = generation;
         self.master_live = true;
@@ -481,8 +951,15 @@ impl MappingRegistry {
             return WaiterCancellation::NotFound;
         };
         waiters.remove(&id);
+        self.active_requests.remove(&id);
         if waiters.is_empty() && !*started {
             let abandoned = *attempt;
+            let Some(reservation) = abandoned.listener_reservation else {
+                return WaiterCancellation::NotFound;
+            };
+            if self.lifetime_ledger.settle(reservation, 0).is_err() {
+                return WaiterCancellation::NotFound;
+            }
             self.mappings.remove(&identity);
             WaiterCancellation::AbandonedBeforeStart(abandoned)
         } else {
@@ -507,6 +984,7 @@ impl MappingRegistry {
             mut fallback_attempts,
             started,
             revoked,
+            last_requested,
         } = mapping
         else {
             self.mappings.insert(attempt.identity, mapping);
@@ -521,39 +999,103 @@ impl MappingRegistry {
                     fallback_attempts,
                     started,
                     revoked,
+                    last_requested,
                 },
             );
             return MappingCompletion::default();
         }
+        let successful_listeners = match result {
+            MappingControlResult::Succeeded => 1,
+            MappingControlResult::PairSucceeded => 2,
+            MappingControlResult::PairSecondFailed => 1,
+            MappingControlResult::BindFailed
+            | MappingControlResult::Rejected
+            | MappingControlResult::TimedOut
+            | MappingControlResult::PairFirstBindFailed
+            | MappingControlResult::PairFirstFailed
+            | MappingControlResult::PairFirstTimedOut => 0,
+        };
         let failure = match (attempt.spec, result) {
             (ListenerSpec::Scalar(_), MappingControlResult::Succeeded)
             | (ListenerSpec::Localhost(_), MappingControlResult::PairSucceeded)
                 if revoked =>
             {
+                if let Err(error) = self.settle_listener_reservation(attempt, successful_listeners)
+                {
+                    return MappingCompletion {
+                        invariant_error: Some(error),
+                        ..MappingCompletion::default()
+                    };
+                }
                 return MappingCompletion {
                     attempt: None,
                     cancellation: Some(attempt),
+                    cancellation_policy: None,
                     settlements: Vec::new(),
+                    invariant_error: None,
                 };
             }
             (ListenerSpec::Scalar(_), MappingControlResult::Succeeded)
             | (ListenerSpec::Localhost(_), MappingControlResult::PairSucceeded) => {
-                let settlements = waiters
-                    .iter()
-                    .copied()
-                    .map(|id| MappingSettlement::ready(id, attempt.spec.local_port()))
-                    .collect();
+                if let Err(error) = self.settle_listener_reservation(attempt, successful_listeners)
+                {
+                    return MappingCompletion {
+                        invariant_error: Some(error),
+                        ..MappingCompletion::default()
+                    };
+                }
                 self.mappings.insert(
                     attempt.identity,
                     MappingState::Ready {
                         spec: attempt.spec,
                         generation: attempt.generation,
+                        last_requested,
                     },
                 );
+                let (effective_limit, cancellation_policy) = self
+                    .pending_saved_limit
+                    .map(|pending| (pending.requested_limit, Some(pending.controller_id)))
+                    .unwrap_or((self.saved_limit, None));
+                let cancellation = if effective_limit.is_exceeded_by(self.mappings.len()) {
+                    self.least_recent_ready().and_then(|identity| {
+                        let MappingState::Ready {
+                            spec, generation, ..
+                        } = self.mappings.remove(&identity)?
+                        else {
+                            return None;
+                        };
+                        Some(MappingAttempt {
+                            controller_id: attempt.controller_id,
+                            identity,
+                            generation,
+                            spec,
+                            listener_reservation: None,
+                        })
+                    })
+                } else {
+                    None
+                };
+                let completed_was_evicted =
+                    cancellation.is_some_and(|cancelled| cancelled.identity == attempt.identity);
+                for id in waiters.iter() {
+                    self.active_requests.remove(id);
+                }
+                let settlements = waiters
+                    .into_iter()
+                    .map(|id| {
+                        if completed_was_evicted {
+                            MappingSettlement::failed(id, ForwardFailure::CapacityExhausted)
+                        } else {
+                            MappingSettlement::ready(id, attempt.spec.local_port())
+                        }
+                    })
+                    .collect();
                 return MappingCompletion {
                     attempt: None,
-                    cancellation: None,
+                    cancellation,
+                    cancellation_policy: cancellation.and(cancellation_policy),
                     settlements,
+                    invariant_error: None,
                 };
             }
             (ListenerSpec::Scalar(_), MappingControlResult::BindFailed)
@@ -564,6 +1106,7 @@ impl MappingRegistry {
                     attempt.controller_id,
                     attempt.identity,
                     &mut fallback_attempts,
+                    attempt.listener_reservation,
                 ) {
                     Ok(next) => {
                         self.mappings.insert(
@@ -574,12 +1117,15 @@ impl MappingRegistry {
                                 fallback_attempts,
                                 started: false,
                                 revoked,
+                                last_requested,
                             },
                         );
                         return MappingCompletion {
                             attempt: Some(next),
                             cancellation: None,
+                            cancellation_policy: None,
                             settlements: Vec::new(),
+                            invariant_error: None,
                         };
                     }
                     Err(failure) => failure,
@@ -603,14 +1149,37 @@ impl MappingRegistry {
             }
             _ => ForwardFailure::CommandRejected,
         };
+        if let Err(error) = self.settle_listener_reservation(attempt, successful_listeners) {
+            return MappingCompletion {
+                invariant_error: Some(error),
+                ..MappingCompletion::default()
+            };
+        }
+        for id in waiters.iter() {
+            self.active_requests.remove(id);
+        }
         MappingCompletion {
             attempt: None,
             cancellation: None,
+            cancellation_policy: None,
             settlements: waiters
                 .into_iter()
                 .map(|id| MappingSettlement::failed(id, failure))
                 .collect(),
+            invariant_error: None,
         }
+    }
+
+    fn settle_listener_reservation(
+        &mut self,
+        attempt: MappingAttempt,
+        successful_listeners: u8,
+    ) -> Result<ListenerSettlement, ListenerLedgerInvariant> {
+        let reservation = attempt
+            .listener_reservation
+            .ok_or(ListenerLedgerInvariant::UnknownReservation)?;
+        self.lifetime_ledger
+            .settle(reservation, successful_listeners)
     }
 
     fn fresh_attempt(
@@ -618,6 +1187,7 @@ impl MappingRegistry {
         controller_id: CorrelationId,
         identity: MappingIdentity,
         fallback_attempts: &mut usize,
+        listener_reservation: Option<ListenerReservation>,
     ) -> Result<MappingAttempt, ForwardFailure> {
         while *fallback_attempts < FALLBACK_CANDIDATES {
             *fallback_attempts += 1;
@@ -651,6 +1221,7 @@ impl MappingRegistry {
                 identity,
                 generation: self.generation,
                 spec,
+                listener_reservation,
             });
         }
         Err(ForwardFailure::BindFailed)
@@ -684,6 +1255,42 @@ impl MappingRegistry {
     #[cfg(test)]
     fn for_test(fallback_ports: impl IntoIterator<Item = Result<u16, CandidateFailure>>) -> Self {
         Self::for_test_with_clock(fallback_ports, Arc::new(FakeMonotonicClock::default()))
+    }
+
+    #[cfg(test)]
+    fn for_test_with_saved_limit(
+        fallback_ports: impl IntoIterator<Item = Result<u16, CandidateFailure>>,
+        saved_limit: crate::config::SavedPortForwardLimit,
+    ) -> Self {
+        Self {
+            saved_limit,
+            ..Self::for_test(fallback_ports)
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test_with_capacity(
+        fallback_ports: impl IntoIterator<Item = Result<u16, CandidateFailure>>,
+        consumed: u16,
+    ) -> Self {
+        let mut registry = Self::for_test_with_saved_limit(
+            fallback_ports,
+            crate::config::SavedPortForwardLimit::new(64).expect("valid limit"),
+        );
+        registry.lifetime_ledger = LifetimeLedger::with_consumed(consumed);
+        registry
+    }
+
+    #[cfg(test)]
+    fn for_test_with_capacity_and_candidate_calls(
+        fallback_ports: impl IntoIterator<Item = u16>,
+        consumed: u16,
+    ) -> (Self, Arc<AtomicUsize>) {
+        let (mut registry, calls) =
+            Self::for_test_with_candidate_calls(fallback_ports.into_iter().map(Ok));
+        registry.saved_limit = crate::config::SavedPortForwardLimit::new(64).expect("valid limit");
+        registry.lifetime_ledger = LifetimeLedger::with_consumed(consumed);
+        (registry, calls)
     }
 
     #[cfg(test)]
@@ -728,6 +1335,12 @@ impl MappingRegistry {
     #[cfg(test)]
     fn mapping_count(&self) -> usize {
         self.mappings.len()
+    }
+
+    #[cfg(test)]
+    fn listener_counts(&self) -> (u16, u16) {
+        let (_, reserved, consumed_success) = self.lifetime_ledger.counts();
+        (consumed_success, reserved)
     }
 }
 
@@ -776,6 +1389,10 @@ impl PortCandidates for QueuedPortCandidates {
 
 #[cfg(test)]
 mod tests {
+    fn saved_limit(value: u8) -> crate::config::SavedPortForwardLimit {
+        crate::config::SavedPortForwardLimit::new(value).expect("valid saved mapping limit")
+    }
+
     use super::*;
     use crate::remote::forwarding::protocol::LoopbackAddress;
 
@@ -803,6 +1420,599 @@ mod tests {
             ipv4,
             MappingIdentity::localhost(8080).expect("localhost pair identity")
         );
+    }
+
+    #[test]
+    fn creating_mapping_and_attachment_request_limits_are_independent_and_exact() {
+        let mut registry = MappingRegistry::for_test_with_saved_limit([], saved_limit(64));
+        let address = LoopbackAddress::Ipv4([127, 0, 0, 1]);
+        let owner = CorrelationId::new(1).expect("id");
+        let _ = registry.request_scalar(owner, address, 8_000);
+        assert_eq!(
+            registry.request_scalar(owner, address, 8_000),
+            MappingRequest::Pending { attempt: None },
+            "duplicate waiter identity must not consume another slot"
+        );
+        for value in 2..=8 {
+            let id = CorrelationId::new(value).expect("id");
+            assert_eq!(
+                registry.request_scalar(id, address, 8_000),
+                MappingRequest::Pending { attempt: None }
+            );
+        }
+        let ninth = CorrelationId::new(9).expect("id");
+        assert_eq!(
+            registry.request_scalar(ninth, address, 8_000),
+            MappingRequest::Failed(MappingSettlement::failed(
+                ninth,
+                ForwardFailure::TooManyWaiters,
+            ))
+        );
+
+        for value in 10..=33 {
+            let id = CorrelationId::new(value).expect("id");
+            let port = 8_000 + u16::try_from(value).expect("bounded port");
+            assert!(matches!(
+                registry.request_scalar(id, address, port),
+                MappingRequest::Pending { attempt: Some(_) }
+            ));
+        }
+        let thirty_third = CorrelationId::new(34).expect("id");
+        assert_eq!(
+            registry.request_scalar(thirty_third, address, 9_000),
+            MappingRequest::Failed(MappingSettlement::failed(
+                thirty_third,
+                ForwardFailure::TooManyRequests,
+            ))
+        );
+        assert_eq!(registry.waiter_count(), 32);
+        let released = CorrelationId::new(2).expect("id");
+        assert_eq!(
+            registry.cancel_waiter(released),
+            WaiterCancellation::Removed
+        );
+        assert_eq!(
+            registry.cancel_waiter(released),
+            WaiterCancellation::NotFound
+        );
+        assert!(matches!(
+            registry.request_scalar(thirty_third, address, 9_000),
+            MappingRequest::Pending { attempt: Some(_) }
+        ));
+        assert_eq!(registry.waiter_count(), 32);
+    }
+
+    #[test]
+    fn exact_saved_limit_replaces_the_least_recently_requested_ready_mapping() {
+        let mut registry = MappingRegistry::for_test_with_saved_limit([], saved_limit(2));
+        let address = LoopbackAddress::Ipv4([127, 0, 0, 1]);
+        for (id, port) in [(1, 8_001), (2, 8_002)] {
+            let id = CorrelationId::new(id).expect("id");
+            let MappingRequest::Pending {
+                attempt: Some(attempt),
+            } = registry.request_scalar(id, address, port)
+            else {
+                panic!("new mapping");
+            };
+            assert!(registry.start(attempt));
+            let _ = registry.complete(attempt, MappingControlResult::Succeeded);
+        }
+        assert!(matches!(
+            registry.request_scalar(CorrelationId::new(3).expect("id"), address, 8_001),
+            MappingRequest::Ready(_)
+        ));
+
+        let replacement_id = CorrelationId::new(4).expect("id");
+        let MappingRequest::Replacing {
+            attempt,
+            cancellation,
+        } = registry.request_scalar(replacement_id, address, 8_003)
+        else {
+            panic!("replacement dispatch");
+        };
+
+        assert_eq!(attempt.local_port(), 8_003);
+        assert_eq!(
+            cancellation.operation(),
+            ControlOperation::Cancel(ForwardSpec {
+                local_address: address,
+                local_port: 8_002,
+                remote_address: address,
+                remote_port: 8_002,
+            })
+        );
+        assert_eq!(registry.mapping_count(), 2);
+        assert!(matches!(
+            registry.request_scalar(CorrelationId::new(5).expect("id"), address, 8_002),
+            MappingRequest::Replacing { .. }
+        ));
+    }
+
+    #[test]
+    fn creating_settlement_preserves_request_time_lru_order() {
+        let address = LoopbackAddress::Ipv4([127, 0, 0, 1]);
+        let mut registry = MappingRegistry::for_test_with_saved_limit([], saved_limit(2));
+
+        let old_id = CorrelationId::new(1).expect("id");
+        let MappingRequest::Pending {
+            attempt: Some(old_attempt),
+        } = registry.request_scalar(old_id, address, 8_001)
+        else {
+            panic!("old creating mapping");
+        };
+        assert!(registry.start(old_attempt));
+
+        let newer_id = CorrelationId::new(2).expect("id");
+        let MappingRequest::Pending {
+            attempt: Some(newer_attempt),
+        } = registry.request_scalar(newer_id, address, 8_002)
+        else {
+            panic!("newer mapping");
+        };
+        assert!(registry.start(newer_attempt));
+        let _ = registry.complete(newer_attempt, MappingControlResult::Succeeded);
+        assert!(matches!(
+            registry.request_scalar(CorrelationId::new(3).expect("id"), address, 8_002),
+            MappingRequest::Ready(_)
+        ));
+        let _ = registry.complete(old_attempt, MappingControlResult::Succeeded);
+
+        let MappingRequest::Replacing { cancellation, .. } =
+            registry.request_scalar(CorrelationId::new(4).expect("id"), address, 8_003)
+        else {
+            panic!("replacement");
+        };
+        assert_eq!(
+            cancellation.operation(),
+            ControlOperation::Cancel(ForwardSpec {
+                local_address: address,
+                local_port: 8_001,
+                remote_address: address,
+                remote_port: 8_001,
+            })
+        );
+    }
+
+    #[test]
+    fn coalesced_creating_waiter_refreshes_request_time_lru_order() {
+        let address = LoopbackAddress::Ipv4([127, 0, 0, 1]);
+        let mut registry = MappingRegistry::for_test_with_saved_limit([], saved_limit(2));
+        let first_id = CorrelationId::new(1).expect("id");
+        let MappingRequest::Pending {
+            attempt: Some(first_attempt),
+        } = registry.request_scalar(first_id, address, 8_001)
+        else {
+            panic!("creating mapping");
+        };
+        assert!(registry.start(first_attempt));
+
+        let ready_id = CorrelationId::new(2).expect("id");
+        let MappingRequest::Pending {
+            attempt: Some(ready_attempt),
+        } = registry.request_scalar(ready_id, address, 8_002)
+        else {
+            panic!("ready mapping");
+        };
+        assert!(registry.start(ready_attempt));
+        let _ = registry.complete(ready_attempt, MappingControlResult::Succeeded);
+        assert_eq!(
+            registry.request_scalar(CorrelationId::new(3).expect("id"), address, 8_001),
+            MappingRequest::Pending { attempt: None }
+        );
+        let _ = registry.complete(first_attempt, MappingControlResult::Succeeded);
+
+        let MappingRequest::Replacing { cancellation, .. } =
+            registry.request_scalar(CorrelationId::new(4).expect("id"), address, 8_003)
+        else {
+            panic!("replacement");
+        };
+        assert_eq!(
+            cancellation.operation(),
+            ControlOperation::Cancel(ForwardSpec {
+                local_address: address,
+                local_port: 8_002,
+                remote_address: address,
+                remote_port: 8_002,
+            })
+        );
+    }
+
+    #[test]
+    fn live_limit_decrease_evicts_ready_lru_but_preserves_creating_work() {
+        let address = LoopbackAddress::Ipv4([127, 0, 0, 1]);
+        let mut ready = MappingRegistry::for_test_with_saved_limit([], saved_limit(4));
+        for (id, port) in [(1, 8_001), (2, 8_002), (3, 8_003)] {
+            let id = CorrelationId::new(id).expect("id");
+            let MappingRequest::Pending {
+                attempt: Some(attempt),
+            } = ready.request_scalar(id, address, port)
+            else {
+                panic!("new mapping");
+            };
+            assert!(ready.start(attempt));
+            let _ = ready.complete(attempt, MappingControlResult::Succeeded);
+        }
+        let _ = ready.request_scalar(CorrelationId::new(4).expect("id"), address, 8_001);
+        let cancellations =
+            ready.set_saved_limit(saved_limit(1), CorrelationId::new(5).expect("id"));
+        assert_eq!(
+            cancellations
+                .into_iter()
+                .map(MappingCancellation::operation)
+                .collect::<Vec<_>>(),
+            vec![
+                ControlOperation::Cancel(ForwardSpec {
+                    local_address: address,
+                    local_port: 8_002,
+                    remote_address: address,
+                    remote_port: 8_002,
+                }),
+                ControlOperation::Cancel(ForwardSpec {
+                    local_address: address,
+                    local_port: 8_003,
+                    remote_address: address,
+                    remote_port: 8_003,
+                }),
+            ]
+        );
+        assert_eq!(ready.mapping_count(), 1);
+
+        let mut creating = MappingRegistry::for_test_with_saved_limit([], saved_limit(3));
+        let mut attempts = Vec::new();
+        for (id, port) in [(10, 9_001), (11, 9_002), (12, 9_003)] {
+            let MappingRequest::Pending {
+                attempt: Some(attempt),
+            } = creating.request_scalar(CorrelationId::new(id).expect("id"), address, port)
+            else {
+                panic!("creating mapping");
+            };
+            attempts.push(attempt);
+        }
+        assert!(creating
+            .set_saved_limit(saved_limit(1), CorrelationId::new(13).expect("id"))
+            .is_empty());
+        let rejected = CorrelationId::new(14).expect("id");
+        assert_eq!(
+            creating.request_scalar(rejected, address, 9_004),
+            MappingRequest::Failed(MappingSettlement::failed(
+                rejected,
+                ForwardFailure::TooManyRequests,
+            ))
+        );
+        assert_eq!(
+            creating.request_scalar(CorrelationId::new(15).expect("id"), address, 9_001),
+            MappingRequest::Pending { attempt: None }
+        );
+        for (index, attempt) in attempts.into_iter().enumerate() {
+            assert!(creating.start(attempt));
+            let completion = creating.complete(attempt, MappingControlResult::Succeeded);
+            assert_eq!(completion.cancellation.is_some(), index < 2);
+        }
+        assert_eq!(creating.mapping_count(), 1);
+    }
+
+    #[test]
+    fn over_limit_completion_evicts_an_older_ready_before_publishing() {
+        let address = LoopbackAddress::Ipv4([127, 0, 0, 1]);
+        let mut registry = MappingRegistry::for_test_with_saved_limit([], saved_limit(2));
+        let old_id = CorrelationId::new(1).expect("id");
+        let MappingRequest::Pending {
+            attempt: Some(old_attempt),
+        } = registry.request_scalar(old_id, address, 8_001)
+        else {
+            panic!("old mapping");
+        };
+        assert!(registry.start(old_attempt));
+        let _ = registry.complete(old_attempt, MappingControlResult::Succeeded);
+
+        let completed_id = CorrelationId::new(2).expect("id");
+        let MappingRequest::Pending {
+            attempt: Some(completed_attempt),
+        } = registry.request_scalar(completed_id, address, 8_002)
+        else {
+            panic!("creating mapping");
+        };
+        assert!(registry.start(completed_attempt));
+        registry.saved_limit = saved_limit(1);
+
+        let completion = registry.complete(completed_attempt, MappingControlResult::Succeeded);
+        assert_eq!(
+            completion.cancellation.map(MappingAttempt::cancellation),
+            Some(ControlOperation::Cancel(ForwardSpec {
+                local_address: address,
+                local_port: 8_001,
+                remote_address: address,
+                remote_port: 8_001,
+            }))
+        );
+        assert_eq!(
+            completion.settlements,
+            vec![MappingSettlement::ready(completed_id, 8_002)]
+        );
+        assert!(matches!(
+            registry.request_scalar(CorrelationId::new(3).expect("id"), address, 8_002),
+            MappingRequest::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn over_limit_completion_selected_as_victim_never_publishes_ready() {
+        let address = LoopbackAddress::Ipv4([127, 0, 0, 1]);
+        let mut registry = MappingRegistry::for_test_with_saved_limit([], saved_limit(3));
+        let mut attempts = Vec::new();
+        for (id, port) in [(1, 8_001), (2, 8_002), (3, 8_003)] {
+            let MappingRequest::Pending {
+                attempt: Some(attempt),
+            } = registry.request_scalar(CorrelationId::new(id).expect("id"), address, port)
+            else {
+                panic!("creating mapping");
+            };
+            attempts.push(attempt);
+        }
+        assert!(registry
+            .set_saved_limit(saved_limit(2), CorrelationId::new(4).expect("id"))
+            .is_empty());
+
+        let victim = attempts[1];
+        let coalesced = CorrelationId::new(5).expect("id");
+        assert_eq!(
+            registry.request_scalar(coalesced, address, 8_002),
+            MappingRequest::Pending { attempt: None }
+        );
+        assert!(registry.start(victim));
+        let completion = registry.complete(victim, MappingControlResult::Succeeded);
+        assert_eq!(
+            completion.cancellation.map(MappingAttempt::cancellation),
+            Some(victim.cancellation())
+        );
+        assert_eq!(
+            completion.settlements,
+            vec![
+                MappingSettlement::failed(
+                    victim.controller_id(),
+                    ForwardFailure::CapacityExhausted,
+                ),
+                MappingSettlement::failed(coalesced, ForwardFailure::CapacityExhausted),
+            ]
+        );
+        assert_eq!(registry.mapping_count(), 2);
+        assert!(matches!(
+            registry.request_scalar(CorrelationId::new(6).expect("id"), address, 8_002,),
+            MappingRequest::Failed(MappingSettlement {
+                result: Err(ForwardFailure::TooManyRequests),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn lifetime_listener_capacity_reserves_atomically_and_counts_partial_pairs_forever() {
+        let address = LoopbackAddress::Ipv4([127, 0, 0, 1]);
+        let mut concurrent = MappingRegistry::for_test_with_capacity([], 126);
+        let first = CorrelationId::new(1).expect("id");
+        assert!(matches!(
+            concurrent.request_scalar(first, address, 8_001),
+            MappingRequest::Pending { .. }
+        ));
+        let pair = CorrelationId::new(2).expect("id");
+        assert_eq!(
+            concurrent.request_localhost(pair, 8_002),
+            MappingRequest::Failed(MappingSettlement::failed(
+                pair,
+                ForwardFailure::CapacityExhausted,
+            )),
+            "the scalar reservation leaves only one indivisible slot"
+        );
+        assert!(matches!(
+            concurrent.request_scalar(CorrelationId::new(3).expect("id"), address, 8_003),
+            MappingRequest::Pending { .. }
+        ));
+        let exhausted = CorrelationId::new(4).expect("id");
+        assert_eq!(
+            concurrent.request_scalar(exhausted, address, 8_004),
+            MappingRequest::Failed(MappingSettlement::failed(
+                exhausted,
+                ForwardFailure::CapacityExhausted,
+            ))
+        );
+
+        let mut partial = MappingRegistry::for_test_with_capacity([], 126);
+        let partial_id = CorrelationId::new(10).expect("id");
+        let MappingRequest::Pending {
+            attempt: Some(pair_attempt),
+        } = partial.request_localhost(partial_id, 9_000)
+        else {
+            panic!("pair reservation");
+        };
+        assert!(partial.start(pair_attempt));
+        let _ = partial.complete(pair_attempt, MappingControlResult::PairSecondFailed);
+        assert_eq!(partial.listener_counts(), (127, 0));
+        assert!(matches!(
+            partial.request_scalar(CorrelationId::new(11).expect("id"), address, 9_001),
+            MappingRequest::Pending { .. }
+        ));
+        assert_eq!(partial.listener_counts(), (127, 1));
+    }
+
+    #[test]
+    fn reservations_at_127_and_128_release_only_never_successful_remainder() {
+        let address = LoopbackAddress::Ipv4([127, 0, 0, 1]);
+        let mut at_127 = MappingRegistry::for_test_with_capacity([], 127);
+        let pair = CorrelationId::new(1).expect("id");
+        assert_eq!(
+            at_127.request_localhost(pair, 8_000),
+            MappingRequest::Failed(MappingSettlement::failed(
+                pair,
+                ForwardFailure::CapacityExhausted,
+            ))
+        );
+        let scalar = CorrelationId::new(2).expect("id");
+        let MappingRequest::Pending {
+            attempt: Some(reserved),
+        } = at_127.request_scalar(scalar, address, 8_001)
+        else {
+            panic!("last scalar reservation");
+        };
+        assert_eq!(at_127.listener_counts(), (127, 1));
+        assert_eq!(
+            at_127.cancel_waiter(scalar),
+            WaiterCancellation::AbandonedBeforeStart(reserved)
+        );
+        assert_eq!(at_127.listener_counts(), (127, 0));
+
+        let mut at_128 = MappingRegistry::for_test_with_capacity([], 128);
+        for (id, request) in [
+            (
+                CorrelationId::new(3).expect("id"),
+                at_128.request_scalar(CorrelationId::new(3).expect("id"), address, 8_002),
+            ),
+            (
+                CorrelationId::new(4).expect("id"),
+                at_128.request_localhost(CorrelationId::new(4).expect("id"), 8_003),
+            ),
+        ] {
+            assert_eq!(
+                request,
+                MappingRequest::Failed(MappingSettlement::failed(
+                    id,
+                    ForwardFailure::CapacityExhausted,
+                ))
+            );
+        }
+        assert_eq!(at_128.listener_counts(), (128, 0));
+    }
+
+    #[test]
+    fn listener_lifetime_ledger_model_sequences_preserve_capacity_and_single_settlement() {
+        for seed in 1_u64..=128 {
+            let mut entropy = seed;
+            let mut ledger = LifetimeLedger::default();
+            let mut reservations = Vec::<(ListenerReservation, u8)>::new();
+            let mut model_available = LIFETIME_LISTENER_LIMIT;
+            let mut model_consumed = 0_u16;
+
+            for _ in 0..256 {
+                entropy = entropy
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                if entropy % 3 != 0 || reservations.is_empty() {
+                    let slots = if entropy & 1 == 0 {
+                        ListenerSlots::SCALAR
+                    } else {
+                        ListenerSlots::ATOMIC_PAIR
+                    };
+                    match ledger.reserve(slots) {
+                        Ok(reservation) => {
+                            assert!(model_available >= u16::from(slots.0));
+                            model_available -= u16::from(slots.0);
+                            reservations.push((reservation, slots.0));
+                        }
+                        Err(ListenerReservationError::CapacityExhausted) => {
+                            assert!(model_available < u16::from(slots.0));
+                        }
+                        Err(ListenerReservationError::Invariant(error)) => {
+                            panic!("unexpected ledger invariant: {error:?}");
+                        }
+                    }
+                } else {
+                    let index =
+                        usize::try_from(entropy).expect("test entropy") % reservations.len();
+                    let (reservation, reserved) = reservations.swap_remove(index);
+                    let successful = u8::try_from(entropy % u64::from(reserved + 1))
+                        .expect("successful listener count");
+                    let settlement = ledger
+                        .settle(reservation, successful)
+                        .expect("model reservation settles once");
+                    assert_eq!(settlement.consumed_success, successful);
+                    assert_eq!(settlement.released_unused, reserved - successful);
+                    model_consumed += u16::from(successful);
+                    model_available += u16::from(reserved - successful);
+                    assert_eq!(
+                        ledger.settle(reservation, 0),
+                        Err(ListenerLedgerInvariant::UnknownReservation)
+                    );
+                }
+
+                let (available, reserved, consumed) = ledger.counts();
+                assert_eq!(available, model_available);
+                assert_eq!(consumed, model_consumed);
+                assert_eq!(available + reserved + consumed, LIFETIME_LISTENER_LIMIT);
+            }
+        }
+    }
+
+    #[test]
+    fn listener_lifetime_ledger_rejects_overconsume_without_losing_reservation() {
+        let mut ledger = LifetimeLedger::default();
+        let reservation = ledger
+            .reserve(ListenerSlots::SCALAR)
+            .expect("scalar reservation");
+        assert_eq!(
+            ledger.settle(reservation, 2),
+            Err(ListenerLedgerInvariant::SuccessfulListenersExceedReservation)
+        );
+        assert_eq!(ledger.counts(), (127, 1, 0));
+        assert_eq!(
+            ledger.settle(reservation, 1),
+            Ok(ListenerSettlement {
+                consumed_success: 1,
+                released_unused: 0,
+            })
+        );
+        assert_eq!(ledger.counts(), (127, 0, 1));
+    }
+
+    #[test]
+    fn exhaustion_preserves_ready_reuse_has_no_candidate_side_effects_and_resets_by_generation() {
+        let address = LoopbackAddress::Ipv4([127, 0, 0, 1]);
+        let mut registry = MappingRegistry::for_test_with_capacity([], 126);
+        for (id, port) in [(1, 8_001), (2, 8_002)] {
+            let id = CorrelationId::new(id).expect("id");
+            let MappingRequest::Pending {
+                attempt: Some(attempt),
+            } = registry.request_scalar(id, address, port)
+            else {
+                panic!("reserved scalar");
+            };
+            assert!(registry.start(attempt));
+            let _ = registry.complete(attempt, MappingControlResult::Succeeded);
+        }
+        assert_eq!(registry.listener_counts(), (128, 0));
+        let _ = registry.set_saved_limit(saved_limit(1), CorrelationId::new(3).expect("id"));
+        assert_eq!(registry.listener_counts(), (128, 0));
+        assert!(matches!(
+            registry.request_scalar(CorrelationId::new(4).expect("id"), address, 8_002),
+            MappingRequest::Ready(_)
+        ));
+        let distinct = CorrelationId::new(5).expect("id");
+        assert_eq!(
+            registry.request_scalar(distinct, address, 8_003),
+            MappingRequest::Failed(MappingSettlement::failed(
+                distinct,
+                ForwardFailure::CapacityExhausted,
+            ))
+        );
+
+        let (mut candidate_guard, calls) =
+            MappingRegistry::for_test_with_capacity_and_candidate_calls([43_123], 128);
+        candidate_guard.quarantine(9_000);
+        let guarded = CorrelationId::new(6).expect("id");
+        assert_eq!(
+            candidate_guard.request_localhost(guarded, 9_000),
+            MappingRequest::Failed(MappingSettlement::failed(
+                guarded,
+                ForwardFailure::CapacityExhausted,
+            ))
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let _ = registry.master_died();
+        assert!(registry.replace_master());
+        assert!(matches!(
+            registry.request_localhost(CorrelationId::new(7).expect("id"), 9_001),
+            MappingRequest::Pending { .. }
+        ));
+        assert_eq!(registry.listener_counts(), (0, 2));
     }
 
     #[test]
@@ -1265,7 +2475,9 @@ mod tests {
             MappingCompletion {
                 attempt: None,
                 cancellation: None,
+                cancellation_policy: None,
                 settlements: vec![MappingSettlement::failed(id, ForwardFailure::BindFailed)],
+                invariant_error: None,
             }
         );
         assert_eq!(registry.mapping_count(), 0);
@@ -1338,7 +2550,9 @@ mod tests {
             MappingCompletion {
                 attempt: None,
                 cancellation: None,
+                cancellation_policy: None,
                 settlements: vec![MappingSettlement::failed(id, ForwardFailure::BindFailed)],
+                invariant_error: None,
             }
         );
     }
@@ -1361,10 +2575,12 @@ mod tests {
             MappingCompletion {
                 attempt: None,
                 cancellation: None,
+                cancellation_policy: None,
                 settlements: vec![MappingSettlement::failed(
                     id,
                     ForwardFailure::CommandRejected,
                 )],
+                invariant_error: None,
             }
         );
     }
@@ -1459,7 +2675,7 @@ mod tests {
 
     #[test]
     fn generated_identity_matrix_settles_each_waiter_exactly_once() {
-        let mut registry = MappingRegistry::for_test([]);
+        let mut registry = MappingRegistry::for_test_with_saved_limit([], saved_limit(64));
         let mut terminal = BTreeSet::new();
 
         for mapping in 0..32_u64 {
