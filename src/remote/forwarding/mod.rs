@@ -5,6 +5,8 @@ mod controller;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod inheritance;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod pair;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod protocol;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod transport;

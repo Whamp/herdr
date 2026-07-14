@@ -657,6 +657,10 @@ pub(crate) const fn external_open_platform() -> crate::external_open::ExternalOp
     crate::external_open::ExternalOpenPlatform::MacOs
 }
 
+pub(crate) fn external_open_ipv6_available() -> bool {
+    std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).is_ok()
+}
+
 pub fn open_url(url: &str) -> std::io::Result<()> {
     Command::new("open")
         .arg(url)
