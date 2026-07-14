@@ -6,21 +6,19 @@ use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use super::pair::{LocalhostMappings, PairRequest, PairSettlement};
 use super::protocol::{
     self, ClientMessage, CorrelationId, ForwardFailure, ForwardSpec, ServerMessage,
     BROKER_PROTOCOL_VERSION,
 };
-use super::transport::AuthenticatedFrameReader;
-use super::worker::{
-    CommandRunner, ControlAuthority, ControlOperation, ControlResult, ControlWorker,
-    PairControlResult, WorkerJob,
+use super::registry::{
+    MappingAttempt, MappingControlResult, MappingRegistry, MappingRequest, MappingSettlement,
+    WaiterCancellation,
 };
+use super::transport::AuthenticatedFrameReader;
+use super::worker::{CommandRunner, ControlAuthority, ControlResult, ControlWorker, WorkerJob};
 
 const MAX_PENDING_FORWARD_REQUESTS: usize = 32;
 
-// Follow-up external-open routing consumes the established forward-call API.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingKind {
     Hello,
@@ -47,8 +45,6 @@ pub(crate) struct ForwardingClient {
     inner: Arc<ClientInner>,
 }
 
-// Follow-up external-open routing consumes these capability operations.
-#[allow(dead_code)]
 impl ForwardingClient {
     pub(super) fn from_stream(
         stream: UnixStream,
@@ -106,6 +102,7 @@ impl ForwardingClient {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn is_active(&self) -> bool {
         self.inner.active.load(Ordering::Acquire) && !self.inner.closed.load(Ordering::Acquire)
     }
@@ -117,69 +114,58 @@ impl ForwardingClient {
     }
 
     pub(crate) fn begin_assert_policy(&self, enabled: bool) -> io::Result<PolicyCall> {
-        let (_id, receiver) = self.start_call(PendingKind::Policy, |id| {
+        let (id, receiver) = self.start_call(PendingKind::Policy, |id| {
             ClientMessage::AssertPolicy { id, enabled }
         })?;
         Ok(PolicyCall {
             requested: enabled,
-            receiver: Some(receiver),
-            inner: Arc::clone(&self.inner),
-            settled: false,
+            core: BrokerCallCore::new(
+                id,
+                receiver,
+                Arc::clone(&self.inner),
+                CancellationMode::LocalOnly,
+            ),
         })
     }
 
-    pub(crate) fn begin_forward(&self, spec: ForwardSpec) -> Result<ForwardCall, ForwardFailure> {
-        self.begin_mapping_call(PendingKind::Forward, |id| ClientMessage::Forward {
-            id,
-            spec,
+    pub(crate) fn begin_forward(&self, spec: ForwardSpec) -> Result<MappingCall, ForwardFailure> {
+        self.begin_mapping_call(PendingKind::Forward, MappingResponseKind::Scalar, |id| {
+            ClientMessage::Forward { id, spec }
         })
     }
 
-    pub(crate) fn begin_localhost(
-        &self,
-        remote_port: u16,
-    ) -> Result<LocalhostCall, ForwardFailure> {
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(ForwardFailure::CapabilityClosed);
-        }
-        let (id, receiver) = self
-            .start_call(PendingKind::Localhost, |id| {
-                ClientMessage::ForwardLocalhost { id, remote_port }
-            })
-            .map_err(|_| {
-                self.close();
-                ForwardFailure::CapabilityClosed
-            })?;
-        Ok(LocalhostCall {
-            id,
-            receiver: Some(receiver),
-            inner: Arc::clone(&self.inner),
-            settled: false,
-            cancelled: false,
-        })
+    pub(crate) fn begin_localhost(&self, remote_port: u16) -> Result<MappingCall, ForwardFailure> {
+        self.begin_mapping_call(
+            PendingKind::Localhost,
+            MappingResponseKind::Localhost,
+            |id| ClientMessage::ForwardLocalhost { id, remote_port },
+        )
     }
 
     fn begin_mapping_call(
         &self,
-        kind: PendingKind,
+        pending_kind: PendingKind,
+        response_kind: MappingResponseKind,
         message: impl FnOnce(CorrelationId) -> ClientMessage,
-    ) -> Result<ForwardCall, ForwardFailure> {
+    ) -> Result<MappingCall, ForwardFailure> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(ForwardFailure::CapabilityClosed);
         }
-        let (id, receiver) = match self.start_call(kind, message) {
+        let (id, receiver) = match self.start_call(pending_kind, message) {
             Ok(call) => call,
             Err(_) => {
                 self.close();
                 return Err(ForwardFailure::CapabilityClosed);
             }
         };
-        Ok(ForwardCall {
-            id,
-            receiver: Some(receiver),
-            inner: Arc::clone(&self.inner),
-            settled: false,
-            cancelled: false,
+        Ok(MappingCall {
+            response_kind,
+            core: BrokerCallCore::new(
+                id,
+                receiver,
+                Arc::clone(&self.inner),
+                CancellationMode::NotifyBroker,
+            ),
         })
     }
 
@@ -274,8 +260,6 @@ impl ForwardingClient {
     }
 }
 
-// Follow-up external-open routing retains this cancellable call handle.
-#[allow(dead_code)]
 impl Drop for ForwardingClient {
     fn drop(&mut self) {
         if Arc::strong_count(&self.inner) == 1 {
@@ -284,166 +268,177 @@ impl Drop for ForwardingClient {
     }
 }
 
-pub(crate) struct ForwardCall {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancellationMode {
+    NotifyBroker,
+    LocalOnly,
+}
+
+struct BrokerCallCore {
     id: CorrelationId,
     receiver: Option<mpsc::Receiver<ServerMessage>>,
     inner: Arc<ClientInner>,
+    cancellation_mode: CancellationMode,
     settled: bool,
     cancelled: bool,
 }
 
-impl ForwardCall {
-    #[cfg(test)]
-    pub(crate) fn wait(mut self) -> Result<(), ForwardFailure> {
+impl BrokerCallCore {
+    fn new(
+        id: CorrelationId,
+        receiver: mpsc::Receiver<ServerMessage>,
+        inner: Arc<ClientInner>,
+        cancellation_mode: CancellationMode,
+    ) -> Self {
+        Self {
+            id,
+            receiver: Some(receiver),
+            inner,
+            cancellation_mode,
+            settled: false,
+            cancelled: false,
+        }
+    }
+
+    fn wait(&mut self) -> Result<ServerMessage, ForwardFailure> {
         let response = self
             .receiver
             .take()
-            .and_then(|receiver| receiver.recv().ok());
+            .and_then(|receiver| receiver.recv().ok())
+            .ok_or(ForwardFailure::CapabilityClosed);
         self.settled = true;
-        forward_response(response)
+        response
     }
 
-    pub(crate) fn try_wait(&mut self) -> Option<Result<(), ForwardFailure>> {
+    fn try_wait(&mut self) -> Option<Result<ServerMessage, ForwardFailure>> {
         let response = match self.receiver.as_ref()?.try_recv() {
-            Ok(response) => response,
+            Ok(response) => Ok(response),
             Err(mpsc::TryRecvError::Empty) => return None,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.receiver = None;
-                self.settled = true;
-                return Some(Err(ForwardFailure::CapabilityClosed));
-            }
+            Err(mpsc::TryRecvError::Disconnected) => Err(ForwardFailure::CapabilityClosed),
         };
         self.receiver = None;
         self.settled = true;
-        Some(forward_response(Some(response)))
+        Some(response)
     }
 
-    pub(crate) fn cancel(&mut self) {
+    fn cancel(&mut self) {
         if self.settled || self.cancelled {
             return;
         }
-        let client = ForwardingClient {
-            inner: Arc::clone(&self.inner),
-        };
-        client.cancel(self.id);
+        if self.cancellation_mode == CancellationMode::NotifyBroker {
+            ForwardingClient {
+                inner: Arc::clone(&self.inner),
+            }
+            .cancel(self.id);
+        } else {
+            self.receiver = None;
+            self.settled = true;
+        }
         self.cancelled = true;
     }
-}
 
-fn forward_response(response: Option<ServerMessage>) -> Result<(), ForwardFailure> {
-    match response {
-        Some(ServerMessage::ForwardSettled { result, .. }) => result,
-        Some(ServerMessage::Cancelled { .. }) => Err(ForwardFailure::Cancelled),
-        _ => Err(ForwardFailure::CapabilityClosed),
+    fn set_active(&self, active: bool) {
+        self.inner.active.store(active, Ordering::Release);
     }
 }
 
-impl Drop for ForwardCall {
+impl Drop for BrokerCallCore {
     fn drop(&mut self) {
         self.cancel();
     }
 }
 
-pub(crate) struct LocalhostCall {
-    id: CorrelationId,
-    receiver: Option<mpsc::Receiver<ServerMessage>>,
-    inner: Arc<ClientInner>,
-    settled: bool,
-    cancelled: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MappingResponseKind {
+    Scalar,
+    Localhost,
 }
 
-impl LocalhostCall {
+impl MappingResponseKind {
+    fn decode(
+        self,
+        response: Result<ServerMessage, ForwardFailure>,
+    ) -> Result<u16, ForwardFailure> {
+        match self {
+            Self::Scalar => forward_response(response),
+            Self::Localhost => localhost_response(response),
+        }
+    }
+}
+
+pub(crate) struct MappingCall {
+    response_kind: MappingResponseKind,
+    core: BrokerCallCore,
+}
+
+impl MappingCall {
     #[cfg(test)]
     pub(crate) fn wait(mut self) -> Result<u16, ForwardFailure> {
-        let response = self
-            .receiver
-            .take()
-            .and_then(|receiver| receiver.recv().ok());
-        self.settled = true;
-        localhost_response(response)
+        self.response_kind.decode(self.core.wait())
     }
 
     pub(crate) fn try_wait(&mut self) -> Option<Result<u16, ForwardFailure>> {
-        let response = match self.receiver.as_ref()?.try_recv() {
-            Ok(response) => response,
-            Err(mpsc::TryRecvError::Empty) => return None,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.receiver = None;
-                self.settled = true;
-                return Some(Err(ForwardFailure::CapabilityClosed));
-            }
-        };
-        self.receiver = None;
-        self.settled = true;
-        Some(localhost_response(Some(response)))
+        self.core
+            .try_wait()
+            .map(|response| self.response_kind.decode(response))
     }
 
     pub(crate) fn cancel(&mut self) {
-        if self.settled || self.cancelled {
-            return;
-        }
-        ForwardingClient {
-            inner: Arc::clone(&self.inner),
-        }
-        .cancel(self.id);
-        self.cancelled = true;
+        self.core.cancel();
     }
 }
 
-fn localhost_response(response: Option<ServerMessage>) -> Result<u16, ForwardFailure> {
+fn forward_response(
+    response: Result<ServerMessage, ForwardFailure>,
+) -> Result<u16, ForwardFailure> {
     match response {
-        Some(ServerMessage::ForwardLocalhostSettled { result, .. }) => result,
-        Some(ServerMessage::Cancelled { .. }) => Err(ForwardFailure::Cancelled),
-        _ => Err(ForwardFailure::CapabilityClosed),
+        Ok(ServerMessage::ForwardSettled { result, .. }) => result,
+        Ok(ServerMessage::Cancelled { .. }) => Err(ForwardFailure::Cancelled),
+        Ok(_) | Err(ForwardFailure::CapabilityClosed) => Err(ForwardFailure::CapabilityClosed),
+        Err(error) => Err(error),
     }
 }
 
-impl Drop for LocalhostCall {
-    fn drop(&mut self) {
-        self.cancel();
+fn localhost_response(
+    response: Result<ServerMessage, ForwardFailure>,
+) -> Result<u16, ForwardFailure> {
+    match response {
+        Ok(ServerMessage::ForwardLocalhostSettled { result, .. }) => result,
+        Ok(ServerMessage::Cancelled { .. }) => Err(ForwardFailure::Cancelled),
+        Ok(_) | Err(ForwardFailure::CapabilityClosed) => Err(ForwardFailure::CapabilityClosed),
+        Err(error) => Err(error),
     }
 }
 
 pub(crate) struct PolicyCall {
     requested: bool,
-    receiver: Option<mpsc::Receiver<ServerMessage>>,
-    inner: Arc<ClientInner>,
-    settled: bool,
+    core: BrokerCallCore,
 }
 
 impl PolicyCall {
     fn wait(mut self) -> io::Result<(bool, Result<(), ForwardFailure>)> {
-        let response = self
-            .receiver
-            .take()
-            .and_then(|receiver| receiver.recv().ok());
-        self.settled = true;
+        let response = self.core.wait().ok();
         let settled = policy_response(self.requested, response)?;
-        self.inner.active.store(settled.0, Ordering::Release);
+        self.core.set_active(settled.0);
         Ok(settled)
     }
 
     pub(crate) fn try_wait(&mut self) -> Option<(bool, Result<(), ForwardFailure>)> {
-        let response = match self.receiver.as_ref()?.try_recv() {
-            Ok(response) => response,
-            Err(mpsc::TryRecvError::Empty) => return None,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.receiver = None;
-                self.settled = true;
+        let response = match self.core.try_wait()? {
+            Ok(response) => Some(response),
+            Err(ForwardFailure::CapabilityClosed) => {
                 return Some((false, Err(ForwardFailure::CapabilityClosed)));
             }
+            Err(error) => return Some((false, Err(error))),
         };
-        self.receiver = None;
-        self.settled = true;
-        let settled = policy_response(self.requested, Some(response))
+        let settled = policy_response(self.requested, response)
             .unwrap_or((false, Err(ForwardFailure::CapabilityClosed)));
-        self.inner.active.store(settled.0, Ordering::Release);
+        self.core.set_active(settled.0);
         Some(settled)
     }
 
     pub(crate) fn cancel(&mut self) {
-        self.receiver = None;
-        self.settled = true;
+        self.core.cancel();
     }
 }
 
@@ -462,15 +457,6 @@ fn policy_response(
             io::ErrorKind::InvalidData,
             "forwarding broker policy acknowledgement rejected",
         )),
-    }
-}
-
-impl Drop for PolicyCall {
-    fn drop(&mut self) {
-        if !self.settled {
-            self.cancel();
-        }
-        let _ = &self.inner;
     }
 }
 
@@ -558,43 +544,15 @@ enum BrokerState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ReadyMapping {
-    pub(super) spec: ForwardSpec,
-}
-
-#[derive(Default)]
-pub(super) struct MappingRegistry {
-    ready: BTreeMap<ForwardSpec, ReadyMapping>,
-}
-
-impl MappingRegistry {
-    fn owns_destination(&self, spec: ForwardSpec) -> bool {
-        self.ready
-            .keys()
-            .any(|owned| same_destination(*owned, spec))
-    }
-
-    fn insert_ready(&mut self, spec: ForwardSpec) {
-        self.ready.insert(spec, ReadyMapping { spec });
-    }
-
-    fn collides_with_ready(&self, spec: ForwardSpec) -> bool {
-        self.ready.keys().any(|ready| {
-            ready.local_address == spec.local_address
-                && ready.local_port == spec.local_port
-                && *ready != spec
-        })
-    }
-}
-
-fn same_destination(left: ForwardSpec, right: ForwardSpec) -> bool {
-    left.remote_address == right.remote_address && left.remote_port == right.remote_port
+enum QueuedJobKind {
+    Mapping(MappingAttempt),
+    Cleanup,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct QueuedJob {
     job: WorkerJob,
-    respond: bool,
+    kind: QueuedJobKind,
 }
 
 pub(crate) struct BrokerServer {
@@ -624,10 +582,28 @@ impl BrokerServer {
         runner: Arc<dyn CommandRunner>,
         timeout: Duration,
     ) -> io::Result<Self> {
+        Self::start_with_runner_and_registry(
+            stream,
+            expected_child,
+            authority,
+            runner,
+            timeout,
+            MappingRegistry::default(),
+        )
+    }
+
+    fn start_with_runner_and_registry(
+        stream: UnixStream,
+        expected_child: crate::platform::InheritedPeerIdentity,
+        authority: ControlAuthority,
+        runner: Arc<dyn CommandRunner>,
+        timeout: Duration,
+        mappings: MappingRegistry,
+    ) -> io::Result<Self> {
         let control = stream.try_clone()?;
         let thread_control = stream.try_clone()?;
         let thread = std::thread::spawn(move || {
-            run_broker(stream, expected_child, authority, runner, timeout);
+            run_broker(stream, expected_child, authority, runner, timeout, mappings);
             let _ = thread_control.shutdown(std::net::Shutdown::Both);
         });
         Ok(Self {
@@ -655,22 +631,13 @@ impl Drop for BrokerServer {
     }
 }
 
-// Tickets 35 and 36 own when cleanup runs; this hook preserves pair-wide exact cancellation.
-#[allow(dead_code)]
-fn ready_pair_cancellation_operations(mappings: &LocalhostMappings) -> Vec<ControlOperation> {
-    mappings
-        .ready_pairs_least_recently_used()
-        .into_iter()
-        .map(ControlOperation::CancelPair)
-        .collect()
-}
-
 fn run_broker(
     mut stream: UnixStream,
     expected_child: crate::platform::InheritedPeerIdentity,
     authority: ControlAuthority,
     runner: Arc<dyn CommandRunner>,
     timeout: Duration,
+    mut mappings: MappingRegistry,
 ) {
     let reader_stream = match stream.try_clone() {
         Ok(stream) => stream,
@@ -692,9 +659,6 @@ fn run_broker(
     let worker = ControlWorker::start(authority, runner, timeout);
     let mut state = BrokerState::AwaitHello;
     let mut highest_id = 0_u64;
-    let mut live = BTreeMap::<u64, ForwardSpec>::new();
-    let mut mappings = MappingRegistry::default();
-    let mut localhost = LocalhostMappings::default();
     let mut queue = VecDeque::<QueuedJob>::new();
     let mut active: Option<QueuedJob> = None;
     let mut pending_disable_ack = None;
@@ -708,82 +672,29 @@ fn run_broker(
                 break 'broker;
             }
 
-            match completed.job.operation {
-                ControlOperation::ForwardPair(pair) => {
-                    let Some(pair_result) = PairControlResult::from_control(result.result) else {
+            match completed.kind {
+                QueuedJobKind::Mapping(attempt) => {
+                    let Some(control_result) = mapping_control_result(result.result) else {
                         break 'broker;
                     };
-                    let completion = localhost.complete(pair, pair_result);
-                    if let Some(next) = completion.command {
-                        queue.push_front(QueuedJob {
-                            job: WorkerJob {
-                                id: completed.job.id,
-                                operation: ControlOperation::ForwardPair(next),
-                            },
-                            respond: false,
-                        });
-                    } else if let Some(cancel) = completion.cancellation {
-                        queue.push_front(QueuedJob {
-                            job: WorkerJob {
-                                id: completed.job.id,
-                                operation: ControlOperation::CancelPair(cancel),
-                            },
-                            respond: false,
-                        });
+                    let completion = mappings.complete(attempt, control_result);
+                    if let Some(next) = completion.attempt {
+                        queue.push_front(mapping_job(next));
+                    }
+                    if let Some(cancelled) = completion.cancellation {
+                        queue.push_front(cleanup_job(cancelled));
                     }
                     for settlement in completion.settlements {
-                        if write_pair_settlement(&mut stream, settlement).is_err() {
-                            break 'broker;
-                        }
-                    }
-                }
-                ControlOperation::CancelPair(_) => {}
-                ControlOperation::Forward(_) | ControlOperation::Cancel(_) => {
-                    if completed.respond {
-                        live.remove(&result.id.get());
-                        let scalar_result = match result.result {
-                            ControlResult::Succeeded => {
-                                if let ControlOperation::Forward(spec) = completed.job.operation {
-                                    mappings.insert_ready(spec);
-                                }
-                                Ok(())
-                            }
-                            ControlResult::BindFailed => Err(ForwardFailure::BindFailed),
-                            ControlResult::Rejected => Err(ForwardFailure::CommandRejected),
-                            ControlResult::TimedOut => Err(ForwardFailure::CommandTimedOut),
-                            ControlResult::PairSucceeded
-                            | ControlResult::PairFirstBindFailed
-                            | ControlResult::PairFirstFailed
-                            | ControlResult::PairFirstTimedOut
-                            | ControlResult::PairSecondFailed
-                            | ControlResult::PairCancellationSucceeded
-                            | ControlResult::PairCancellationFailed => break 'broker,
-                        };
-                        if protocol::write_message(
-                            &mut stream,
-                            &ServerMessage::ForwardSettled {
-                                id: completed.job.id,
-                                result: scalar_result,
-                            },
-                        )
-                        .is_err()
+                        if write_mapping_settlement(&mut stream, attempt.is_localhost(), settlement)
+                            .is_err()
                         {
                             break 'broker;
                         }
-                    } else if result.result == ControlResult::Succeeded {
-                        if let ControlOperation::Forward(spec) = completed.job.operation {
-                            queue.push_front(QueuedJob {
-                                job: WorkerJob {
-                                    id: completed.job.id,
-                                    operation: ControlOperation::Cancel(spec),
-                                },
-                                respond: false,
-                            });
-                        }
                     }
                 }
+                QueuedJobKind::Cleanup => {}
             }
-            if dispatch_next(&worker, &mut queue, &mut active).is_err() {
+            if dispatch_next(&worker, &mut mappings, &mut queue, &mut active).is_err() {
                 break 'broker;
             }
             if active.is_none() {
@@ -852,10 +763,22 @@ fn run_broker(
                             }
                         } else {
                             state = BrokerState::Disabled;
-                            cancel_uncommitted(&mut stream, &mut live, &mut queue, &mut active);
-                            localhost.revoke_creating();
-                            if active.is_none() {
-                                let _ = dispatch_next(&worker, &mut queue, &mut active);
+                            for revoked in mappings.revoke_creating() {
+                                if write_mapping_settlement(
+                                    &mut stream,
+                                    revoked.localhost,
+                                    revoked.settlement,
+                                )
+                                .is_err()
+                                {
+                                    break 'broker;
+                                }
+                            }
+                            if active.is_none()
+                                && dispatch_next(&worker, &mut mappings, &mut queue, &mut active)
+                                    .is_err()
+                            {
+                                break 'broker;
                             }
                             if active.is_some() {
                                 pending_disable_ack = Some(id);
@@ -879,12 +802,10 @@ fn run_broker(
                             && spec.is_valid() =>
                     {
                         if state == BrokerState::Disabled {
-                            if protocol::write_message(
+                            if write_mapping_settlement(
                                 &mut stream,
-                                &ServerMessage::ForwardSettled {
-                                    id,
-                                    result: Err(ForwardFailure::Disabled),
-                                },
+                                false,
+                                MappingSettlement::failed(id, ForwardFailure::Disabled),
                             )
                             .is_err()
                             {
@@ -892,59 +813,33 @@ fn run_broker(
                             }
                             continue;
                         }
-                        if live.values().any(|owned| same_destination(*owned, spec))
-                            || mappings.owns_destination(spec)
+                        let at_limit = mappings.waiter_count() >= MAX_PENDING_FORWARD_REQUESTS;
+                        let request =
+                            mappings.request_scalar(id, spec.remote_address, spec.remote_port);
+                        if at_limit && matches!(request, MappingRequest::Pending { .. }) {
+                            let _ = mappings.cancel_waiter(id);
+                            if write_mapping_settlement(
+                                &mut stream,
+                                false,
+                                MappingSettlement::failed(id, ForwardFailure::TooManyRequests),
+                            )
+                            .is_err()
+                            {
+                                break 'broker;
+                            }
+                            continue;
+                        }
+                        if handle_mapping_request(
+                            &worker,
+                            &mut stream,
+                            &mut mappings,
+                            &mut queue,
+                            &mut active,
+                            false,
+                            request,
+                        )
+                        .is_err()
                         {
-                            if protocol::write_message(
-                                &mut stream,
-                                &ServerMessage::ForwardSettled {
-                                    id,
-                                    result: Err(ForwardFailure::AlreadyOwned),
-                                },
-                            )
-                            .is_err()
-                            {
-                                break 'broker;
-                            }
-                            continue;
-                        }
-                        if mappings.collides_with_ready(spec) {
-                            if protocol::write_message(
-                                &mut stream,
-                                &ServerMessage::ForwardSettled {
-                                    id,
-                                    result: Err(ForwardFailure::BindFailed),
-                                },
-                            )
-                            .is_err()
-                            {
-                                break 'broker;
-                            }
-                            continue;
-                        }
-                        if live.len() >= MAX_PENDING_FORWARD_REQUESTS {
-                            if protocol::write_message(
-                                &mut stream,
-                                &ServerMessage::ForwardSettled {
-                                    id,
-                                    result: Err(ForwardFailure::TooManyRequests),
-                                },
-                            )
-                            .is_err()
-                            {
-                                break 'broker;
-                            }
-                            continue;
-                        }
-                        live.insert(id.get(), spec);
-                        queue.push_back(QueuedJob {
-                            job: WorkerJob {
-                                id,
-                                operation: ControlOperation::Forward(spec),
-                            },
-                            respond: true,
-                        });
-                        if dispatch_next(&worker, &mut queue, &mut active).is_err() {
                             break 'broker;
                         }
                     }
@@ -953,12 +848,10 @@ fn run_broker(
                             && remote_port != 0 =>
                     {
                         if state == BrokerState::Disabled {
-                            if write_pair_settlement(
+                            if write_mapping_settlement(
                                 &mut stream,
-                                PairSettlement {
-                                    id,
-                                    result: Err(ForwardFailure::Disabled),
-                                },
+                                true,
+                                MappingSettlement::failed(id, ForwardFailure::Disabled),
                             )
                             .is_err()
                             {
@@ -966,13 +859,14 @@ fn run_broker(
                             }
                             continue;
                         }
-                        if live.len() + localhost.waiter_count() >= MAX_PENDING_FORWARD_REQUESTS {
-                            if write_pair_settlement(
+                        let at_limit = mappings.waiter_count() >= MAX_PENDING_FORWARD_REQUESTS;
+                        let request = mappings.request_localhost(id, remote_port);
+                        if at_limit && matches!(request, MappingRequest::Pending { .. }) {
+                            let _ = mappings.cancel_waiter(id);
+                            if write_mapping_settlement(
                                 &mut stream,
-                                PairSettlement {
-                                    id,
-                                    result: Err(ForwardFailure::TooManyRequests),
-                                },
+                                true,
+                                MappingSettlement::failed(id, ForwardFailure::TooManyRequests),
                             )
                             .is_err()
                             {
@@ -980,36 +874,40 @@ fn run_broker(
                             }
                             continue;
                         }
-                        match localhost.request(id, remote_port) {
-                            PairRequest::Ready(settlement) | PairRequest::Failed(settlement) => {
-                                if write_pair_settlement(&mut stream, settlement).is_err() {
-                                    break 'broker;
-                                }
-                            }
-                            PairRequest::Pending { command } => {
-                                if let Some(pair) = command {
-                                    queue.push_back(QueuedJob {
-                                        job: WorkerJob {
-                                            id,
-                                            operation: ControlOperation::ForwardPair(pair),
-                                        },
-                                        respond: false,
-                                    });
-                                    if dispatch_next(&worker, &mut queue, &mut active).is_err() {
-                                        break 'broker;
-                                    }
-                                }
-                            }
+                        if handle_mapping_request(
+                            &worker,
+                            &mut stream,
+                            &mut mappings,
+                            &mut queue,
+                            &mut active,
+                            true,
+                            request,
+                        )
+                        .is_err()
+                        {
+                            break 'broker;
                         }
                     }
                     ClientMessage::Cancel { id } if state != BrokerState::AwaitHello => {
-                        if localhost.cancel_waiter(id) {
-                            let _ = protocol::write_message(
-                                &mut stream,
-                                &ServerMessage::Cancelled { id },
-                            );
-                        } else {
-                            cancel_one(&mut stream, id, &mut live, &mut queue, &mut active);
+                        match mappings.cancel_waiter(id) {
+                            WaiterCancellation::NotFound => {}
+                            WaiterCancellation::Removed => {
+                                let _ = protocol::write_message(
+                                    &mut stream,
+                                    &ServerMessage::Cancelled { id },
+                                );
+                            }
+                            WaiterCancellation::AbandonedBeforeStart(attempt) => {
+                                if let Some(position) = queue.iter().position(|queued| {
+                                    queued.kind == QueuedJobKind::Mapping(attempt)
+                                }) {
+                                    queue.remove(position);
+                                }
+                                let _ = protocol::write_message(
+                                    &mut stream,
+                                    &ServerMessage::Cancelled { id },
+                                );
+                            }
                         }
                     }
                     _ => break 'broker,
@@ -1020,101 +918,105 @@ fn run_broker(
         }
     }
 
-    cleanup_on_disconnect(&worker, &mut stream, &mut live, &mut queue, &mut active);
-    localhost.reset();
+    let _ = mappings.master_died();
 }
 
-fn write_pair_settlement(stream: &mut UnixStream, settlement: PairSettlement) -> io::Result<()> {
-    protocol::write_message(
-        stream,
-        &ServerMessage::ForwardLocalhostSettled {
-            id: settlement.id,
-            result: settlement.result,
+fn mapping_job(attempt: MappingAttempt) -> QueuedJob {
+    QueuedJob {
+        job: WorkerJob {
+            id: attempt.controller_id(),
+            operation: attempt.operation(),
         },
-    )
+        kind: QueuedJobKind::Mapping(attempt),
+    }
 }
 
-fn cleanup_on_disconnect(
+fn cleanup_job(attempt: MappingAttempt) -> QueuedJob {
+    QueuedJob {
+        job: WorkerJob {
+            id: attempt.controller_id(),
+            operation: attempt.cancellation(),
+        },
+        kind: QueuedJobKind::Cleanup,
+    }
+}
+
+fn mapping_control_result(result: ControlResult) -> Option<MappingControlResult> {
+    match result {
+        ControlResult::Succeeded => Some(MappingControlResult::Succeeded),
+        ControlResult::BindFailed => Some(MappingControlResult::BindFailed),
+        ControlResult::Rejected => Some(MappingControlResult::Rejected),
+        ControlResult::TimedOut => Some(MappingControlResult::TimedOut),
+        ControlResult::PairSucceeded => Some(MappingControlResult::PairSucceeded),
+        ControlResult::PairFirstBindFailed => Some(MappingControlResult::PairFirstBindFailed),
+        ControlResult::PairFirstFailed => Some(MappingControlResult::PairFirstFailed),
+        ControlResult::PairFirstTimedOut => Some(MappingControlResult::PairFirstTimedOut),
+        ControlResult::PairSecondFailed => Some(MappingControlResult::PairSecondFailed),
+        ControlResult::PairCancellationSucceeded | ControlResult::PairCancellationFailed => None,
+    }
+}
+
+fn handle_mapping_request(
     worker: &ControlWorker,
     stream: &mut UnixStream,
-    live: &mut BTreeMap<u64, ForwardSpec>,
+    mappings: &mut MappingRegistry,
     queue: &mut VecDeque<QueuedJob>,
     active: &mut Option<QueuedJob>,
-) {
-    cancel_uncommitted(stream, live, queue, active);
-    if active.is_none() {
-        let _ = dispatch_next(worker, queue, active);
-    }
-    while let Some(completed) = active.take() {
-        let Ok(result) = worker.recv() else {
-            break;
-        };
-        if result.id != completed.job.id || result.operation != completed.job.operation {
-            break;
+    localhost: bool,
+    request: MappingRequest,
+) -> io::Result<()> {
+    match request {
+        MappingRequest::Ready(settlement) | MappingRequest::Failed(settlement) => {
+            write_mapping_settlement(stream, localhost, settlement)
         }
-        if result.result == ControlResult::Succeeded {
-            if let ControlOperation::Forward(spec) = completed.job.operation {
-                queue.push_front(QueuedJob {
-                    job: WorkerJob {
-                        id: completed.job.id,
-                        operation: ControlOperation::Cancel(spec),
-                    },
-                    respond: false,
-                });
+        MappingRequest::Pending { attempt } => {
+            if let Some(attempt) = attempt {
+                queue.push_back(mapping_job(attempt));
+                dispatch_next(worker, mappings, queue, active)?;
             }
-        }
-        if dispatch_next(worker, queue, active).is_err() {
-            break;
+            Ok(())
         }
     }
+}
+
+fn write_mapping_settlement(
+    stream: &mut UnixStream,
+    localhost: bool,
+    settlement: MappingSettlement,
+) -> io::Result<()> {
+    let message = if localhost {
+        ServerMessage::ForwardLocalhostSettled {
+            id: settlement.id,
+            result: settlement.result,
+        }
+    } else {
+        ServerMessage::ForwardSettled {
+            id: settlement.id,
+            result: settlement.result,
+        }
+    };
+    protocol::write_message(stream, &message)
 }
 
 fn dispatch_next(
     worker: &ControlWorker,
+    mappings: &mut MappingRegistry,
     queue: &mut VecDeque<QueuedJob>,
     active: &mut Option<QueuedJob>,
 ) -> io::Result<()> {
-    if active.is_none() {
-        if let Some(next) = queue.pop_front() {
-            worker.submit(next.job)?;
-            *active = Some(next);
+    while active.is_none() {
+        let Some(next) = queue.pop_front() else {
+            break;
+        };
+        if let QueuedJobKind::Mapping(attempt) = next.kind {
+            if !mappings.start(attempt) {
+                continue;
+            }
         }
+        worker.submit(next.job)?;
+        *active = Some(next);
     }
     Ok(())
-}
-
-fn cancel_one(
-    stream: &mut UnixStream,
-    id: CorrelationId,
-    live: &mut BTreeMap<u64, ForwardSpec>,
-    queue: &mut VecDeque<QueuedJob>,
-    active: &mut Option<QueuedJob>,
-) {
-    if live.remove(&id.get()).is_none() {
-        return;
-    }
-    if let Some(position) = queue.iter().position(|queued| queued.job.id == id) {
-        queue.remove(position);
-    }
-    if let Some(running) = active.as_mut().filter(|running| running.job.id == id) {
-        running.respond = false;
-    }
-    let _ = protocol::write_message(stream, &ServerMessage::Cancelled { id });
-}
-
-fn cancel_uncommitted(
-    stream: &mut UnixStream,
-    live: &mut BTreeMap<u64, ForwardSpec>,
-    queue: &mut VecDeque<QueuedJob>,
-    active: &mut Option<QueuedJob>,
-) {
-    let ids = live
-        .keys()
-        .filter_map(|id| CorrelationId::new(*id))
-        .collect::<Vec<_>>();
-    for id in ids {
-        cancel_one(stream, id, live, queue, active);
-    }
 }
 
 #[cfg(test)]
@@ -1203,7 +1105,7 @@ mod tests {
         )
     }
 
-    fn settle_forward(client: &ForwardingClient, spec: ForwardSpec) -> Result<(), ForwardFailure> {
+    fn settle_forward(client: &ForwardingClient, spec: ForwardSpec) -> Result<u16, ForwardFailure> {
         client.begin_forward(spec)?.wait()
     }
 
@@ -1234,12 +1136,12 @@ mod tests {
 
         client.assert_policy(true).expect("activate policy");
         assert!(client.is_active());
-        assert_eq!(settle_forward(&client, spec()), Ok(()));
+        assert_eq!(settle_forward(&client, spec()), Ok(8080));
         assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn creating_mapping_is_reported_as_owned_without_coalescing_or_another_command() {
+    fn concurrent_scalar_requests_coalesce_and_ready_reuse_returns_one_local_port() {
         let runner = Arc::new(CountingRunner {
             calls: AtomicUsize::new(0),
             delay: Duration::from_millis(80),
@@ -1255,14 +1157,78 @@ mod tests {
         .expect("broker server");
         let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
 
-        let first = client
-            .begin_forward(spec_for_mapping(43_123, 8080))
-            .expect("first forward");
+        let first = client.begin_forward(spec()).expect("first forward");
         let repeated = client.begin_forward(spec()).expect("repeated destination");
 
-        assert_eq!(repeated.wait(), Err(ForwardFailure::AlreadyOwned));
-        assert_eq!(first.wait(), Ok(()));
+        assert_eq!(repeated.wait(), Ok(8080));
+        assert_eq!(first.wait(), Ok(8080));
+        assert_eq!(
+            client.begin_forward(spec()).expect("ready reuse").wait(),
+            Ok(8080)
+        );
         assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn coalesced_scalar_failure_reaches_all_waiters_and_later_click_retries() {
+        let runner = Arc::new(RecordingRunner::with_delay(
+            [ControlResult::Rejected, ControlResult::Succeeded],
+            Duration::from_millis(50),
+        ));
+        let (parent, child) = UnixStream::pair().expect("broker pair");
+        let _broker = BrokerServer::start_with_runner(
+            parent,
+            crate::platform::InheritedPeerIdentity::current_process(),
+            authority(),
+            runner.clone(),
+            Duration::from_secs(10),
+        )
+        .expect("broker server");
+        let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
+        let first = client.begin_forward(spec()).expect("first");
+        let second = client.begin_forward(spec()).expect("second");
+
+        assert_eq!(first.wait(), Err(ForwardFailure::CommandRejected));
+        assert_eq!(second.wait(), Err(ForwardFailure::CommandRejected));
+        assert_eq!(settle_forward(&client, spec()), Ok(8080));
+        assert_eq!(
+            *runner.operations.lock().expect("operations"),
+            vec!["forward", "forward"]
+        );
+    }
+
+    #[test]
+    fn scalar_waiter_cancellation_keeps_other_and_final_started_attempts_coherent() {
+        let runner = Arc::new(CountingRunner {
+            calls: AtomicUsize::new(0),
+            delay: Duration::from_millis(60),
+        });
+        let (parent, child) = UnixStream::pair().expect("broker pair");
+        let _broker = BrokerServer::start_with_runner(
+            parent,
+            crate::platform::InheritedPeerIdentity::current_process(),
+            authority(),
+            runner.clone(),
+            Duration::from_secs(10),
+        )
+        .expect("broker server");
+        let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
+        let first = client.begin_forward(spec()).expect("first");
+        let second = client.begin_forward(spec()).expect("second");
+        drop(first);
+        assert_eq!(second.wait(), Ok(8080));
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+
+        let final_waiter = client
+            .begin_forward(spec_for_port(8081))
+            .expect("final waiter");
+        while runner.calls.load(Ordering::SeqCst) < 2 {
+            std::thread::yield_now();
+        }
+        drop(final_waiter);
+        std::thread::sleep(Duration::from_millis(90));
+        assert_eq!(settle_forward(&client, spec_for_port(8081)), Ok(8081));
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -1279,20 +1245,11 @@ mod tests {
         .expect("broker server");
         let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
 
-        assert_eq!(
-            settle_forward(&client, spec_for_mapping(43_123, 8080)),
-            Ok(())
-        );
-        assert_eq!(
-            settle_forward(&client, spec()),
-            Err(ForwardFailure::AlreadyOwned)
-        );
+        assert_eq!(settle_forward(&client, spec()), Ok(8080));
+        assert_eq!(settle_forward(&client, spec()), Ok(8080));
         client.assert_policy(false).expect("disable policy");
         client.assert_policy(true).expect("re-enable policy");
-        assert_eq!(
-            settle_forward(&client, spec()),
-            Err(ForwardFailure::AlreadyOwned)
-        );
+        assert_eq!(settle_forward(&client, spec()), Ok(8080));
 
         assert_eq!(
             *runner.operations.lock().expect("operations"),
@@ -1325,6 +1282,61 @@ mod tests {
         assert_eq!(
             *runner.operations.lock().expect("operations"),
             vec!["forward", "forward"]
+        );
+    }
+
+    #[test]
+    fn quarantined_preferred_port_does_not_hide_remapped_creating_or_ready_mappings() {
+        let runner = Arc::new(RecordingRunner::with_delay(
+            [
+                ControlResult::Succeeded,
+                ControlResult::Rejected,
+                ControlResult::Succeeded,
+                ControlResult::Succeeded,
+                ControlResult::Succeeded,
+            ],
+            Duration::from_millis(30),
+        ));
+        let (mappings, candidate_calls) = MappingRegistry::for_broker_test([43_123]);
+        let (parent, child) = UnixStream::pair().expect("broker pair");
+        let _broker = BrokerServer::start_with_runner_and_registry(
+            parent,
+            crate::platform::InheritedPeerIdentity::current_process(),
+            authority(),
+            runner.clone(),
+            Duration::from_secs(10),
+            mappings,
+        )
+        .expect("broker server");
+        let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
+
+        assert_eq!(
+            client
+                .begin_localhost(8080)
+                .expect("partial preferred pair")
+                .wait(),
+            Err(ForwardFailure::AtomicCreationFailed)
+        );
+        assert_eq!(candidate_calls.load(Ordering::SeqCst), 0);
+
+        let owner = client.begin_localhost(8080).expect("remapped owner");
+        let joined = client.begin_localhost(8080).expect("concurrent waiter");
+        assert_eq!(owner.wait(), Ok(43_123));
+        assert_eq!(joined.wait(), Ok(43_123));
+        assert_eq!(candidate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *runner.operations.lock().expect("operations"),
+            vec!["forward", "forward", "cancel", "forward", "forward"]
+        );
+
+        assert_eq!(
+            client.begin_localhost(8080).expect("ready reuse").wait(),
+            Ok(43_123)
+        );
+        assert_eq!(candidate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *runner.operations.lock().expect("operations"),
+            vec!["forward", "forward", "cancel", "forward", "forward"]
         );
     }
 
@@ -1381,35 +1393,6 @@ mod tests {
         assert_eq!(
             *runner.operations.lock().expect("operations"),
             vec!["forward", "forward"]
-        );
-    }
-
-    #[test]
-    fn cleanup_hook_returns_one_pair_wide_operation_per_saved_mapping_in_lru_order() {
-        let mut mappings = LocalhostMappings::default();
-        for (id, remote_port) in [(1, 8001), (2, 8002)] {
-            let PairRequest::Pending {
-                command: Some(pair),
-            } = mappings.request(CorrelationId::new(id).expect("id"), remote_port)
-            else {
-                panic!("pair command");
-            };
-            mappings.complete(pair, PairControlResult::Succeeded);
-        }
-        assert!(matches!(
-            mappings.request(CorrelationId::new(3).expect("id"), 8001),
-            PairRequest::Ready(_)
-        ));
-
-        assert_eq!(
-            ready_pair_cancellation_operations(&mappings)
-                .into_iter()
-                .map(|operation| match operation {
-                    ControlOperation::CancelPair(pair) => pair.remote_port(),
-                    _ => panic!("pair-wide cancellation operation"),
-                })
-                .collect::<Vec<_>>(),
-            vec![8002, 8001]
         );
     }
 
@@ -1491,8 +1474,8 @@ mod tests {
         )
         .expect("broker server");
         let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
-        assert_eq!(settle_forward(&client, spec_for_port(8080)), Ok(()));
-        assert_eq!(settle_forward(&client, spec_for_port(8081)), Ok(()));
+        assert_eq!(settle_forward(&client, spec_for_port(8080)), Ok(8080));
+        assert_eq!(settle_forward(&client, spec_for_port(8081)), Ok(8081));
 
         drop(client);
         broker.close();
@@ -1611,7 +1594,10 @@ mod tests {
             reader
                 .read_message::<ServerMessage>()
                 .expect("forward result"),
-            ServerMessage::ForwardSettled { result: Ok(()), .. }
+            ServerMessage::ForwardSettled {
+                result: Ok(8080),
+                ..
+            }
         ));
         assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
     }
@@ -1639,8 +1625,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        for call in calls {
-            assert_eq!(call.join().expect("call thread"), Ok(()));
+        for (offset, call) in calls.into_iter().enumerate() {
+            assert_eq!(
+                call.join().expect("call thread"),
+                Ok(8100 + u16::try_from(offset).expect("bounded offset"))
+            );
         }
         assert_eq!(runner.calls.load(Ordering::SeqCst), 8);
     }
@@ -1670,7 +1659,7 @@ mod tests {
 
         drop(queued);
 
-        assert_eq!(running.wait(), Ok(()));
+        assert_eq!(running.wait(), Ok(8080));
         std::thread::sleep(Duration::from_millis(30));
         assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
     }
@@ -1743,7 +1732,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_loss_fails_an_unresolved_forward_call() {
+    fn channel_loss_has_scalar_and_localhost_call_parity() {
         let runner = Arc::new(CountingRunner {
             calls: AtomicUsize::new(0),
             delay: Duration::from_millis(250),
@@ -1758,11 +1747,13 @@ mod tests {
         )
         .expect("broker server");
         let client = ForwardingClient::from_stream_for_test(child, true).expect("client handshake");
-        let call = client.begin_forward(spec()).expect("begin forward");
+        let scalar = client.begin_forward(spec()).expect("begin scalar");
+        let localhost = client.begin_localhost(8081).expect("begin localhost");
 
         broker.close();
 
-        assert_eq!(call.wait(), Err(ForwardFailure::CapabilityClosed));
+        assert_eq!(scalar.wait(), Err(ForwardFailure::CapabilityClosed));
+        assert_eq!(localhost.wait(), Err(ForwardFailure::CapabilityClosed));
     }
 
     #[test]

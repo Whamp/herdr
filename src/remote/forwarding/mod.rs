@@ -5,9 +5,9 @@ mod controller;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod inheritance;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-mod pair;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod protocol;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod registry;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod transport;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -24,17 +24,9 @@ pub(crate) const FORWARDING_STATUS_MANAGED_SSH_REQUIRED: &str = "managed_ssh_req
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) const FORWARDING_STATUS_UNAVAILABLE: &str = "forwarding_unavailable";
 
-// Follow-up external-open routing consumes the capability and closed value types.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[allow(unused_imports)]
-pub(crate) use broker::{ForwardCall, ForwardingClient};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use controller::NumericForwardingController;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use inheritance::{adopt_external_open_forwarding, PendingBroker};
-// Follow-up URL-policy routing constructs these closed forwarding requests.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[allow(unused_imports)]
-pub(crate) use protocol::{ForwardFailure, ForwardSpec, LoopbackAddress};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use worker::ControlAuthority;

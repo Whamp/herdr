@@ -1,5 +1,3 @@
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::num::NonZeroU16;
 use std::sync::Arc;
 
@@ -8,15 +6,16 @@ use crate::external_open::{
     ForwardingPreparation, ForwardingPreparationError, LoopbackTarget,
 };
 
-use super::broker::{ForwardCall, ForwardingClient, LocalhostCall, PolicyCall};
+use super::broker::{ForwardingClient, MappingCall, PolicyCall};
 use super::protocol::{ForwardFailure, ForwardSpec, LoopbackAddress};
 
-trait ForwardCommandCall: Send {
-    fn poll(&mut self) -> Option<Result<(), ForwardFailure>>;
-    fn cancel(&mut self);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MappingCommand {
+    Scalar(ForwardSpec),
+    Localhost(u16),
 }
 
-trait LocalhostCommandCall: Send {
+trait MappingCommandCall: Send {
     fn poll(&mut self) -> Option<Result<u16, ForwardFailure>>;
     fn cancel(&mut self);
 }
@@ -27,15 +26,10 @@ trait PolicyCommandCall: Send {
 }
 
 trait ForwardCommand: Send + Sync {
-    fn begin_forward(
+    fn begin_mapping(
         &self,
-        spec: ForwardSpec,
-    ) -> Result<Box<dyn ForwardCommandCall>, ForwardFailure>;
-
-    fn begin_localhost(
-        &self,
-        remote_port: u16,
-    ) -> Result<Box<dyn LocalhostCommandCall>, ForwardFailure>;
+        command: MappingCommand,
+    ) -> Result<Box<dyn MappingCommandCall>, ForwardFailure>;
 
     fn begin_set_enabled(
         &self,
@@ -43,23 +37,13 @@ trait ForwardCommand: Send + Sync {
     ) -> Result<Box<dyn PolicyCommandCall>, ForwardFailure>;
 }
 
-impl ForwardCommandCall for ForwardCall {
-    fn poll(&mut self) -> Option<Result<(), ForwardFailure>> {
-        self.try_wait()
-    }
-
-    fn cancel(&mut self) {
-        ForwardCall::cancel(self);
-    }
-}
-
-impl LocalhostCommandCall for LocalhostCall {
+impl MappingCommandCall for MappingCall {
     fn poll(&mut self) -> Option<Result<u16, ForwardFailure>> {
         self.try_wait()
     }
 
     fn cancel(&mut self) {
-        LocalhostCall::cancel(self);
+        MappingCall::cancel(self);
     }
 }
 
@@ -74,20 +58,17 @@ impl PolicyCommandCall for PolicyCall {
 }
 
 impl ForwardCommand for ForwardingClient {
-    fn begin_forward(
+    fn begin_mapping(
         &self,
-        spec: ForwardSpec,
-    ) -> Result<Box<dyn ForwardCommandCall>, ForwardFailure> {
-        ForwardingClient::begin_forward(self, spec)
-            .map(|call| Box::new(call) as Box<dyn ForwardCommandCall>)
-    }
-
-    fn begin_localhost(
-        &self,
-        remote_port: u16,
-    ) -> Result<Box<dyn LocalhostCommandCall>, ForwardFailure> {
-        ForwardingClient::begin_localhost(self, remote_port)
-            .map(|call| Box::new(call) as Box<dyn LocalhostCommandCall>)
+        command: MappingCommand,
+    ) -> Result<Box<dyn MappingCommandCall>, ForwardFailure> {
+        let call = match command {
+            MappingCommand::Scalar(spec) => ForwardingClient::begin_forward(self, spec),
+            MappingCommand::Localhost(remote_port) => {
+                ForwardingClient::begin_localhost(self, remote_port)
+            }
+        }?;
+        Ok(Box::new(call))
     }
 
     fn begin_set_enabled(
@@ -100,63 +81,8 @@ impl ForwardCommand for ForwardingClient {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CandidateFailure {
-    Collision,
-    Unavailable,
-}
-
-struct PortReservation {
-    port: NonZeroU16,
-    _listener: Option<TcpListener>,
-}
-
-impl PortReservation {
-    #[cfg(test)]
-    fn for_test(port: NonZeroU16) -> Self {
-        Self {
-            port,
-            _listener: None,
-        }
-    }
-}
-
-trait PortCandidates: Send + Sync {
-    fn reserve_fresh(&self, target: LoopbackAddress) -> Result<PortReservation, CandidateFailure>;
-}
-
-struct SystemPortCandidates;
-
-impl PortCandidates for SystemPortCandidates {
-    fn reserve_fresh(&self, target: LoopbackAddress) -> Result<PortReservation, CandidateFailure> {
-        let address = match target {
-            LoopbackAddress::Ipv4(octets) => IpAddr::V4(Ipv4Addr::from(octets)),
-            LoopbackAddress::Ipv6 => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        };
-        let listener = TcpListener::bind(SocketAddr::new(address, 0)).map_err(candidate_failure)?;
-        let port = listener
-            .local_addr()
-            .ok()
-            .and_then(|address| NonZeroU16::new(address.port()))
-            .ok_or(CandidateFailure::Unavailable)?;
-        Ok(PortReservation {
-            port,
-            _listener: Some(listener),
-        })
-    }
-}
-
-fn candidate_failure(error: io::Error) -> CandidateFailure {
-    if error.kind() == io::ErrorKind::AddrInUse {
-        CandidateFailure::Collision
-    } else {
-        CandidateFailure::Unavailable
-    }
-}
-
 pub(crate) struct NumericForwardingController {
     command: Arc<dyn ForwardCommand>,
-    candidates: Arc<dyn PortCandidates>,
     ipv6_available: bool,
 }
 
@@ -164,25 +90,14 @@ impl NumericForwardingController {
     pub(crate) fn new(client: ForwardingClient) -> Self {
         Self {
             command: Arc::new(client),
-            candidates: Arc::new(SystemPortCandidates),
             ipv6_available: crate::platform::external_open_ipv6_available(),
         }
     }
 
     #[cfg(test)]
-    fn with_parts(command: Arc<dyn ForwardCommand>, candidates: Arc<dyn PortCandidates>) -> Self {
-        Self::with_capability(command, candidates, true)
-    }
-
-    #[cfg(test)]
-    fn with_capability(
-        command: Arc<dyn ForwardCommand>,
-        candidates: Arc<dyn PortCandidates>,
-        ipv6_available: bool,
-    ) -> Self {
+    fn with_capability(command: Arc<dyn ForwardCommand>, ipv6_available: bool) -> Self {
         Self {
             command,
-            candidates,
             ipv6_available,
         }
     }
@@ -202,33 +117,21 @@ impl ForwardingController for NumericForwardingController {
         if target == LoopbackTarget::Localhost {
             let call = self
                 .command
-                .begin_localhost(remote_port.get())
+                .begin_mapping(MappingCommand::Localhost(remote_port.get()))
                 .map_err(forwarding_failure)?;
-            return Ok(Box::new(LocalhostForwardOperation {
-                call: Some(call),
-                settled: false,
-            }));
+            return Ok(Box::new(MappingForwardOperation::new(call)));
         }
         let address = match target {
             LoopbackTarget::Ipv4(address) => LoopbackAddress::Ipv4(address.octets()),
             LoopbackTarget::Ipv6 => LoopbackAddress::Ipv6,
             LoopbackTarget::Localhost => return Err(ForwardingPreparationError::Unavailable),
         };
-        let spec = forward_spec(address, remote_port, remote_port);
+        let spec = forward_spec(address, remote_port);
         let call = self
             .command
-            .begin_forward(spec)
+            .begin_mapping(MappingCommand::Scalar(spec))
             .map_err(forwarding_failure)?;
-        Ok(Box::new(NumericForwardOperation {
-            command: Arc::clone(&self.command),
-            candidates: Arc::clone(&self.candidates),
-            address,
-            remote_port,
-            local_port: remote_port,
-            fresh_attempts: 0,
-            call: Some(call),
-            settled: false,
-        }))
+        Ok(Box::new(MappingForwardOperation::new(call)))
     }
 
     fn begin_set_enabled(
@@ -247,25 +150,30 @@ impl ForwardingController for NumericForwardingController {
     }
 }
 
-fn forward_spec(
-    address: LoopbackAddress,
-    local_port: NonZeroU16,
-    remote_port: NonZeroU16,
-) -> ForwardSpec {
+fn forward_spec(address: LoopbackAddress, remote_port: NonZeroU16) -> ForwardSpec {
     ForwardSpec {
         local_address: address,
-        local_port: local_port.get(),
+        local_port: remote_port.get(),
         remote_address: address,
         remote_port: remote_port.get(),
     }
 }
 
-struct LocalhostForwardOperation {
-    call: Option<Box<dyn LocalhostCommandCall>>,
+struct MappingForwardOperation {
+    call: Option<Box<dyn MappingCommandCall>>,
     settled: bool,
 }
 
-impl ForwardingPreparation for LocalhostForwardOperation {
+impl MappingForwardOperation {
+    fn new(call: Box<dyn MappingCommandCall>) -> Self {
+        Self {
+            call: Some(call),
+            settled: false,
+        }
+    }
+}
+
+impl ForwardingPreparation for MappingForwardOperation {
     fn poll(&mut self) -> Option<Result<NonZeroU16, ForwardingPreparationError>> {
         if self.settled {
             return None;
@@ -291,91 +199,7 @@ impl ForwardingPreparation for LocalhostForwardOperation {
     }
 }
 
-impl Drop for LocalhostForwardOperation {
-    fn drop(&mut self) {
-        self.cancel();
-    }
-}
-
-struct NumericForwardOperation {
-    command: Arc<dyn ForwardCommand>,
-    candidates: Arc<dyn PortCandidates>,
-    address: LoopbackAddress,
-    remote_port: NonZeroU16,
-    local_port: NonZeroU16,
-    fresh_attempts: usize,
-    call: Option<Box<dyn ForwardCommandCall>>,
-    settled: bool,
-}
-
-impl NumericForwardOperation {
-    fn begin_fresh_candidate(&mut self) -> Result<(), ForwardingPreparationError> {
-        while self.fresh_attempts < 5 {
-            self.fresh_attempts += 1;
-            let reservation = match self.candidates.reserve_fresh(self.address) {
-                Ok(reservation) => reservation,
-                Err(CandidateFailure::Collision) => continue,
-                Err(CandidateFailure::Unavailable) => {
-                    return Err(ForwardingPreparationError::CommandRejected);
-                }
-            };
-            self.local_port = reservation.port;
-            drop(reservation);
-            self.call = Some(
-                self.command
-                    .begin_forward(forward_spec(
-                        self.address,
-                        self.local_port,
-                        self.remote_port,
-                    ))
-                    .map_err(forwarding_failure)?,
-            );
-            return Ok(());
-        }
-        Err(ForwardingPreparationError::BindExhausted)
-    }
-}
-
-impl ForwardingPreparation for NumericForwardOperation {
-    fn poll(&mut self) -> Option<Result<NonZeroU16, ForwardingPreparationError>> {
-        if self.settled {
-            return None;
-        }
-        loop {
-            let result = self.call.as_mut()?.poll()?;
-            self.call = None;
-            match result {
-                Ok(()) => {
-                    self.settled = true;
-                    return Some(Ok(self.local_port));
-                }
-                Err(ForwardFailure::BindFailed) => {
-                    if let Err(error) = self.begin_fresh_candidate() {
-                        self.settled = true;
-                        return Some(Err(error));
-                    }
-                }
-                Err(error) => {
-                    self.settled = true;
-                    return Some(Err(forwarding_failure(error)));
-                }
-            }
-        }
-    }
-
-    fn cancel(&mut self) {
-        if self.settled {
-            return;
-        }
-        if let Some(call) = self.call.as_mut() {
-            call.cancel();
-        }
-        self.call = None;
-        self.settled = true;
-    }
-}
-
-impl Drop for NumericForwardOperation {
+impl Drop for MappingForwardOperation {
     fn drop(&mut self) {
         self.cancel();
     }
@@ -438,32 +262,17 @@ fn forwarding_failure(error: ForwardFailure) -> ForwardingPreparationError {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::net::Ipv4Addr;
     use std::sync::{Arc, Mutex};
 
     use super::*;
 
-    struct ImmediateForwardCall {
-        result: Option<Result<(), ForwardFailure>>,
-        cancelled: Arc<Mutex<usize>>,
-    }
-
-    impl ForwardCommandCall for ImmediateForwardCall {
-        fn poll(&mut self) -> Option<Result<(), ForwardFailure>> {
-            self.result.take()
-        }
-
-        fn cancel(&mut self) {
-            *self.cancelled.lock().expect("cancel count") += 1;
-            self.result = None;
-        }
-    }
-
-    struct ImmediateLocalhostCall {
+    struct ImmediateMappingCall {
         result: Option<Result<u16, ForwardFailure>>,
         cancelled: Arc<Mutex<usize>>,
     }
 
-    impl LocalhostCommandCall for ImmediateLocalhostCall {
+    impl MappingCommandCall for ImmediateMappingCall {
         fn poll(&mut self) -> Option<Result<u16, ForwardFailure>> {
             self.result.take()
         }
@@ -490,14 +299,14 @@ mod tests {
     }
 
     struct FakeForwardCommand {
-        results: Mutex<VecDeque<Result<(), ForwardFailure>>>,
+        results: Mutex<VecDeque<Result<u16, ForwardFailure>>>,
         specs: Mutex<Vec<ForwardSpec>>,
         localhost_ports: Mutex<Vec<u16>>,
         cancelled: Arc<Mutex<usize>>,
     }
 
     impl FakeForwardCommand {
-        fn new(results: impl IntoIterator<Item = Result<(), ForwardFailure>>) -> Self {
+        fn new(results: impl IntoIterator<Item = Result<u16, ForwardFailure>>) -> Self {
             Self {
                 results: Mutex::new(results.into_iter().collect()),
                 specs: Mutex::new(Vec::new()),
@@ -508,39 +317,25 @@ mod tests {
     }
 
     impl ForwardCommand for FakeForwardCommand {
-        fn begin_forward(
+        fn begin_mapping(
             &self,
-            spec: ForwardSpec,
-        ) -> Result<Box<dyn ForwardCommandCall>, ForwardFailure> {
-            self.specs.lock().expect("fake specs").push(spec);
+            command: MappingCommand,
+        ) -> Result<Box<dyn MappingCommandCall>, ForwardFailure> {
+            match command {
+                MappingCommand::Scalar(spec) => self.specs.lock().expect("specs").push(spec),
+                MappingCommand::Localhost(remote_port) => self
+                    .localhost_ports
+                    .lock()
+                    .expect("localhost ports")
+                    .push(remote_port),
+            }
             let result = self
                 .results
                 .lock()
-                .expect("fake results")
+                .expect("results")
                 .pop_front()
-                .expect("queued forward result");
-            Ok(Box::new(ImmediateForwardCall {
-                result: Some(result),
-                cancelled: Arc::clone(&self.cancelled),
-            }))
-        }
-
-        fn begin_localhost(
-            &self,
-            remote_port: u16,
-        ) -> Result<Box<dyn LocalhostCommandCall>, ForwardFailure> {
-            self.localhost_ports
-                .lock()
-                .expect("localhost ports")
-                .push(remote_port);
-            let result = self
-                .results
-                .lock()
-                .expect("fake results")
-                .pop_front()
-                .expect("queued localhost result")
-                .map(|()| remote_port);
-            Ok(Box::new(ImmediateLocalhostCall {
+                .expect("queued result");
+            Ok(Box::new(ImmediateMappingCall {
                 result: Some(result),
                 cancelled: Arc::clone(&self.cancelled),
             }))
@@ -557,83 +352,16 @@ mod tests {
         }
     }
 
-    struct QueuedPortCandidates {
-        results: Mutex<VecDeque<Result<NonZeroU16, CandidateFailure>>>,
-        requests: Mutex<usize>,
-    }
-
-    impl QueuedPortCandidates {
-        fn new(results: impl IntoIterator<Item = Result<u16, CandidateFailure>>) -> Self {
-            Self {
-                results: Mutex::new(
-                    results
-                        .into_iter()
-                        .map(|result| {
-                            result.map(|port| NonZeroU16::new(port).expect("nonzero test port"))
-                        })
-                        .collect(),
-                ),
-                requests: Mutex::new(0),
-            }
-        }
-    }
-
-    impl PortCandidates for QueuedPortCandidates {
-        fn reserve_fresh(
-            &self,
-            _target: LoopbackAddress,
-        ) -> Result<PortReservation, CandidateFailure> {
-            *self.requests.lock().expect("candidate requests") += 1;
-            self.results
-                .lock()
-                .expect("candidate results")
-                .pop_front()
-                .expect("queued candidate result")
-                .map(PortReservation::for_test)
-        }
-    }
-
-    fn prepare(
-        command: Arc<FakeForwardCommand>,
-        candidates: Arc<dyn PortCandidates>,
-        target: LoopbackTarget,
-        remote_port: u16,
-    ) -> Box<dyn ForwardingPreparation> {
-        NumericForwardingController::with_parts(command, candidates)
+    #[test]
+    fn scalar_preparation_sends_exact_identity_and_returns_broker_selected_port() {
+        let command = Arc::new(FakeForwardCommand::new([Ok(43_123)]));
+        let controller = NumericForwardingController::with_capability(command.clone(), true);
+        let mut operation = controller
             .begin_prepare_numeric(
-                target,
-                NonZeroU16::new(remote_port).expect("nonzero remote port"),
+                LoopbackTarget::Ipv4(Ipv4Addr::new(127, 0, 0, 42)),
+                NonZeroU16::new(8080).expect("port"),
             )
-            .expect("begin numeric preparation")
-    }
-
-    #[test]
-    fn preferred_port_reaches_ssh_before_fallback_candidate_selection() {
-        let command = Arc::new(FakeForwardCommand::new([Ok(())]));
-        let candidates = Arc::new(QueuedPortCandidates::new([]));
-        let mut operation = prepare(
-            command.clone(),
-            candidates.clone(),
-            LoopbackTarget::Ipv4(Ipv4Addr::LOCALHOST),
-            8080,
-        );
-
-        assert_eq!(
-            operation.poll(),
-            Some(Ok(NonZeroU16::new(8080).expect("port")))
-        );
-        assert_eq!(*candidates.requests.lock().expect("requests"), 0);
-        assert_eq!(command.specs.lock().expect("specs")[0].local_port, 8080);
-    }
-
-    #[test]
-    fn clean_preferred_bind_failure_remaps_exact_ipv6_forward() {
-        let command = Arc::new(FakeForwardCommand::new([
-            Err(ForwardFailure::BindFailed),
-            Ok(()),
-        ]));
-        let candidates = Arc::new(QueuedPortCandidates::new([Ok(43_123)]));
-        let mut operation = prepare(command.clone(), candidates, LoopbackTarget::Ipv6, 3000);
+            .expect("preparation");
 
         assert_eq!(
             operation.poll(),
@@ -641,244 +369,59 @@ mod tests {
         );
         assert_eq!(
             *command.specs.lock().expect("specs"),
-            vec![
-                forward_spec(
-                    LoopbackAddress::Ipv6,
-                    NonZeroU16::new(3000).expect("port"),
-                    NonZeroU16::new(3000).expect("port"),
-                ),
-                forward_spec(
-                    LoopbackAddress::Ipv6,
-                    NonZeroU16::new(43_123).expect("port"),
-                    NonZeroU16::new(3000).expect("port"),
-                ),
-            ]
+            vec![forward_spec(
+                LoopbackAddress::Ipv4([127, 0, 0, 42]),
+                NonZeroU16::new(8080).expect("port")
+            )]
         );
     }
 
     #[test]
-    fn fifth_fresh_ssh_candidate_can_succeed_after_four_race_collisions() {
-        let command = Arc::new(FakeForwardCommand::new([
-            Err(ForwardFailure::BindFailed),
-            Err(ForwardFailure::BindFailed),
-            Err(ForwardFailure::BindFailed),
-            Err(ForwardFailure::BindFailed),
-            Err(ForwardFailure::BindFailed),
-            Ok(()),
-        ]));
-        let candidates = Arc::new(QueuedPortCandidates::new([
-            Ok(40_001),
-            Ok(40_002),
-            Ok(40_003),
-            Ok(40_004),
-            Ok(40_005),
-        ]));
-        let mut operation = prepare(
-            command.clone(),
-            candidates,
-            LoopbackTarget::Ipv4(Ipv4Addr::LOCALHOST),
-            8080,
-        );
-
-        assert_eq!(
-            operation.poll(),
-            Some(Ok(NonZeroU16::new(40_005).expect("port")))
-        );
-        assert_eq!(command.specs.lock().expect("specs").len(), 6);
-    }
-
-    #[test]
-    fn five_os_candidate_collisions_exhaust_without_an_unbounded_selection_loop() {
-        let command = Arc::new(FakeForwardCommand::new([Err(ForwardFailure::BindFailed)]));
-        let candidates = Arc::new(QueuedPortCandidates::new(std::iter::repeat_n(
-            Err(CandidateFailure::Collision),
-            5,
-        )));
-        let mut operation = prepare(
-            command.clone(),
-            candidates.clone(),
-            LoopbackTarget::Ipv4(Ipv4Addr::LOCALHOST),
-            8080,
-        );
-
-        assert_eq!(
-            operation.poll(),
-            Some(Err(ForwardingPreparationError::BindExhausted))
-        );
-        assert_eq!(*candidates.requests.lock().expect("requests"), 5);
-        assert_eq!(command.specs.lock().expect("specs").len(), 1);
-    }
-
-    #[test]
-    fn five_fresh_ssh_bind_failures_exhaust_without_a_sixth_candidate() {
-        let command = Arc::new(FakeForwardCommand::new(std::iter::repeat_n(
-            Err(ForwardFailure::BindFailed),
-            6,
-        )));
-        let candidates = Arc::new(QueuedPortCandidates::new([
-            Ok(40_001),
-            Ok(40_002),
-            Ok(40_003),
-            Ok(40_004),
-            Ok(40_005),
-        ]));
-        let mut operation = prepare(
-            command.clone(),
-            candidates,
-            LoopbackTarget::Ipv4(Ipv4Addr::LOCALHOST),
-            8080,
-        );
-
-        assert_eq!(
-            operation.poll(),
-            Some(Err(ForwardingPreparationError::BindExhausted))
-        );
-        assert_eq!(command.specs.lock().expect("specs").len(), 6);
-    }
-
-    #[test]
-    fn owned_rejection_and_timeout_do_not_select_a_fallback() {
-        for (failure, expected) in [
-            (
-                ForwardFailure::AlreadyOwned,
-                ForwardingPreparationError::CommandRejected,
-            ),
-            (
-                ForwardFailure::CommandRejected,
-                ForwardingPreparationError::CommandRejected,
-            ),
-            (
-                ForwardFailure::CommandTimedOut,
-                ForwardingPreparationError::CommandTimedOut,
-            ),
-        ] {
-            let command = Arc::new(FakeForwardCommand::new([Err(failure)]));
-            let candidates = Arc::new(QueuedPortCandidates::new([]));
-            let mut operation = prepare(
-                command,
-                candidates.clone(),
-                LoopbackTarget::Ipv4(Ipv4Addr::LOCALHOST),
-                9000,
-            );
-
-            assert_eq!(operation.poll(), Some(Err(expected)));
-            assert_eq!(*candidates.requests.lock().expect("requests"), 0);
-        }
-    }
-
-    #[test]
-    fn localhost_uses_the_atomic_pair_command_and_returns_its_selected_port() {
-        let command = Arc::new(FakeForwardCommand::new([Ok(())]));
-        let controller = NumericForwardingController::with_parts(
-            command.clone(),
-            Arc::new(QueuedPortCandidates::new([])),
-        );
-        let mut operation = controller
+    fn localhost_uses_atomic_command_and_ipv4_only_capability_fails_closed() {
+        let command = Arc::new(FakeForwardCommand::new([Ok(8080), Ok(8080)]));
+        let available = NumericForwardingController::with_capability(command.clone(), true);
+        let mut localhost = available
             .begin_prepare_numeric(
                 LoopbackTarget::Localhost,
                 NonZeroU16::new(8080).expect("port"),
             )
-            .expect("localhost preparation");
-
+            .expect("localhost");
         assert_eq!(
-            operation.poll(),
+            localhost.poll(),
             Some(Ok(NonZeroU16::new(8080).expect("port")))
         );
+
+        let ipv4_only = NumericForwardingController::with_capability(command.clone(), false);
+        for target in [LoopbackTarget::Localhost, LoopbackTarget::Ipv6] {
+            assert!(matches!(
+                ipv4_only.begin_prepare_numeric(target, NonZeroU16::new(8080).expect("port")),
+                Err(ForwardingPreparationError::Unavailable)
+            ));
+        }
         assert_eq!(
             *command.localhost_ports.lock().expect("localhost ports"),
             vec![8080]
         );
-        assert!(command.specs.lock().expect("numeric specs").is_empty());
     }
 
     #[test]
-    fn ipv4_only_capability_fails_localhost_and_ipv6_before_commands_but_keeps_ipv4() {
-        let command = Arc::new(FakeForwardCommand::new([Ok(())]));
-        let controller = NumericForwardingController::with_capability(
-            command.clone(),
-            Arc::new(QueuedPortCandidates::new([])),
-            false,
-        );
+    fn scalar_and_localhost_cancellation_share_one_idempotent_dispatch_path() {
+        let command = Arc::new(FakeForwardCommand::new([Ok(8080), Ok(8081)]));
+        let cancellations = Arc::clone(&command.cancelled);
+        let controller = NumericForwardingController::with_capability(command, true);
 
-        for target in [LoopbackTarget::Localhost, LoopbackTarget::Ipv6] {
-            assert!(matches!(
-                controller.begin_prepare_numeric(target, NonZeroU16::new(8080).expect("port"),),
-                Err(ForwardingPreparationError::Unavailable)
-            ));
-        }
-        assert!(command
-            .localhost_ports
-            .lock()
-            .expect("localhost ports")
-            .is_empty());
-        assert!(command.specs.lock().expect("specs").is_empty());
-
-        let mut ipv4 = controller
-            .begin_prepare_numeric(
-                LoopbackTarget::Ipv4(Ipv4Addr::LOCALHOST),
-                NonZeroU16::new(8080).expect("port"),
-            )
-            .expect("ipv4 remains available");
-        assert_eq!(ipv4.poll(), Some(Ok(NonZeroU16::new(8080).expect("port"))));
-        assert_eq!(command.specs.lock().expect("specs").len(), 1);
-    }
-
-    #[test]
-    fn cancelling_an_unsettled_operation_cancels_the_active_command() {
-        struct BlockedCall {
-            cancelled: Arc<Mutex<usize>>,
-        }
-        impl ForwardCommandCall for BlockedCall {
-            fn poll(&mut self) -> Option<Result<(), ForwardFailure>> {
-                None
-            }
-            fn cancel(&mut self) {
-                *self.cancelled.lock().expect("cancel count") += 1;
-            }
-        }
-        struct BlockedCommand {
-            cancelled: Arc<Mutex<usize>>,
-        }
-        impl ForwardCommand for BlockedCommand {
-            fn begin_forward(
-                &self,
-                _spec: ForwardSpec,
-            ) -> Result<Box<dyn ForwardCommandCall>, ForwardFailure> {
-                Ok(Box::new(BlockedCall {
-                    cancelled: Arc::clone(&self.cancelled),
-                }))
-            }
-            fn begin_localhost(
-                &self,
-                _remote_port: u16,
-            ) -> Result<Box<dyn LocalhostCommandCall>, ForwardFailure> {
-                unreachable!()
-            }
-            fn begin_set_enabled(
-                &self,
-                _enabled: bool,
-            ) -> Result<Box<dyn PolicyCommandCall>, ForwardFailure> {
-                unreachable!()
-            }
+        for (target, port) in [
+            (LoopbackTarget::Ipv4(Ipv4Addr::LOCALHOST), 8080),
+            (LoopbackTarget::Localhost, 8081),
+        ] {
+            let mut operation = controller
+                .begin_prepare_numeric(target, NonZeroU16::new(port).expect("port"))
+                .expect("preparation");
+            operation.cancel();
+            operation.cancel();
+            assert_eq!(operation.poll(), None);
         }
 
-        let cancelled = Arc::new(Mutex::new(0));
-        let controller = NumericForwardingController::with_parts(
-            Arc::new(BlockedCommand {
-                cancelled: Arc::clone(&cancelled),
-            }),
-            Arc::new(QueuedPortCandidates::new([])),
-        );
-        let mut operation = controller
-            .begin_prepare_numeric(
-                LoopbackTarget::Ipv4(Ipv4Addr::LOCALHOST),
-                NonZeroU16::new(8080).expect("port"),
-            )
-            .expect("begin");
-
-        assert_eq!(operation.poll(), None);
-        operation.cancel();
-        assert_eq!(*cancelled.lock().expect("cancel count"), 1);
-        assert_eq!(operation.poll(), None);
+        assert_eq!(*cancellations.lock().expect("cancellations"), 2);
     }
 }
