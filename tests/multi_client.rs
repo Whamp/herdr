@@ -1746,10 +1746,10 @@ fn external_open_socket_lifecycle_covers_forwarded_success_preparation_failure_a
     let mut source = connect_full_app_client(&client_socket, 100, 30, true);
     assert!(wait_for_frame(&mut source, Duration::from_secs(3)));
 
-    let url = "http://127.0.0.1:8080/private?a=%2F#frag";
+    let url = "http://localhost:8080/private?a=%2F#frag";
     pane_send_input(&api_socket, &link_pane, &format!("echo {url}"));
     let (column, row) = wait_for_text_position(&mut source, url, Duration::from_secs(8))
-        .expect("source should render numeric loopback URL");
+        .expect("source should render localhost URL");
     let mut opener = RecordingOpener::default();
 
     send_ctrl_click(&mut source, column, row);
@@ -1773,11 +1773,11 @@ fn external_open_socket_lifecycle_covers_forwarded_success_preparation_failure_a
     let (failed_id, prepared_url) =
         read_external_prepare(&mut source, Duration::from_secs(3)).expect("failed prepare");
     assert_eq!(prepared_url, url);
-    send_external_preparation_failed(&mut source, failed_id, 14); // ForwardCommandRejected
+    send_external_preparation_failed(&mut source, failed_id, 13); // AtomicForwardCreationFailed
     wait_for_external_open_settlement(
         &server_log_path(&config_home),
         failed_id,
-        "forward_command_rejected",
+        "atomic_forward_creation_failed",
         Duration::from_secs(3),
     );
     assert_eq!(

@@ -3,7 +3,7 @@ use std::io;
 
 use crate::external_open::{
     validate_external_open_url, ExternalOpenForwarding, ExternalOpenPlatform, ExternalOpenUrlError,
-    ForwardingPolicyChange, ForwardingPolicySettlement, ForwardingPreparation, LoopbackTarget,
+    ForwardingPolicyChange, ForwardingPolicySettlement, ForwardingPreparation,
     ValidatedExternalOpenUrl,
 };
 use crate::protocol::{
@@ -80,12 +80,6 @@ impl ClientExternalOpen {
                 Some(ClientMessage::ExternalOpenReady { request_id, target })
             }
             Ok(ValidatedExternalOpenUrl::Loopback(loopback)) => {
-                if loopback.target() == LoopbackTarget::Localhost {
-                    return Some(ClientMessage::ExternalOpenPreparationFailed {
-                        request_id,
-                        reason: ExternalOpenPreparationFailure::ForwardingUnavailable,
-                    });
-                }
                 let remote_port = loopback.remote_port();
                 let operation = match self
                     .forwarding
@@ -435,7 +429,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::external_open::{
-        ForwardingController, ForwardingPreparation, ForwardingPreparationError,
+        ForwardingController, ForwardingPreparation, ForwardingPreparationError, LoopbackTarget,
     };
 
     use super::*;
@@ -735,6 +729,97 @@ mod tests {
     }
 
     #[test]
+    fn macos_rejects_unsupported_127_slash_8_before_any_forward_command() {
+        let controller = Arc::new(FakeForwardingController::with_results([]));
+        let mut external_open = ClientExternalOpen::new(
+            ExternalOpenPolicy::Enabled,
+            ExternalOpenForwarding::available(controller.clone()),
+        );
+
+        assert_eq!(
+            external_open.prepare(
+                50,
+                "http://127.0.0.2:8080/private".to_owned(),
+                ExternalOpenPlatform::MacOs,
+            ),
+            Some(ClientMessage::ExternalOpenPreparationFailed {
+                request_id: 50,
+                reason: ExternalOpenPreparationFailure::LoopbackUnsupportedOnPlatform,
+            })
+        );
+        assert!(controller.requests.lock().expect("requests").is_empty());
+        assert!(external_open.commit(50).is_none());
+    }
+
+    #[test]
+    fn localhost_readiness_is_commit_gated_and_rewrites_only_the_pair_port() {
+        let controller = Arc::new(FakeForwardingController::with_results([Some(Ok(
+            NonZeroU16::new(43_123).expect("port"),
+        ))]));
+        let mut external_open = ClientExternalOpen::new(
+            ExternalOpenPolicy::Enabled,
+            ExternalOpenForwarding::available(controller.clone()),
+        );
+        let opened = RefCell::new(Vec::new());
+
+        assert!(external_open
+            .prepare(
+                50,
+                "HTTPS://LOCALHOST:00443/a%2Fb?token=A%2BB#Frag".to_owned(),
+                ExternalOpenPlatform::Linux,
+            )
+            .is_none());
+        assert!(opened.borrow().is_empty());
+        assert_eq!(
+            *controller.requests.lock().expect("requests"),
+            vec![(
+                LoopbackTarget::Localhost,
+                NonZeroU16::new(443).expect("port")
+            )]
+        );
+        assert_eq!(external_open.poll().len(), 1);
+        assert!(opened.borrow().is_empty());
+
+        external_open.commit(50).expect("commit").execute(|url| {
+            opened.borrow_mut().push(url.to_owned());
+            Ok(())
+        });
+        assert_eq!(
+            *opened.borrow(),
+            vec!["HTTPS://LOCALHOST:43123/a%2Fb?token=A%2BB#Frag"]
+        );
+    }
+
+    #[test]
+    fn atomic_pair_failure_never_becomes_committable_or_invokes_opener() {
+        let controller = Arc::new(FakeForwardingController::with_results([Some(Err(
+            ForwardingPreparationError::AtomicCreationFailed,
+        ))]));
+        let mut external_open = ClientExternalOpen::new(
+            ExternalOpenPolicy::Enabled,
+            ExternalOpenForwarding::available(controller),
+        );
+        let opened = RefCell::new(Vec::<String>::new());
+
+        assert!(external_open
+            .prepare(
+                50,
+                "http://localhost:8080/private".to_owned(),
+                ExternalOpenPlatform::Linux,
+            )
+            .is_none());
+        assert_eq!(
+            external_open.poll(),
+            vec![ClientMessage::ExternalOpenPreparationFailed {
+                request_id: 50,
+                reason: ExternalOpenPreparationFailure::AtomicForwardCreationFailed,
+            }]
+        );
+        assert!(external_open.commit(50).is_none());
+        assert!(opened.borrow().is_empty());
+    }
+
+    #[test]
     fn forwarded_url_is_opaque_to_opener_until_commit() {
         let controller = Arc::new(FakeForwardingController::with_results([Some(Ok(
             NonZeroU16::new(43_123).expect("port"),
@@ -817,6 +902,10 @@ mod tests {
             (
                 ForwardingPreparationError::CommandTimedOut,
                 ExternalOpenPreparationFailure::ForwardCommandTimedOut,
+            ),
+            (
+                ForwardingPreparationError::AtomicCreationFailed,
+                ExternalOpenPreparationFailure::AtomicForwardCreationFailed,
             ),
             (
                 ForwardingPreparationError::Unavailable,

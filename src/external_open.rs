@@ -18,6 +18,7 @@ pub(crate) enum ForwardingPreparationError {
     BindExhausted,
     CommandRejected,
     CommandTimedOut,
+    AtomicCreationFailed,
     Unavailable,
 }
 
@@ -101,6 +102,7 @@ impl From<ForwardingPreparationError> for crate::protocol::ExternalOpenPreparati
             ForwardingPreparationError::BindExhausted => Self::ForwardBindExhausted,
             ForwardingPreparationError::CommandRejected => Self::ForwardCommandRejected,
             ForwardingPreparationError::CommandTimedOut => Self::ForwardCommandTimedOut,
+            ForwardingPreparationError::AtomicCreationFailed => Self::AtomicForwardCreationFailed,
             ForwardingPreparationError::Unavailable => Self::ForwardingUnavailable,
         }
     }
@@ -439,6 +441,10 @@ mod tests {
             (
                 ForwardingPreparationError::CommandTimedOut,
                 crate::protocol::ExternalOpenPreparationFailure::ForwardCommandTimedOut,
+            ),
+            (
+                ForwardingPreparationError::AtomicCreationFailed,
+                crate::protocol::ExternalOpenPreparationFailure::AtomicForwardCreationFailed,
             ),
             (
                 ForwardingPreparationError::Unavailable,

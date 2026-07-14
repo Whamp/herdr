@@ -29,11 +29,7 @@ impl ControlAuthority {
         }
     }
 
-    fn invocation(&self, operation: ControlOperation) -> ControlInvocation {
-        let (operation_name, spec) = match operation {
-            ControlOperation::Forward(spec) => ("forward", spec),
-            ControlOperation::Cancel(spec) => ("cancel", spec),
-        };
+    fn invocation(&self, operation_name: &'static str, spec: ForwardSpec) -> ControlInvocation {
         ControlInvocation {
             program: "ssh".to_string(),
             args: vec![
@@ -52,9 +48,57 @@ impl ControlAuthority {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LocalhostPairSpec {
+    ipv4: ForwardSpec,
+    ipv6: ForwardSpec,
+}
+
+impl LocalhostPairSpec {
+    pub(super) fn new(local_port: u16, remote_port: u16) -> Option<Self> {
+        if local_port == 0 || remote_port == 0 {
+            return None;
+        }
+        Some(Self {
+            ipv4: ForwardSpec {
+                local_address: super::protocol::LoopbackAddress::Ipv4([127, 0, 0, 1]),
+                local_port,
+                remote_address: super::protocol::LoopbackAddress::Ipv4([127, 0, 0, 1]),
+                remote_port,
+            },
+            ipv6: ForwardSpec {
+                local_address: super::protocol::LoopbackAddress::Ipv6,
+                local_port,
+                remote_address: super::protocol::LoopbackAddress::Ipv6,
+                remote_port,
+            },
+        })
+    }
+
+    pub(super) const fn local_port(self) -> u16 {
+        self.ipv4.local_port
+    }
+
+    pub(super) const fn remote_port(self) -> u16 {
+        self.ipv4.remote_port
+    }
+
+    #[cfg(test)]
+    pub(super) const fn ipv4(self) -> ForwardSpec {
+        self.ipv4
+    }
+
+    #[cfg(test)]
+    pub(super) const fn ipv6(self) -> ForwardSpec {
+        self.ipv6
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ControlOperation {
     Forward(ForwardSpec),
     Cancel(ForwardSpec),
+    ForwardPair(LocalhostPairSpec),
+    CancelPair(LocalhostPairSpec),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +107,40 @@ pub(super) enum ControlResult {
     BindFailed,
     Rejected,
     TimedOut,
+    PairSucceeded,
+    PairFirstBindFailed,
+    PairFirstFailed,
+    PairFirstTimedOut,
+    PairSecondFailed,
+    PairCancellationSucceeded,
+    PairCancellationFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PairControlResult {
+    Succeeded,
+    FirstBindFailed,
+    FirstFailed,
+    FirstTimedOut,
+    SecondFailed,
+}
+
+impl PairControlResult {
+    pub(super) const fn from_control(result: ControlResult) -> Option<Self> {
+        match result {
+            ControlResult::PairSucceeded => Some(Self::Succeeded),
+            ControlResult::PairFirstBindFailed => Some(Self::FirstBindFailed),
+            ControlResult::PairFirstFailed => Some(Self::FirstFailed),
+            ControlResult::PairFirstTimedOut => Some(Self::FirstTimedOut),
+            ControlResult::PairSecondFailed => Some(Self::SecondFailed),
+            ControlResult::Succeeded
+            | ControlResult::BindFailed
+            | ControlResult::Rejected
+            | ControlResult::TimedOut
+            | ControlResult::PairCancellationSucceeded
+            | ControlResult::PairCancellationFailed => None,
+        }
+    }
 }
 
 pub(super) trait CommandRunner: Send + Sync + 'static {
@@ -183,8 +261,8 @@ impl ControlWorker {
             while let Ok(message) = receiver.recv() {
                 match message {
                     WorkerMessage::Run(job) => {
-                        let invocation = authority.invocation(job.operation);
-                        let result = runner.run(&invocation, timeout);
+                        let result =
+                            run_operation(&authority, runner.as_ref(), job.operation, timeout);
                         if result_sender
                             .send(WorkerResult {
                                 id: job.id,
@@ -224,6 +302,56 @@ impl ControlWorker {
     }
 }
 
+fn run_operation(
+    authority: &ControlAuthority,
+    runner: &dyn CommandRunner,
+    operation: ControlOperation,
+    timeout: Duration,
+) -> ControlResult {
+    match operation {
+        ControlOperation::Forward(spec) => {
+            runner.run(&authority.invocation("forward", spec), timeout)
+        }
+        ControlOperation::Cancel(spec) => {
+            runner.run(&authority.invocation("cancel", spec), timeout)
+        }
+        ControlOperation::ForwardPair(pair) => {
+            let first = runner.run(&authority.invocation("forward", pair.ipv4), timeout);
+            match first {
+                ControlResult::Succeeded => {}
+                ControlResult::BindFailed => return ControlResult::PairFirstBindFailed,
+                ControlResult::TimedOut => return ControlResult::PairFirstTimedOut,
+                ControlResult::Rejected
+                | ControlResult::PairSucceeded
+                | ControlResult::PairFirstBindFailed
+                | ControlResult::PairFirstFailed
+                | ControlResult::PairFirstTimedOut
+                | ControlResult::PairSecondFailed
+                | ControlResult::PairCancellationSucceeded
+                | ControlResult::PairCancellationFailed => {
+                    return ControlResult::PairFirstFailed;
+                }
+            }
+            let second = runner.run(&authority.invocation("forward", pair.ipv6), timeout);
+            if second == ControlResult::Succeeded {
+                ControlResult::PairSucceeded
+            } else {
+                let _ = runner.run(&authority.invocation("cancel", pair.ipv4), timeout);
+                ControlResult::PairSecondFailed
+            }
+        }
+        ControlOperation::CancelPair(pair) => {
+            let ipv4 = runner.run(&authority.invocation("cancel", pair.ipv4), timeout);
+            let ipv6 = runner.run(&authority.invocation("cancel", pair.ipv6), timeout);
+            if ipv4 == ControlResult::Succeeded && ipv6 == ControlResult::Succeeded {
+                ControlResult::PairCancellationSucceeded
+            } else {
+                ControlResult::PairCancellationFailed
+            }
+        }
+    }
+}
+
 impl Drop for ControlWorker {
     fn drop(&mut self) {
         let _ = self.sender.send(WorkerMessage::Shutdown);
@@ -256,7 +384,7 @@ mod tests {
         let authority =
             ControlAuthority::new("user@remote".to_string(), PathBuf::from("/private/ctl"));
 
-        let invocation = authority.invocation(ControlOperation::Forward(spec(8443)));
+        let invocation = authority.invocation("forward", spec(8443));
 
         assert_eq!(invocation.program, "ssh");
         assert_eq!(
@@ -288,6 +416,138 @@ mod tests {
             self.active.fetch_sub(1, Ordering::SeqCst);
             ControlResult::Succeeded
         }
+    }
+
+    #[test]
+    fn atomic_pair_creates_ipv4_then_ipv6_and_rolls_back_ipv4_once() {
+        struct PairRunner {
+            operations: std::sync::Mutex<Vec<(String, String)>>,
+            results: std::sync::Mutex<std::collections::VecDeque<ControlResult>>,
+        }
+
+        impl CommandRunner for PairRunner {
+            fn run(&self, invocation: &ControlInvocation, _timeout: Duration) -> ControlResult {
+                let operation = invocation
+                    .args
+                    .windows(2)
+                    .find_map(|args| (args[0] == "-O").then(|| args[1].clone()))
+                    .expect("operation");
+                let specification = invocation
+                    .args
+                    .windows(2)
+                    .find_map(|args| (args[0] == "-L").then(|| args[1].clone()))
+                    .expect("specification");
+                self.operations
+                    .lock()
+                    .expect("operations")
+                    .push((operation, specification));
+                self.results
+                    .lock()
+                    .expect("results")
+                    .pop_front()
+                    .expect("queued result")
+            }
+        }
+
+        let pair = LocalhostPairSpec::new(8080, 3000).expect("valid pair");
+        let runner = Arc::new(PairRunner {
+            operations: std::sync::Mutex::new(Vec::new()),
+            results: std::sync::Mutex::new(std::collections::VecDeque::from([
+                ControlResult::Succeeded,
+                ControlResult::Rejected,
+                ControlResult::Rejected,
+            ])),
+        });
+        let worker = ControlWorker::start(
+            ControlAuthority::new("remote".to_string(), PathBuf::from("/ctl")),
+            runner.clone(),
+            Duration::from_secs(10),
+        );
+
+        worker
+            .submit(WorkerJob {
+                id: CorrelationId::new(1).expect("id"),
+                operation: ControlOperation::ForwardPair(pair),
+            })
+            .expect("pair job");
+
+        assert_eq!(
+            worker.recv().expect("pair result").result,
+            ControlResult::PairSecondFailed
+        );
+        assert_eq!(
+            *runner.operations.lock().expect("operations"),
+            vec![
+                (
+                    "forward".to_string(),
+                    "127.0.0.1:8080:127.0.0.1:3000".to_string()
+                ),
+                ("forward".to_string(), "[::1]:8080:[::1]:3000".to_string()),
+                (
+                    "cancel".to_string(),
+                    "127.0.0.1:8080:127.0.0.1:3000".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn pair_cancellation_attempts_ipv6_after_ipv4_failure() {
+        struct CancellationRunner {
+            operations: std::sync::Mutex<Vec<String>>,
+            results: std::sync::Mutex<std::collections::VecDeque<ControlResult>>,
+        }
+
+        impl CommandRunner for CancellationRunner {
+            fn run(&self, invocation: &ControlInvocation, _timeout: Duration) -> ControlResult {
+                let specification = invocation
+                    .args
+                    .windows(2)
+                    .find_map(|args| (args[0] == "-L").then(|| args[1].clone()))
+                    .expect("specification");
+                self.operations
+                    .lock()
+                    .expect("operations")
+                    .push(specification);
+                self.results
+                    .lock()
+                    .expect("results")
+                    .pop_front()
+                    .expect("queued result")
+            }
+        }
+
+        let runner = Arc::new(CancellationRunner {
+            operations: std::sync::Mutex::new(Vec::new()),
+            results: std::sync::Mutex::new(std::collections::VecDeque::from([
+                ControlResult::Rejected,
+                ControlResult::TimedOut,
+            ])),
+        });
+        let worker = ControlWorker::start(
+            ControlAuthority::new("remote".to_string(), PathBuf::from("/ctl")),
+            runner.clone(),
+            Duration::from_secs(10),
+        );
+        let pair = LocalhostPairSpec::new(8080, 3000).expect("pair");
+        worker
+            .submit(WorkerJob {
+                id: CorrelationId::new(1).expect("id"),
+                operation: ControlOperation::CancelPair(pair),
+            })
+            .expect("cancel pair");
+
+        assert_eq!(
+            worker.recv().expect("result").result,
+            ControlResult::PairCancellationFailed
+        );
+        assert_eq!(
+            *runner.operations.lock().expect("operations"),
+            vec![
+                "127.0.0.1:8080:127.0.0.1:3000".to_string(),
+                "[::1]:8080:[::1]:3000".to_string(),
+            ]
+        );
     }
 
     #[test]

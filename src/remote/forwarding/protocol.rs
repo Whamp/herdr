@@ -5,7 +5,7 @@ use std::num::NonZeroU64;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-pub(super) const BROKER_PROTOCOL_VERSION: u16 = 2;
+pub(super) const BROKER_PROTOCOL_VERSION: u16 = 3;
 pub(super) const MAX_PAYLOAD_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -87,6 +87,10 @@ pub(super) enum ClientMessage {
         id: CorrelationId,
         spec: ForwardSpec,
     },
+    ForwardLocalhost {
+        id: CorrelationId,
+        remote_port: u16,
+    },
     Cancel {
         id: CorrelationId,
     },
@@ -98,6 +102,7 @@ impl ClientMessage {
             Self::Hello { id, .. }
             | Self::AssertPolicy { id, .. }
             | Self::Forward { id, .. }
+            | Self::ForwardLocalhost { id, .. }
             | Self::Cancel { id } => *id,
         }
     }
@@ -112,6 +117,7 @@ pub(crate) enum ForwardFailure {
     BindFailed,
     CommandRejected,
     CommandTimedOut,
+    AtomicCreationFailed,
     CapabilityClosed,
 }
 
@@ -131,6 +137,10 @@ pub(super) enum ServerMessage {
         id: CorrelationId,
         result: Result<(), ForwardFailure>,
     },
+    ForwardLocalhostSettled {
+        id: CorrelationId,
+        result: Result<u16, ForwardFailure>,
+    },
     Cancelled {
         id: CorrelationId,
     },
@@ -142,6 +152,7 @@ impl ServerMessage {
             Self::HelloAcknowledged { id, .. }
             | Self::PolicyAcknowledged { id, .. }
             | Self::ForwardSettled { id, .. }
+            | Self::ForwardLocalhostSettled { id, .. }
             | Self::Cancelled { id } => *id,
         }
     }
@@ -243,6 +254,32 @@ mod tests {
             ..exact_ipv4
         }
         .is_valid());
+    }
+
+    #[test]
+    fn localhost_pair_request_and_settlement_round_trip_as_closed_values() {
+        let id = CorrelationId::new(7).expect("id");
+        let request = ClientMessage::ForwardLocalhost {
+            id,
+            remote_port: 8080,
+        };
+        let settlement = ServerMessage::ForwardLocalhostSettled {
+            id,
+            result: Err(ForwardFailure::AtomicCreationFailed),
+        };
+
+        assert_eq!(
+            decode_message::<ClientMessage>(&encode_message(&request).expect("encode request"))
+                .expect("decode request"),
+            request
+        );
+        assert_eq!(
+            decode_message::<ServerMessage>(
+                &encode_message(&settlement).expect("encode settlement")
+            )
+            .expect("decode settlement"),
+            settlement
+        );
     }
 
     #[test]
