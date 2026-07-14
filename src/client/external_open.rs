@@ -94,6 +94,28 @@ impl ClientExternalOpen {
             }
             Ok(ValidatedExternalOpenUrl::Loopback(loopback)) => {
                 let remote_port = loopback.remote_port();
+                #[cfg(debug_assertions)]
+                if let Some(result) = external_open_forward_port_for_test() {
+                    let local_port = match result {
+                        Ok(local_port) => local_port,
+                        Err(reason) => {
+                            return Some(ClientMessage::ExternalOpenPreparationFailed {
+                                request_id,
+                                reason,
+                            });
+                        }
+                    };
+                    let url = loopback.rewrite_with_local_port(local_port);
+                    let port_status = if local_port == remote_port {
+                        ExternalOpenPortStatus::SamePort
+                    } else {
+                        ExternalOpenPortStatus::RemappedPort
+                    };
+                    let target = ExternalOpenTarget::Forwarded { port_status };
+                    self.prepared
+                        .insert(request_id, PreparedExternalOpen { url, target });
+                    return Some(ClientMessage::ExternalOpenReady { request_id, target });
+                }
                 let operation = match self
                     .forwarding
                     .begin_prepare_numeric(loopback.target(), remote_port)
@@ -350,6 +372,34 @@ impl Drop for ClientExternalOpen {
     }
 }
 
+#[cfg(debug_assertions)]
+fn external_open_forward_port_for_test(
+) -> Option<Result<std::num::NonZeroU16, ExternalOpenPreparationFailure>> {
+    let path = std::env::var_os("HERDR_TEST_EXTERNAL_OPEN_FORWARD_PORT_PATH")?;
+    let value = match std::fs::read_to_string(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(_) => {
+            return Some(Err(
+                ExternalOpenPreparationFailure::AtomicForwardCreationFailed,
+            ));
+        }
+    };
+    if std::fs::remove_file(path).is_err() {
+        return Some(Err(
+            ExternalOpenPreparationFailure::AtomicForwardCreationFailed,
+        ));
+    }
+    Some(
+        value
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .and_then(std::num::NonZeroU16::new)
+            .ok_or(ExternalOpenPreparationFailure::AtomicForwardCreationFailed),
+    )
+}
+
 fn policy_change_succeeded(
     reply: PendingPolicyReply,
     effective: ExternalOpenPolicy,
@@ -552,7 +602,7 @@ fn preparation_failure(error: ExternalOpenUrlError) -> ExternalOpenPreparationFa
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::num::NonZeroU16;
     use std::sync::{Arc, Mutex};
@@ -627,6 +677,17 @@ mod tests {
         SavedPortForwardLimit::new(value).expect("valid saved mapping limit")
     }
 
+    fn opener_calls_if_committed(external_open: &mut ClientExternalOpen, request_id: u64) -> usize {
+        let calls = Cell::new(0);
+        if let Some(committed) = external_open.commit(request_id) {
+            let _ = committed.execute(|_| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            });
+        }
+        calls.get()
+    }
+
     fn persisted_mutation(request_id: u64, requested: ExternalOpenPolicy) -> ClientMessage {
         ClientMessage::ExternalOpenPolicyMutationResult {
             request_id,
@@ -677,6 +738,224 @@ mod tests {
                 result: Some(result),
             }))
         }
+    }
+
+    #[test]
+    fn every_url_policy_failure_is_typed_and_has_zero_opener_authority() {
+        let cases = [
+            (
+                "ftp://example.test/private",
+                ExternalOpenPlatform::Linux,
+                ExternalOpenPreparationFailure::UnsupportedScheme,
+            ),
+            (
+                "http://userinfo@example.test/private",
+                ExternalOpenPlatform::Linux,
+                ExternalOpenPreparationFailure::AuthorityUserinfoForbidden,
+            ),
+            (
+                "http://example.test:0/private",
+                ExternalOpenPlatform::Linux,
+                ExternalOpenPreparationFailure::InvalidPort,
+            ),
+            (
+                "http:///private",
+                ExternalOpenPlatform::Linux,
+                ExternalOpenPreparationFailure::InvalidAbsoluteUrl,
+            ),
+            (
+                "http://127.1/private",
+                ExternalOpenPlatform::Linux,
+                ExternalOpenPreparationFailure::UnsupportedLoopbackForm,
+            ),
+            (
+                "http://127.0.0.2/private",
+                ExternalOpenPlatform::MacOs,
+                ExternalOpenPreparationFailure::LoopbackUnsupportedOnPlatform,
+            ),
+        ];
+
+        for (offset, (url, platform, expected)) in cases.into_iter().enumerate() {
+            let request_id = 1 + u64::try_from(offset).expect("small case count");
+            let mut external_open = ClientExternalOpen::new(
+                ExternalOpenPolicy::Enabled,
+                SavedPortForwardLimit::DEFAULT,
+                ExternalOpenForwarding::Unavailable,
+            );
+            assert_eq!(
+                external_open.prepare(request_id, url.to_owned(), platform),
+                Some(ClientMessage::ExternalOpenPreparationFailed {
+                    request_id,
+                    reason: expected,
+                })
+            );
+            assert_eq!(opener_calls_if_committed(&mut external_open, request_id), 0);
+        }
+    }
+
+    #[test]
+    fn client_socket_authority_matrix_calls_recording_opener_only_after_commit() {
+        fn direct_client() -> ClientExternalOpen {
+            ClientExternalOpen::new(
+                ExternalOpenPolicy::Enabled,
+                SavedPortForwardLimit::DEFAULT,
+                ExternalOpenForwarding::Unavailable,
+            )
+        }
+
+        fn execute_if_committed(
+            external_open: &mut ClientExternalOpen,
+            request_id: u64,
+            calls: &Cell<usize>,
+            opener_result: io::Result<()>,
+        ) -> Option<ClientMessage> {
+            external_open.commit(request_id).map(|committed| {
+                committed.execute(|_| {
+                    calls.set(calls.get() + 1);
+                    opener_result
+                })
+            })
+        }
+
+        let mut observed = Vec::new();
+        for label in ["admission", "precommit", "invalid"] {
+            let mut external_open = direct_client();
+            let calls = Cell::new(0);
+            if label != "admission" {
+                assert!(matches!(
+                    external_open.prepare(
+                        1,
+                        "https://example.test/private".to_owned(),
+                        ExternalOpenPlatform::Linux,
+                    ),
+                    Some(ClientMessage::ExternalOpenReady { request_id: 1, .. })
+                ));
+            }
+            // No commit command crossed the socket authority boundary.
+            observed.push((label, calls.get()));
+            external_open.cancel_all();
+            assert!(execute_if_committed(&mut external_open, 1, &calls, Ok(())).is_none());
+        }
+
+        let mut preparation = direct_client();
+        let preparation_calls = Cell::new(0);
+        assert!(matches!(
+            preparation.prepare(
+                2,
+                "ftp://example.test/private".to_owned(),
+                ExternalOpenPlatform::Linux,
+            ),
+            Some(ClientMessage::ExternalOpenPreparationFailed { request_id: 2, .. })
+        ));
+        assert!(execute_if_committed(&mut preparation, 2, &preparation_calls, Ok(())).is_none());
+        observed.push(("preparation", preparation_calls.get()));
+
+        for label in ["cancellation", "timeout"] {
+            let mut external_open = direct_client();
+            let calls = Cell::new(0);
+            assert!(matches!(
+                external_open.prepare(
+                    3,
+                    "https://example.test/private".to_owned(),
+                    ExternalOpenPlatform::Linux,
+                ),
+                Some(ClientMessage::ExternalOpenReady { request_id: 3, .. })
+            ));
+            assert!(external_open.cancel(3));
+            assert!(execute_if_committed(&mut external_open, 3, &calls, Ok(())).is_none());
+            observed.push((label, calls.get()));
+        }
+
+        let mut disabled = direct_client();
+        let disabled_calls = Cell::new(0);
+        assert!(disabled
+            .prepare(
+                4,
+                "https://example.test/private".to_owned(),
+                ExternalOpenPlatform::Linux,
+            )
+            .is_some());
+        disabled.begin_policy_mutation(persisted_mutation(40, ExternalOpenPolicy::Disabled));
+        assert!(execute_if_committed(&mut disabled, 4, &disabled_calls, Ok(())).is_none());
+        observed.push(("disable", disabled_calls.get()));
+
+        for label in ["disconnect", "delivery"] {
+            let mut external_open = direct_client();
+            let calls = Cell::new(0);
+            assert!(external_open
+                .prepare(
+                    5,
+                    "https://example.test/private".to_owned(),
+                    ExternalOpenPlatform::Linux,
+                )
+                .is_some());
+            external_open.cancel_all();
+            assert!(execute_if_committed(&mut external_open, 5, &calls, Ok(())).is_none());
+            observed.push((label, calls.get()));
+        }
+
+        assert_eq!(
+            observed,
+            vec![
+                ("admission", 0),
+                ("precommit", 0),
+                ("invalid", 0),
+                ("preparation", 0),
+                ("cancellation", 0),
+                ("timeout", 0),
+                ("disable", 0),
+                ("disconnect", 0),
+                ("delivery", 0),
+            ]
+        );
+
+        let mut successful = direct_client();
+        assert!(successful
+            .prepare(
+                6,
+                "https://example.test/private".to_owned(),
+                ExternalOpenPlatform::Linux,
+            )
+            .is_some());
+        let success_calls = Cell::new(0);
+        assert_eq!(
+            execute_if_committed(&mut successful, 6, &success_calls, Ok(())),
+            Some(ClientMessage::ExternalOpenResult {
+                request_id: 6,
+                result: ExternalOpenResult::OpenedDirectly,
+            })
+        );
+        assert_eq!(success_calls.get(), 1);
+        assert!(
+            execute_if_committed(&mut successful, 6, &success_calls, Ok(())).is_none(),
+            "committed unknown must never retry an opener"
+        );
+        assert_eq!(success_calls.get(), 1);
+
+        let mut rejected = direct_client();
+        assert!(rejected
+            .prepare(
+                7,
+                "https://example.test/private".to_owned(),
+                ExternalOpenPlatform::Linux,
+            )
+            .is_some());
+        let rejection_calls = Cell::new(0);
+        assert!(matches!(
+            execute_if_committed(
+                &mut rejected,
+                7,
+                &rejection_calls,
+                Err(io::Error::other("recording opener rejection")),
+            ),
+            Some(ClientMessage::ExternalOpenResult {
+                request_id: 7,
+                result: ExternalOpenResult::PlatformOpenRejected,
+            })
+        ));
+        assert_eq!(rejection_calls.get(), 1);
+        assert!(execute_if_committed(&mut rejected, 7, &rejection_calls, Ok(())).is_none());
+        assert_eq!(rejection_calls.get(), 1);
     }
 
     #[test]
@@ -1270,7 +1549,7 @@ mod tests {
                 reason: ExternalOpenPreparationFailure::AtomicForwardCreationFailed,
             }]
         );
-        assert!(external_open.commit(50).is_none());
+        assert_eq!(opener_calls_if_committed(&mut external_open, 50), 0);
         assert!(opened.borrow().is_empty());
     }
 
@@ -1342,7 +1621,7 @@ mod tests {
                     reason: expected,
                 })
             );
-            assert!(external_open.commit(request_id).is_none());
+            assert_eq!(opener_calls_if_committed(&mut external_open, request_id), 0);
         }
 
         let translations = [
@@ -1410,7 +1689,7 @@ mod tests {
                         reason: expected,
                     }]
                 );
-                assert!(external_open.commit(request_id).is_none());
+                assert_eq!(opener_calls_if_committed(&mut external_open, request_id), 0);
             }
         }
     }

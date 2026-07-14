@@ -1725,13 +1725,30 @@ async fn run_client_loop(
                 }
                 ServerMessage::ExternalOpenPrepare { request_id, url } => {
                     if config.connection_kind.is_full_app() {
+                        #[cfg(debug_assertions)]
+                        if let Some(replies) = external_open_actions_for_test(request_id) {
+                            for reply in replies {
+                                if let Err(error) = write_to_server(&mut write_stream, &reply) {
+                                    return Err(ClientError::ConnectionLost(error));
+                                }
+                            }
+                            continue;
+                        }
                         if let Some(reply) = external_open.prepare(
                             request_id,
                             url,
                             crate::platform::external_open_platform(),
                         ) {
-                            if let Err(error) = write_to_server(&mut write_stream, &reply) {
-                                return Err(ClientError::ConnectionLost(error));
+                            #[cfg(debug_assertions)]
+                            let suppress_ready =
+                                matches!(reply, ClientMessage::ExternalOpenReady { .. })
+                                    && external_open_ready_suppressed_for_test();
+                            #[cfg(not(debug_assertions))]
+                            let suppress_ready = false;
+                            if !suppress_ready {
+                                if let Err(error) = write_to_server(&mut write_stream, &reply) {
+                                    return Err(ClientError::ConnectionLost(error));
+                                }
                             }
                         }
                     }
@@ -1741,7 +1758,16 @@ async fn run_client_loop(
                         if let Some(committed) = external_open.commit(request_id) {
                             let completion_tx = event_tx.clone();
                             std::thread::spawn(move || {
-                                let result = committed.execute(crate::platform::open_url);
+                                let result = committed.execute(|url| {
+                                    let result = crate::platform::open_url(url);
+                                    #[cfg(debug_assertions)]
+                                    if result.is_ok() && external_open_rejection_armed_for_test() {
+                                        return Err(io::Error::other(
+                                            "test-controlled platform opener rejection",
+                                        ));
+                                    }
+                                    result
+                                });
                                 let _ = completion_tx
                                     .blocking_send(ClientLoopEvent::ExternalOpenCompleted(result));
                             });
@@ -1776,8 +1802,14 @@ async fn run_client_loop(
                 }
             },
             ClientLoopEvent::ExternalOpenCompleted(result) => {
-                if let Err(error) = write_to_server(&mut write_stream, &result) {
-                    return Err(ClientError::ConnectionLost(error));
+                #[cfg(debug_assertions)]
+                let suppress_result = external_open_result_suppressed_for_test();
+                #[cfg(not(debug_assertions))]
+                let suppress_result = false;
+                if !suppress_result {
+                    if let Err(error) = write_to_server(&mut write_stream, &result) {
+                        return Err(ClientError::ConnectionLost(error));
+                    }
                 }
             }
             ClientLoopEvent::ServerDisconnected => {
@@ -1867,6 +1899,111 @@ fn server_reader_thread(
 /// Writes a message to the server stream (blocking).
 fn write_to_server(stream: &mut LocalStream, msg: &ClientMessage) -> io::Result<()> {
     protocol::write_message(stream, msg).map_err(|e| io::Error::other(e.to_string()))
+}
+
+#[cfg(debug_assertions)]
+fn external_open_actions_for_test(request_id: u64) -> Option<Vec<ClientMessage>> {
+    let path = std::path::PathBuf::from(std::env::var_os("HERDR_TEST_EXTERNAL_OPEN_ACTION_PATH")?);
+    let mut claimed = path.clone();
+    claimed.set_extension(format!("claimed-{}", std::process::id()));
+    let _ = std::fs::remove_file(&claimed);
+    match std::fs::rename(&path, &claimed) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(Vec::new()),
+    }
+    let script = std::fs::read_to_string(&claimed);
+    let _ = std::fs::remove_file(claimed);
+    let Ok(script) = script else {
+        return Some(Vec::new());
+    };
+    let messages = script
+        .lines()
+        .map(str::split_whitespace)
+        .map(|mut fields| {
+            let command = fields.next()?;
+            let message = match command {
+                "failure" => ClientMessage::ExternalOpenPreparationFailed {
+                    request_id: external_open_test_request_id(fields.next()?, request_id)?,
+                    reason: external_open_test_preparation_failure(fields.next()?)?,
+                },
+                "ready" => ClientMessage::ExternalOpenReady {
+                    request_id: external_open_test_request_id(fields.next()?, request_id)?,
+                    target: crate::protocol::ExternalOpenTarget::Direct,
+                },
+                "result" => ClientMessage::ExternalOpenResult {
+                    request_id: external_open_test_request_id(fields.next()?, request_id)?,
+                    result: crate::protocol::ExternalOpenResult::OpenedDirectly,
+                },
+                "suppress" => return fields.next().is_none().then_some(None),
+                _ => return None,
+            };
+            fields.next().is_none().then_some(Some(message))
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|messages| messages.into_iter().flatten().collect())
+        .unwrap_or_default();
+    Some(messages)
+}
+
+#[cfg(debug_assertions)]
+fn external_open_test_request_id(value: &str, current: u64) -> Option<u64> {
+    match value {
+        "current" => Some(current),
+        "unknown" => Some(u64::MAX),
+        value => value.parse().ok(),
+    }
+}
+
+#[cfg(debug_assertions)]
+fn external_open_test_preparation_failure(
+    value: &str,
+) -> Option<crate::protocol::ExternalOpenPreparationFailure> {
+    use crate::protocol::ExternalOpenPreparationFailure as Failure;
+
+    Some(match value {
+        "unsupported_scheme" => Failure::UnsupportedScheme,
+        "authority_userinfo_forbidden" => Failure::AuthorityUserinfoForbidden,
+        "invalid_port" => Failure::InvalidPort,
+        "invalid_absolute_url" => Failure::InvalidAbsoluteUrl,
+        "unsupported_loopback_form" => Failure::UnsupportedLoopbackForm,
+        "loopback_unsupported_on_platform" => Failure::LoopbackUnsupportedOnPlatform,
+        "managed_ssh_required" => Failure::ManagedSshRequired,
+        "forwarding_unavailable" => Failure::ForwardingUnavailable,
+        "too_many_opens_in_progress" => Failure::TooManyOpensInProgress,
+        "too_many_forward_requests" => Failure::TooManyForwardRequests,
+        "too_many_mapping_waiters" => Failure::TooManyMappingWaiters,
+        "forward_capacity_exhausted" => Failure::ForwardCapacityExhausted,
+        "forward_bind_exhausted" => Failure::ForwardBindExhausted,
+        "atomic_forward_creation_failed" => Failure::AtomicForwardCreationFailed,
+        "forward_command_rejected" => Failure::ForwardCommandRejected,
+        "forward_command_timed_out" => Failure::ForwardCommandTimedOut,
+        _ => return None,
+    })
+}
+
+#[cfg(debug_assertions)]
+fn external_open_ready_suppressed_for_test() -> bool {
+    let Some(path) = std::env::var_os("HERDR_TEST_EXTERNAL_OPEN_SUPPRESS_READY_PATH") else {
+        return false;
+    };
+    std::fs::remove_file(path).is_ok()
+}
+
+#[cfg(debug_assertions)]
+fn external_open_result_suppressed_for_test() -> bool {
+    let Some(path) = std::env::var_os("HERDR_TEST_EXTERNAL_OPEN_SUPPRESS_RESULT_PATH") else {
+        return false;
+    };
+    std::fs::remove_file(path).is_ok()
+}
+
+#[cfg(debug_assertions)]
+fn external_open_rejection_armed_for_test() -> bool {
+    let Some(path) = std::env::var_os("HERDR_TEST_EXTERNAL_OPEN_REJECT_PATH") else {
+        return false;
+    };
+    std::fs::remove_file(path).is_ok()
 }
 
 // ---------------------------------------------------------------------------
