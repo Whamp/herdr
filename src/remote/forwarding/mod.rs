@@ -4,6 +4,8 @@ mod broker;
 mod controller;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod inheritance;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod openssh_harness;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod protocol;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

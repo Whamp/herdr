@@ -1,0 +1,6 @@
+[test-groups]
+openssh-harness = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(/^remote::forwarding::openssh_harness::/)'
+test-group = 'openssh-harness'

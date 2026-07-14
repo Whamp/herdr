@@ -605,6 +605,8 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::num::NonZeroU16;
+    #[cfg(target_os = "macos")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use crate::config::SavedPortForwardLimit;
@@ -653,6 +655,46 @@ mod tests {
         cancellations: Arc<Mutex<usize>>,
         begin_error: Mutex<Option<ForwardingPreparationError>>,
         policy_result: Mutex<Option<ForwardingPolicySettlement>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    struct CountingForwardingController {
+        inner: Arc<dyn ForwardingController>,
+        begin_prepare_calls: AtomicUsize,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl CountingForwardingController {
+        fn new(inner: Arc<dyn ForwardingController>) -> Self {
+            Self {
+                inner,
+                begin_prepare_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn begin_prepare_calls(&self) -> usize {
+            self.begin_prepare_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl ForwardingController for CountingForwardingController {
+        fn begin_prepare_numeric(
+            &self,
+            target: LoopbackTarget,
+            remote_port: NonZeroU16,
+        ) -> Result<Box<dyn ForwardingPreparation>, ForwardingPreparationError> {
+            self.begin_prepare_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.begin_prepare_numeric(target, remote_port)
+        }
+
+        fn begin_set_enabled(
+            &self,
+            enabled: bool,
+            saved_mapping_limit: SavedPortForwardLimit,
+        ) -> Result<Box<dyn ForwardingPolicyChange>, ForwardingPreparationError> {
+            self.inner.begin_set_enabled(enabled, saved_mapping_limit)
+        }
     }
 
     impl FakeForwardingController {
@@ -1352,28 +1394,33 @@ mod tests {
         assert_eq!(external_open.policy(), ExternalOpenPolicy::Disabled);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn macos_rejects_unsupported_127_slash_8_before_any_forward_command() {
-        let controller = Arc::new(FakeForwardingController::with_results([]));
+    fn macos_client_rejects_canonical_127_8_before_forwarding_or_opener_authority() {
+        let broker = ForwardingBrokerTestHarness::succeeding(SavedPortForwardLimit::DEFAULT);
+        let controller = Arc::new(CountingForwardingController::new(broker.controller()));
         let mut external_open = ClientExternalOpen::new(
             ExternalOpenPolicy::Enabled,
             SavedPortForwardLimit::DEFAULT,
             ExternalOpenForwarding::available(controller.clone()),
         );
 
-        assert_eq!(
-            external_open.prepare(
-                50,
-                "http://127.0.0.2:8080/private".to_owned(),
-                ExternalOpenPlatform::MacOs,
-            ),
-            Some(ClientMessage::ExternalOpenPreparationFailed {
-                request_id: 50,
-                reason: ExternalOpenPreparationFailure::LoopbackUnsupportedOnPlatform,
-            })
-        );
-        assert!(controller.requests.lock().expect("requests").is_empty());
-        assert!(external_open.commit(50).is_none());
+        for (request_id, url) in [
+            (50, "http://127.0.0.2:3000/private"),
+            (51, "http://127.42.0.9:3000/private"),
+            (52, "http://127.255.255.255:3000/private"),
+        ] {
+            assert_eq!(
+                external_open.prepare(request_id, url.to_owned(), ExternalOpenPlatform::MacOs),
+                Some(ClientMessage::ExternalOpenPreparationFailed {
+                    request_id,
+                    reason: ExternalOpenPreparationFailure::LoopbackUnsupportedOnPlatform,
+                })
+            );
+            assert_eq!(controller.begin_prepare_calls(), 0);
+            assert_eq!(broker.total_operations(), 0);
+            assert_eq!(opener_calls_if_committed(&mut external_open, request_id), 0);
+        }
     }
 
     #[test]
