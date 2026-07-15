@@ -323,17 +323,21 @@ impl ClientExternalOpen {
             .policy_change
             .as_mut()
             .and_then(|pending| pending.operation.poll());
-        if let (Some(settlement), Some(pending)) = (policy_settlement, self.policy_change.take()) {
-            messages.extend(policy_change_settled(
-                pending.reply,
-                pending.requested,
-                pending.requested_saved_mapping_limit,
-                pending.prior_effective,
-                settlement,
-                pending.prior_saved_mapping_limit,
-                |policy, limit| self.apply_configuration(policy, limit),
-            ));
-        }
+        let Some(settlement) = policy_settlement else {
+            return messages;
+        };
+        let Some(pending) = self.policy_change.take() else {
+            return messages;
+        };
+        messages.extend(policy_change_settled(
+            pending.reply,
+            pending.requested,
+            pending.requested_saved_mapping_limit,
+            pending.prior_effective,
+            settlement,
+            pending.prior_saved_mapping_limit,
+            |policy, limit| self.apply_configuration(policy, limit),
+        ));
         messages
     }
 
@@ -637,11 +641,16 @@ mod tests {
     }
 
     struct FakePolicyChange {
+        empty_polls: usize,
         result: Option<ForwardingPolicySettlement>,
     }
 
     impl ForwardingPolicyChange for FakePolicyChange {
         fn poll(&mut self) -> Option<ForwardingPolicySettlement> {
+            if self.empty_polls > 0 {
+                self.empty_polls -= 1;
+                return None;
+            }
             self.result.take()
         }
         fn cancel(&mut self) {
@@ -654,6 +663,7 @@ mod tests {
         requests: Mutex<Vec<(LoopbackTarget, NonZeroU16)>>,
         cancellations: Arc<Mutex<usize>>,
         begin_error: Mutex<Option<ForwardingPreparationError>>,
+        policy_empty_polls: Mutex<usize>,
         policy_result: Mutex<Option<ForwardingPolicySettlement>>,
     }
 
@@ -704,6 +714,7 @@ mod tests {
                 requests: Mutex::new(Vec::new()),
                 cancellations: Arc::new(Mutex::new(0)),
                 begin_error: Mutex::new(None),
+                policy_empty_polls: Mutex::new(0),
                 policy_result: Mutex::new(None),
             }
         }
@@ -777,6 +788,9 @@ mod tests {
                     result: Ok(()),
                 });
             Ok(Box::new(FakePolicyChange {
+                empty_polls: std::mem::take(
+                    &mut *self.policy_empty_polls.lock().expect("policy empty polls"),
+                ),
                 result: Some(result),
             }))
         }
@@ -1202,6 +1216,28 @@ mod tests {
             SavedPortForwardLimit::DEFAULT
         );
         assert!(external_open.poll().is_empty());
+    }
+
+    #[test]
+    fn pending_policy_mutation_survives_an_empty_poll_before_acknowledgement() {
+        let controller = Arc::new(FakeForwardingController::with_results([]));
+        *controller
+            .policy_empty_polls
+            .lock()
+            .expect("policy empty polls") = 1;
+        let mut external_open = ClientExternalOpen::new(
+            ExternalOpenPolicy::Disabled,
+            SavedPortForwardLimit::DEFAULT,
+            ExternalOpenForwarding::available(controller),
+        );
+        let mutation = persisted_mutation(9, ExternalOpenPolicy::Enabled);
+
+        assert!(external_open
+            .begin_policy_mutation(mutation.clone())
+            .is_empty());
+        assert!(external_open.poll().is_empty());
+        assert_eq!(external_open.poll(), vec![mutation]);
+        assert_eq!(external_open.policy(), ExternalOpenPolicy::Enabled);
     }
 
     #[test]
