@@ -9,7 +9,7 @@ use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,6 +35,7 @@ fn unique_test_dir() -> PathBuf {
 struct SpawnedHerdr {
     _master: Box<dyn MasterPty + Send>,
     input: Option<Box<dyn Write + Send>>,
+    output: Option<Arc<Mutex<Vec<u8>>>>,
     child: Box<dyn Child + Send + Sync>,
 }
 
@@ -44,6 +45,125 @@ impl SpawnedHerdr {
         writer.write_all(input).expect("write spawned client input");
         writer.flush().expect("flush spawned client input");
     }
+
+    fn wait_for_output_text_position(&self, needle: &str, timeout: Duration) -> Option<(u16, u16)> {
+        let output = self.output.as_ref().expect("spawned client output capture");
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let position = terminal_text_position_from_ansi(
+                &output
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                needle,
+                80,
+                24,
+            );
+            if position.is_some() {
+                return position;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+}
+
+fn terminal_text_position_from_ansi(
+    output: &[u8],
+    needle: &str,
+    width: usize,
+    height: usize,
+) -> Option<(u16, u16)> {
+    let mut screen = vec![b' '; width * height];
+    let (mut row, mut column) = (0usize, 0usize);
+    let mut index = 0usize;
+
+    while index < output.len() {
+        if output[index] == 0x1b {
+            index += 1;
+            match output.get(index) {
+                Some(b'[') => {
+                    index += 1;
+                    let parameters_start = index;
+                    while index < output.len() && !(0x40..=0x7e).contains(&output[index]) {
+                        index += 1;
+                    }
+                    let final_byte = output.get(index).copied();
+                    let parameters =
+                        std::str::from_utf8(&output[parameters_start..index]).unwrap_or_default();
+                    index += usize::from(final_byte.is_some());
+                    match final_byte {
+                        Some(b'H' | b'f') => {
+                            let mut values = parameters.split(';');
+                            row = values
+                                .next()
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .unwrap_or(1)
+                                .saturating_sub(1)
+                                .min(height.saturating_sub(1));
+                            column = values
+                                .next()
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .unwrap_or(1)
+                                .saturating_sub(1)
+                                .min(width.saturating_sub(1));
+                        }
+                        Some(b'J') if parameters == "2" => screen.fill(b' '),
+                        Some(b'K') => {
+                            let (start, end) = match parameters {
+                                "1" => (row * width, row * width + column + 1),
+                                "2" => (row * width, (row + 1) * width),
+                                _ => (row * width + column, (row + 1) * width),
+                            };
+                            let screen_len = screen.len();
+                            screen[start.min(screen_len)..end.min(screen_len)].fill(b' ');
+                        }
+                        _ => {}
+                    }
+                }
+                Some(b']') => {
+                    index += 1;
+                    while index < output.len() {
+                        if output[index] == 0x07 {
+                            index += 1;
+                            break;
+                        }
+                        if output[index] == 0x1b && output.get(index + 1) == Some(&b'\\') {
+                            index += 2;
+                            break;
+                        }
+                        index += 1;
+                    }
+                }
+                Some(_) => index += 1,
+                None => {}
+            }
+            continue;
+        }
+
+        let byte = output[index];
+        index += 1;
+        match byte {
+            b'\r' => column = 0,
+            b'\n' => row = (row + 1).min(height.saturating_sub(1)),
+            0x20..=0x7e => {
+                if row < height && column < width {
+                    screen[row * width + column] = byte;
+                }
+                column = (column + 1).min(width);
+            }
+            _ => {}
+        }
+    }
+
+    for (row_index, cells) in screen.chunks(width).enumerate() {
+        if let Some(column) = cells
+            .windows(needle.len())
+            .position(|window| window == needle.as_bytes())
+        {
+            return Some((column as u16, row_index as u16));
+        }
+    }
+    None
 }
 
 impl Drop for SpawnedHerdr {
@@ -128,15 +248,15 @@ fn wait_for_file(path: &Path, timeout: Duration) {
     panic!("socket did not accept connections at {}", path.display());
 }
 
-fn wait_for_path_absent(path: &Path, timeout: Duration) {
+fn wait_for_path_absent(path: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if !path.exists() {
-            return;
+            return true;
         }
         thread::sleep(Duration::from_millis(20));
     }
-    panic!("test control was not consumed: {}", path.display());
+    false
 }
 
 fn accept_spawned_client(
@@ -249,6 +369,7 @@ fn spawn_server_with_test_controls(
     SpawnedHerdr {
         _master: pair.master,
         input: None,
+        output: None,
         child,
     }
 }
@@ -278,8 +399,19 @@ fn spawn_client_process(
         .master
         .try_clone_reader()
         .expect("client PTY output reader");
+    let captured_output = Arc::new(Mutex::new(Vec::new()));
+    let output_sink = Arc::clone(&captured_output);
     thread::spawn(move || {
-        let _ = io::copy(&mut output, &mut io::sink());
+        let mut buffer = [0_u8; 8 * 1024];
+        while let Ok(read) = output.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            output_sink
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(&buffer[..read]);
+        }
     });
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
@@ -324,6 +456,7 @@ fn spawn_client_process(
     SpawnedHerdr {
         _master: pair.master,
         input: Some(input),
+        output: Some(captured_output),
         child,
     }
 }
@@ -374,6 +507,7 @@ fn spawn_terminal_client_process(
     SpawnedHerdr {
         _master: pair.master,
         input: Some(input),
+        output: None,
         child,
     }
 }
@@ -1186,7 +1320,13 @@ fn send_ctrl_click(stream: &mut UnixStream, column: u16, row: u16) {
 }
 
 fn send_spawned_client_ctrl_click(client: &mut SpawnedHerdr, column: u16, row: u16) {
-    let input = format!("\x1b[<16;{};{}M", column + 1, row + 1);
+    let input = format!(
+        "\x1b[<16;{};{}M\x1b[<19;{};{}m",
+        column + 1,
+        row + 1,
+        column + 1,
+        row + 1
+    );
     client.write_input(input.as_bytes());
 }
 
@@ -2096,15 +2236,21 @@ fn production_socket_real_client_precommit_lifecycle_never_acquires_opener_autho
     ));
     let url = "https://example.com/ticket-37-precommit-lifecycle";
     pane_send_input(&api_socket, &link_pane, &format!("echo {url}"));
-    let (column, row) = wait_for_text_position(&mut observer, url, Duration::from_secs(8))
-        .expect("precommit lifecycle URL should render");
+    wait_for_text_position(&mut observer, url, Duration::from_secs(8))
+        .expect("observer should render the precommit lifecycle URL");
+    let (column, row) = client
+        .wait_for_output_text_position(url, Duration::from_secs(8))
+        .expect("clicked production client should render the precommit lifecycle URL");
     let suppress_ready_path = client_external_open_suppress_ready_path(&config_home);
     let opener_log = client_external_open_log_path(&config_home);
 
     fs::write(&suppress_ready_path, b"hold policy-cancelled readiness")
         .expect("arm held readiness");
     send_spawned_client_ctrl_click(&mut client, column, row);
-    wait_for_path_absent(&suppress_ready_path, Duration::from_secs(3));
+    assert!(
+        wait_for_path_absent(&suppress_ready_path, Duration::from_secs(3)),
+        "policy-cancellation readiness control should be consumed"
+    );
     write_external_open_config(&config_home, false);
     let response = send_json_request(
         &api_socket,
@@ -2145,8 +2291,14 @@ fn production_socket_real_client_precommit_lifecycle_never_acquires_opener_autho
     ));
 
     fs::write(&suppress_ready_path, b"hold exact-deadline readiness").expect("arm held readiness");
+    let (column, row) = client
+        .wait_for_output_text_position(url, Duration::from_secs(8))
+        .expect("clicked production client should still render the exact-deadline URL");
     send_spawned_client_ctrl_click(&mut client, column, row);
-    wait_for_path_absent(&suppress_ready_path, Duration::from_secs(3));
+    assert!(
+        wait_for_path_absent(&suppress_ready_path, Duration::from_secs(3)),
+        "exact-deadline readiness control should be consumed"
+    );
     set_test_monotonic_time(&clock_path, Duration::from_secs(10));
     assert!(ping_socket(&api_socket).contains("pong"));
     let settlements =
@@ -2166,8 +2318,14 @@ fn production_socket_real_client_precommit_lifecycle_never_acquires_opener_autho
 
     set_test_monotonic_time(&clock_path, Duration::from_secs(11));
     fs::write(&suppress_ready_path, b"hold disconnect readiness").expect("arm held readiness");
+    let (column, row) = client
+        .wait_for_output_text_position(url, Duration::from_secs(8))
+        .expect("clicked production client should still render the disconnect URL");
     send_spawned_client_ctrl_click(&mut client, column, row);
-    wait_for_path_absent(&suppress_ready_path, Duration::from_secs(3));
+    assert!(
+        wait_for_path_absent(&suppress_ready_path, Duration::from_secs(3)),
+        "disconnect readiness control should be consumed"
+    );
     drop(client);
     let settlements =
         wait_for_external_open_settlement_count(&server_log, 3, Duration::from_secs(3));
@@ -2611,8 +2769,11 @@ fn production_socket_admission_matrix_uses_tagged_attempts_without_opener_author
 
     let url = "https://example.com/ticket-37-admission";
     pane_send_input(&api_socket, &link_pane, &format!("echo {url}"));
-    let (column, row) = wait_for_text_position(&mut observer, url, Duration::from_secs(8))
-        .expect("admission URL should render");
+    wait_for_text_position(&mut observer, url, Duration::from_secs(8))
+        .expect("observer should render the admission URL");
+    capacity_source
+        .wait_for_output_text_position(url, Duration::from_secs(8))
+        .expect("clicked production client should render the admission URL");
     let suppress_ready_path = client_external_open_suppress_ready_path(&config_home);
     for _ in 0..32 {
         fs::write(
@@ -2620,8 +2781,14 @@ fn production_socket_admission_matrix_uses_tagged_attempts_without_opener_author
             b"hold the next readiness before commit",
         )
         .expect("arm production-client readiness hold");
+        let (column, row) = capacity_source
+            .wait_for_output_text_position(url, Duration::from_secs(8))
+            .expect("clicked production client should still render the admission URL");
         send_spawned_client_ctrl_click(&mut capacity_source, column, row);
-        wait_for_path_absent(&suppress_ready_path, Duration::from_secs(3));
+        assert!(
+            wait_for_path_absent(&suppress_ready_path, Duration::from_secs(3)),
+            "capacity readiness control should be consumed"
+        );
     }
     assert!(
         fs::read_to_string(client_external_open_log_path(&config_home))
@@ -2629,6 +2796,9 @@ fn production_socket_admission_matrix_uses_tagged_attempts_without_opener_author
             .is_empty(),
         "32 preparing requests must invoke the actual client opener zero times"
     );
+    let (column, row) = capacity_source
+        .wait_for_output_text_position(url, Duration::from_secs(8))
+        .expect("clicked production client should render the capacity-rejection URL");
     send_spawned_client_ctrl_click(&mut capacity_source, column, row);
     let settlements =
         wait_for_external_open_settlement_count(&server_log, 1, Duration::from_secs(3));
