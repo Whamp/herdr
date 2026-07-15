@@ -160,7 +160,7 @@ jobs:
           persist-credentials: false
 
       - name: Download artifacts
-        uses: actions/download-artifact@8f5be19c0e3aa9c9b2c9c254472dfc7c500a34b1 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: herdr-port-forward-*
           path: dist

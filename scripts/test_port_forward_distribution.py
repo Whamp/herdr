@@ -182,6 +182,14 @@ class PortForwardInstallerCliTests(unittest.TestCase):
         self.assertNotIn("herdr-port-forward-windows", workflow)
         self.assertNotIn("windows-latest", workflow)
         self.assertIn("install-port-forward-test.sh", workflow)
+        self.assertIn(
+            "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+            workflow,
+        )
+        self.assertNotIn(
+            "actions/download-artifact@8f5be19c0e3aa9c9b2c9c254472dfc7c500a34b1",
+            workflow,
+        )
         self.assertIn("--notes-file .github/remote-link-test-guide.md", workflow)
         self.assertIn(".sha256", workflow)
         self.assertIn(
