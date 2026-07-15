@@ -174,10 +174,11 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     let external_open_attachment_id = crate::remote::new_external_open_attachment_id();
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let forwarding_launch = remote_ssh.forwarding_launch();
-    let prepared_remote = prepare_remote_herdr(&remote_ssh, remote.live_handoff)?;
+    let prepared_remote = prepare_remote_herdr(&remote_ssh, &session_name, remote.live_handoff)?;
     ensure_remote_server_ready(
         &remote_ssh,
         &prepared_remote.remote_herdr,
+        &session_name,
         prepared_remote.installed_or_replaced,
         prepared_remote.stop_after_install_approved,
         remote.live_handoff,
@@ -777,6 +778,7 @@ impl InstallSource {
 
 fn prepare_remote_herdr(
     ssh: &RemoteSsh,
+    session_name: &str,
     live_handoff_enabled: bool,
 ) -> io::Result<PreparedRemoteHerdr> {
     let platform = detect_remote_platform(ssh)?;
@@ -812,6 +814,7 @@ fn prepare_remote_herdr(
         stop_after_install_approved = confirm_remote_install_with_running_server(
             ssh,
             status_probe_herdr,
+            session_name,
             live_handoff_enabled,
         )?;
     }
@@ -1133,11 +1136,12 @@ enum RemoteInstallRunningServerPlan {
 fn ensure_remote_server_ready(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
+    session_name: &str,
     remote_binary_changed: bool,
     stop_after_install_approved: bool,
     live_handoff_enabled: bool,
 ) -> io::Result<()> {
-    let status = remote_server_status(ssh, remote_herdr)?;
+    let status = remote_server_status(ssh, remote_herdr, session_name)?;
     let RemoteServerStatus::Running {
         version,
         protocol,
@@ -1158,7 +1162,7 @@ fn ensure_remote_server_ready(
     };
 
     if live_handoff_enabled && live_handoff {
-        match live_handoff_remote_server(ssh, remote_herdr) {
+        match live_handoff_remote_server(ssh, remote_herdr, session_name) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 eprintln!("remote live handoff failed: {err}");
@@ -1168,12 +1172,12 @@ fn ensure_remote_server_ready(
     }
 
     if stop_after_install_approved {
-        stop_remote_server(ssh, remote_herdr)?;
+        stop_remote_server(ssh, remote_herdr, session_name)?;
         return Ok(());
     }
 
     if confirm_remote_server_stop(ssh.target(), version.as_deref(), protocol, reason)? {
-        stop_remote_server(ssh, remote_herdr)?;
+        stop_remote_server(ssh, remote_herdr, session_name)?;
     }
     Ok(())
 }
@@ -1202,10 +1206,11 @@ fn remote_server_restart_reason(
 fn confirm_remote_install_with_running_server(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
+    session_name: &str,
     live_handoff_enabled: bool,
 ) -> io::Result<bool> {
     let target = ssh.target();
-    let status = match remote_server_status(ssh, remote_herdr) {
+    let status = match remote_server_status(ssh, remote_herdr, session_name) {
         Ok(status) => status,
         Err(err) => {
             if !io::stdin().is_terminal() {
@@ -1337,8 +1342,9 @@ fn remote_install_running_server_plan(
 fn remote_server_status(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
+    session_name: &str,
 ) -> io::Result<RemoteServerStatus> {
-    let command = format!("{} status server --json", remote_herdr.shell_path);
+    let command = remote_herdr_command(remote_herdr, session_name, "status server --json");
     let output = ssh.sh_output(&command)?;
     if !output.status.success() {
         return Err(command_failed("remote server status failed", &output));
@@ -1470,13 +1476,20 @@ fn confirm_remote_server_stop(
     Ok(false)
 }
 
-fn live_handoff_remote_server(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<()> {
-    let command = format!(
-        "{} server live-handoff --import-exe {} --expected-protocol {} --expected-version {}",
-        remote_herdr.shell_path,
-        remote_herdr.shell_path,
-        CURRENT_PROTOCOL,
-        current_version()
+fn live_handoff_remote_server(
+    ssh: &RemoteSsh,
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+) -> io::Result<()> {
+    let command = remote_herdr_command(
+        remote_herdr,
+        session_name,
+        &format!(
+            "server live-handoff --import-exe {} --expected-protocol {} --expected-version {}",
+            remote_herdr.shell_path,
+            CURRENT_PROTOCOL,
+            current_version()
+        ),
     );
     let output = ssh.sh_output(&command)?;
     if !output.status.success() {
@@ -1490,14 +1503,18 @@ fn live_handoff_remote_server(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io
     Ok(())
 }
 
-fn stop_remote_server(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<()> {
-    let command = format!("{} server stop", remote_herdr.shell_path);
+fn stop_remote_server(
+    ssh: &RemoteSsh,
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+) -> io::Result<()> {
+    let command = remote_herdr_command(remote_herdr, session_name, "server stop");
     let output = ssh.sh_output(&command)?;
     if !output.status.success() {
         return Err(command_failed("remote server stop failed", &output));
     }
 
-    wait_for_remote_server_shutdown(ssh, remote_herdr)?;
+    wait_for_remote_server_shutdown(ssh, remote_herdr, session_name)?;
     eprintln!(
         "stopped the remote herdr server on {}; it will restart when the remote client bridge attaches.",
         ssh.target()
@@ -1505,10 +1522,15 @@ fn stop_remote_server(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result
     Ok(())
 }
 
-fn wait_for_remote_server_shutdown(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<()> {
+fn wait_for_remote_server_shutdown(
+    ssh: &RemoteSsh,
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+) -> io::Result<()> {
     let deadline = Instant::now() + REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT;
     loop {
-        if remote_server_status(ssh, remote_herdr)? == RemoteServerStatus::NotRunning {
+        if remote_server_status(ssh, remote_herdr, session_name)? == RemoteServerStatus::NotRunning
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -1736,14 +1758,22 @@ fn confirm_remote_install(
     Ok(())
 }
 
-fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> String {
-    let mut command = format!("exec {}", remote_herdr.shell_path);
+fn remote_herdr_command(remote_herdr: &RemoteHerdr, session_name: &str, arguments: &str) -> String {
+    let mut command = remote_herdr.shell_path.clone();
     if session_name != crate::session::DEFAULT_SESSION_NAME {
         command.push_str(" --session ");
         command.push_str(&shell_quote(session_name));
     }
-    command.push_str(" remote-client-bridge");
+    command.push(' ');
+    command.push_str(arguments);
     command
+}
+
+fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> String {
+    format!(
+        "exec {}",
+        remote_herdr_command(remote_herdr, session_name, "remote-client-bridge")
+    )
 }
 
 fn reattach_command(
@@ -2731,6 +2761,42 @@ mod tests {
         assert_eq!(
             remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
             "exec \"$HOME/.local/bin/herdr\" remote-client-bridge"
+        );
+    }
+
+    #[test]
+    fn named_remote_session_scopes_preflight_and_lifecycle_commands() {
+        let remote_herdr = RemoteHerdr::for_platform_with_install_name(
+            RemotePlatform {
+                os: "linux",
+                arch: "x86_64",
+            },
+            "herdr-port-forward",
+        );
+
+        assert_eq!(
+            remote_herdr_command(
+                &remote_herdr,
+                "port-forward-test",
+                "status server --json"
+            ),
+            "\"$HOME/.local/bin/herdr-port-forward\" --session port-forward-test status server --json"
+        );
+        assert_eq!(
+            remote_herdr_command(&remote_herdr, "port-forward-test", "server stop"),
+            "\"$HOME/.local/bin/herdr-port-forward\" --session port-forward-test server stop"
+        );
+        assert_eq!(
+            remote_bridge_command(&remote_herdr, "port-forward-test"),
+            "exec \"$HOME/.local/bin/herdr-port-forward\" --session port-forward-test remote-client-bridge"
+        );
+        assert_eq!(
+            remote_herdr_command(
+                &remote_herdr,
+                crate::session::DEFAULT_SESSION_NAME,
+                "status server --json"
+            ),
+            "\"$HOME/.local/bin/herdr-port-forward\" status server --json"
         );
     }
 
