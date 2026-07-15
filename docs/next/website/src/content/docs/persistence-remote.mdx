@@ -94,6 +94,36 @@ For local builds or custom binaries, set `HERDR_REMOTE_BINARY` to a local file p
 HERDR_REMOTE_BINARY=target/release/herdr herdr --remote workbox
 ```
 
+## Open remote links on this device
+
+Remote link opening is an opt-in experiment. Its default configuration is:
+
+```toml
+[experimental]
+open_remote_links_on_client = false
+```
+
+Set the value to `true`, or enable **open remote links on this device** under **Settings > Experiments**, on each client device where links should open. The setting is device-local and each full app client applies its own value. It does not affect `herdr --no-session`: single-process Herdr continues to open links on its own machine. When the experiment is off, a remote session keeps the existing server-side fallback.
+
+Herdr acts only on an unhandled HTTP or HTTPS link opened with the existing modified-click action. Plugin link handlers still take precedence. Ordinary web links open unchanged on the initiating client. A recognized remote-loopback link first gets an attachment-owned SSH forward, then opens on that same client with only the port changed. Herdr does not send the link or a failure notice to another client and does not fall back to another client or the server after an enabled request starts. Client preparation cannot open the browser: the source server must send irrevocable commit authority before the initiating client may invoke its platform opener.
+
+Loopback forwarding supports Linux and macOS clients. Linux accepts canonical dotted-decimal addresses in `127/8`, `::1`, and `localhost`. macOS accepts only `127.0.0.1`, `::1`, and `localhost`; other `127/8` addresses fail without address substitution. `localhost` requires both its IPv4 and IPv6 listeners to be ready. HTTPS remains HTTPS, including normal certificate checks.
+
+Loopback forwarding requires a Herdr-managed SSH attachment, OpenSSH 6.7 or newer, and `[remote].manage_ssh_config = true`. Ordinary web links can still open on the client when forwarding is unavailable. The launcher process owns the managed SSH master, target, control path, forwarding registry, and cleanup. The child client receives only a private inherited forwarding capability. Broker frame payloads are credential-authenticated inherited local messages limited to 4 KiB. Herdr invokes SSH control commands with structured direct arguments, never through a shell, and gives each command a ten-second timeout. Every listener binds the exact requested local loopback identity and forwards to the matching remote loopback identity. Herdr never binds a wildcard, LAN, or tailnet address.
+
+One open has a ten-second end-to-end deadline. An attachment permits at most 32 external opens in progress, 32 forwarding calls in progress, and eight waiters for one creating mapping. It can create at most 128 SSH listeners over its lifetime. `localhost` uses two listeners. These hard limits do not interrupt reuse of an existing ready mapping.
+
+Reusable mappings are bounded separately:
+
+```toml
+[remote]
+saved_port_forward_limit = 12
+```
+
+The default is 12 and the accepted range is 1 through 64. Herdr prefers the remote port locally, then tries at most five fresh OS-selected fallback candidates after a clean collision. It reuses a Ready mapping for later clicks and replaces the least-recently-requested Ready mapping when space is needed. A partially created `localhost` pair quarantines that candidate for five minutes, retaining at most 64 recent candidates. Mappings belong to one attachment: disabling the experiment, disconnecting, or normal managed-master cleanup removes owned state and listeners. If the managed SSH master dies, Herdr fails pending work and clears saved mapping state. After an abnormal launcher exit, the managed master and listeners can remain for up to 60 seconds. Mappings are not persisted, recovered, adopted, or migrated after reconnect or restart.
+
+Successful opens are silent. Failure banners omit the URL, host, port, credentials, browser details, SSH target, control path, command arguments, and raw operating-system errors. If a link is invalid or uses an unsupported local address, use an explicit supported HTTP(S) address. If managed SSH or forwarding is unavailable, enable managed SSH, verify OpenSSH is current, then reconnect. If work is busy, at capacity, or times out, wait and click the original remote link again; reconnect first if the attachment may be stale. If the device rejects the open request, check its default browser or opener. If Herdr cannot confirm a committed open, check the browser before retrying because it may already have opened. An incomplete cleanup warning leaves the setting off; reconnect before opening the original remote link again.
+
 ## Remote named sessions
 
 Use `--session` with `--remote` to attach to a named session on the remote host:

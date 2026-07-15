@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Added opt-in device-local opening for HTTP(S) links from remote sessions, including attachment-owned loopback forwarding for managed SSH connections.
 - Copy mode now supports literal smart-case search with `/` and `?`, repeating with `n` and `N`, match highlighting, and tmux-style cross-line `w`/`b`/`e` word motions. (#1230)
 - Added maki detection with idle, working, and blocked screen states. (#1301, thanks @tontinton)
 

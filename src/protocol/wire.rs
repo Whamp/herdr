@@ -1376,32 +1376,67 @@ mod tests {
 
     #[test]
     fn external_open_closed_value_wire_order_is_stable() {
-        fn tag<T: Serialize>(value: &T) -> u8 {
-            *bincode::serde::encode_to_vec(value, bincode::config::standard())
-                .unwrap()
-                .first()
-                .expect("encoded enum should include tag")
+        macro_rules! roundtrip_tag {
+            ($type:ty, $value:expr) => {{
+                let value = $value;
+                let encoded =
+                    bincode::serde::encode_to_vec(&value, bincode::config::standard()).unwrap();
+                let tag = *encoded.first().expect("encoded enum should include tag");
+                let (decoded, consumed): ($type, usize) =
+                    bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+                        .unwrap();
+                assert_eq!(consumed, encoded.len());
+                assert_eq!(decoded, value);
+                tag
+            }};
         }
 
-        assert_eq!(tag(&ExternalOpenPolicy::Disabled), 0);
-        assert_eq!(tag(&ExternalOpenPolicy::Enabled), 1);
-        assert_eq!(tag(&ExternalOpenPortStatus::SamePort), 0);
-        assert_eq!(tag(&ExternalOpenPortStatus::RemappedPort), 1);
-        assert_eq!(tag(&ExternalOpenTarget::Direct), 0);
         assert_eq!(
-            tag(&ExternalOpenTarget::Forwarded {
-                port_status: ExternalOpenPortStatus::SamePort,
-            }),
+            roundtrip_tag!(ExternalOpenPolicy, ExternalOpenPolicy::Disabled),
+            0
+        );
+        assert_eq!(
+            roundtrip_tag!(ExternalOpenPolicy, ExternalOpenPolicy::Enabled),
             1
         );
-        assert_eq!(tag(&ExternalOpenResult::OpenedDirectly), 0);
         assert_eq!(
-            tag(&ExternalOpenResult::OpenedThroughForward {
-                port_status: ExternalOpenPortStatus::SamePort,
-            }),
+            roundtrip_tag!(ExternalOpenPortStatus, ExternalOpenPortStatus::SamePort),
+            0
+        );
+        assert_eq!(
+            roundtrip_tag!(ExternalOpenPortStatus, ExternalOpenPortStatus::RemappedPort),
             1
         );
-        assert_eq!(tag(&ExternalOpenResult::PlatformOpenRejected), 2);
+        assert_eq!(
+            roundtrip_tag!(ExternalOpenTarget, ExternalOpenTarget::Direct),
+            0
+        );
+        assert_eq!(
+            roundtrip_tag!(
+                ExternalOpenTarget,
+                ExternalOpenTarget::Forwarded {
+                    port_status: ExternalOpenPortStatus::SamePort,
+                }
+            ),
+            1
+        );
+        assert_eq!(
+            roundtrip_tag!(ExternalOpenResult, ExternalOpenResult::OpenedDirectly),
+            0
+        );
+        assert_eq!(
+            roundtrip_tag!(
+                ExternalOpenResult,
+                ExternalOpenResult::OpenedThroughForward {
+                    port_status: ExternalOpenPortStatus::SamePort,
+                }
+            ),
+            1
+        );
+        assert_eq!(
+            roundtrip_tag!(ExternalOpenResult, ExternalOpenResult::PlatformOpenRejected),
+            2
+        );
 
         for (reason, expected_tag) in [
             (ExternalOpenPreparationFailure::UnsupportedScheme, 0),
@@ -1430,7 +1465,10 @@ mod tests {
             (ExternalOpenPreparationFailure::ForwardCommandRejected, 14),
             (ExternalOpenPreparationFailure::ForwardCommandTimedOut, 15),
         ] {
-            assert_eq!(tag(&reason), expected_tag);
+            assert_eq!(
+                roundtrip_tag!(ExternalOpenPreparationFailure, reason),
+                expected_tag
+            );
         }
         assert_eq!(PROTOCOL_VERSION, 17);
     }

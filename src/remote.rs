@@ -1,6 +1,7 @@
 #[cfg(unix)]
 mod unix;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) mod forwarding;
 
 pub(crate) const EXTERNAL_OPEN_ATTACHMENT_ENV_VAR: &str = "HERDR_EXTERNAL_OPEN_ATTACHMENT_ID";
