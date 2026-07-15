@@ -97,7 +97,19 @@ pub(crate) fn read_authenticated_inherited_bytes(
         message.msg_iov = std::ptr::addr_of_mut!(iov);
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr().cast();
-        message.msg_controllen = control_bytes;
+        #[cfg(target_env = "musl")]
+        {
+            message.msg_controllen = control_bytes.try_into().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "inherited broker credential buffer is too large",
+                )
+            })?;
+        }
+        #[cfg(not(target_env = "musl"))]
+        {
+            message.msg_controllen = control_bytes;
+        }
 
         let received = loop {
             let received = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, 0) };
