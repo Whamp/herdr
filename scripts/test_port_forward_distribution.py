@@ -184,6 +184,8 @@ class PortForwardInstallerCliTests(unittest.TestCase):
         self.assertIn("install-port-forward-test.sh", workflow)
         self.assertIn("--notes-file .github/remote-link-test-guide.md", workflow)
         self.assertIn(".sha256", workflow)
+        self.assertIn('grep -F "statically linked" FILE_INFO.txt', workflow)
+        self.assertNotIn('ldd "${{ matrix.artifact }}"', workflow)
         self.assertNotIn("desktop", workflow.lower())
 
     def test_guide_uses_placeholders_and_an_isolated_session(self) -> None:

@@ -128,11 +128,10 @@ jobs:
           set -euo pipefail
           cp "target/${{ matrix.target }}/release/herdr" "${{ matrix.artifact }}"
           chmod 755 "${{ matrix.artifact }}"
-          file "${{ matrix.artifact }}"
+          file "${{ matrix.artifact }}" | tee FILE_INFO.txt
           strings "${{ matrix.artifact }}" | grep -F herdr-port-forward >/dev/null
           if [ "${{ runner.os }}" = Linux ]; then
-            ldd "${{ matrix.artifact }}" 2>&1 | tee LDD_INFO.txt
-            grep -Eq "statically linked|not a dynamic executable" LDD_INFO.txt
+            grep -F "statically linked" FILE_INFO.txt >/dev/null
             sha256sum "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
           else
             shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
