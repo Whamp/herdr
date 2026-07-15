@@ -304,6 +304,7 @@ impl RemotePlatform {
 
 #[derive(Debug, Clone)]
 struct RemoteHerdr {
+    install_name: String,
     install_suffix: String,
     shell_path: String,
     platform: RemotePlatform,
@@ -311,9 +312,14 @@ struct RemoteHerdr {
 
 impl RemoteHerdr {
     fn for_platform(platform: RemotePlatform) -> Self {
-        let install_suffix = ".local/bin/herdr".to_string();
+        Self::for_platform_with_install_name(platform, crate::build_info::install_name())
+    }
+
+    fn for_platform_with_install_name(platform: RemotePlatform, install_name: &str) -> Self {
+        let install_suffix = format!(".local/bin/{install_name}");
         let shell_path = format!("\"$HOME/{install_suffix}\"");
         Self {
+            install_name: install_name.to_string(),
             install_suffix,
             shell_path,
             platform,
@@ -826,7 +832,7 @@ fn prepare_remote_herdr(
             current_version()
         )));
     }
-    warn_if_remote_bin_not_on_path(ssh)?;
+    warn_if_remote_bin_not_on_path(ssh, &remote_herdr)?;
 
     Ok(PreparedRemoteHerdr {
         remote_herdr,
@@ -864,9 +870,7 @@ fn remote_binary_candidates(
         push_if_new_remote_binary_candidate(&mut candidates, path_candidate);
     }
 
-    let output = ssh.sh_output(&known_remote_binary_candidate_script(
-        &remote_herdr.platform,
-    ))?;
+    let output = ssh.sh_output(&known_remote_binary_candidate_script(remote_herdr))?;
     if !output.status.success() {
         return Err(command_failed("remote binary discovery failed", &output));
     }
@@ -887,37 +891,37 @@ fn push_if_new_remote_binary_candidate(candidates: &mut Vec<RemoteHerdr>, candid
     }
 }
 
-fn known_remote_binary_candidate_script(platform: &RemotePlatform) -> String {
-    let mut script = String::from(
-        r#"home=${HOME:-}
-user=${USER:-}
-version="#,
+fn known_remote_binary_candidate_script(remote_herdr: &RemoteHerdr) -> String {
+    let mut script = format!(
+        "home=${{HOME:-}}\nuser=${{USER:-}}\nversion={}\n",
+        shell_quote(&current_version())
     );
-    script.push_str(&shell_quote(&current_version()));
     script.push_str(
-        r#"
-emit() {
+        r#"emit() {
     path=$1
     if [ -n "$path" ] && [ -x "$path" ]; then
         printf '%s\n' "$path"
     fi
 }
-if [ -n "$home" ]; then
-    emit "$home/.local/bin/herdr"
-fi
 "#,
     );
-    if platform.os == "macos" {
+    script.push_str(&format!(
+        "if [ -n \"$home\" ]; then\n    emit \"$home/.local/bin/{}\"\nfi\n",
+        remote_herdr.install_name
+    ));
+
+    if remote_herdr.install_name != "herdr" {
+        return script;
+    }
+
+    if remote_herdr.platform.os == "macos" {
         script.push_str(
-            r#"    emit "/opt/homebrew/bin/herdr"
-    emit "/usr/local/bin/herdr"
+            r#"emit "/opt/homebrew/bin/herdr"
+emit "/usr/local/bin/herdr"
 "#,
         );
-    } else if platform.os == "linux" {
-        script.push_str(
-            r#"    emit "/home/linuxbrew/.linuxbrew/bin/herdr"
-"#,
-        );
+    } else if remote_herdr.platform.os == "linux" {
+        script.push_str("emit \"/home/linuxbrew/.linuxbrew/bin/herdr\"\n");
     }
     script.push_str(
         r#"if [ -n "$home" ]; then
@@ -936,11 +940,15 @@ emit "/run/current-system/sw/bin/herdr"
     script
 }
 
+fn remote_binary_lookup_command(remote_herdr: &RemoteHerdr) -> String {
+    format!("command -v {}", remote_herdr.install_name)
+}
+
 fn remote_binary_on_path_any(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
 ) -> io::Result<Option<RemoteHerdr>> {
-    let output = ssh.user_shell_output("command -v herdr")?;
+    let output = ssh.user_shell_output(&remote_binary_lookup_command(remote_herdr))?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -1521,26 +1529,31 @@ fn version_label(version: Option<&str>) -> &str {
     version.unwrap_or("unknown")
 }
 
-fn warn_if_remote_bin_not_on_path(ssh: &RemoteSsh) -> io::Result<()> {
-    let output = ssh.user_shell_output("command -v herdr")?;
+fn warn_if_remote_bin_not_on_path(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<()> {
+    let output = ssh.user_shell_output(&remote_binary_lookup_command(remote_herdr))?;
     if output.status.success()
-        && remote_shell_resolves_managed_install(&String::from_utf8_lossy(&output.stdout))
+        && remote_shell_resolves_managed_install(
+            &String::from_utf8_lossy(&output.stdout),
+            &remote_herdr.install_name,
+        )
     {
         return Ok(());
     }
 
     eprintln!(
-        "herdr: installed remote binary to ~/.local/bin/herdr, but the remote shell does not resolve `herdr` to that path"
+        "herdr: installed remote binary to ~/.local/bin/{0}, but the remote shell does not resolve `{0}` to that path",
+        remote_herdr.install_name
     );
     Ok(())
 }
 
-fn remote_shell_resolves_managed_install(stdout: &str) -> bool {
+fn remote_shell_resolves_managed_install(stdout: &str, install_name: &str) -> bool {
+    let suffix = format!("/.local/bin/{install_name}");
     stdout
         .lines()
         .next()
         .map(str::trim)
-        .is_some_and(|path| path.ends_with("/.local/bin/herdr"))
+        .is_some_and(|path| path.ends_with(&suffix))
 }
 
 fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource> {
@@ -2722,6 +2735,39 @@ mod tests {
     }
 
     #[test]
+    fn side_by_side_build_uses_its_install_name_for_remote_bootstrap() {
+        let remote_herdr = RemoteHerdr::for_platform_with_install_name(
+            RemotePlatform {
+                os: "linux",
+                arch: "x86_64",
+            },
+            "herdr-port-forward",
+        );
+
+        assert_eq!(remote_herdr.install_suffix, ".local/bin/herdr-port-forward");
+        assert_eq!(
+            remote_binary_lookup_command(&remote_herdr),
+            "command -v herdr-port-forward"
+        );
+        let discovery = known_remote_binary_candidate_script(&remote_herdr);
+        assert!(discovery.contains("emit \"$home/.local/bin/herdr-port-forward\""));
+        assert!(!discovery.contains("mise/installs/herdr"));
+        assert!(!discovery.contains("/usr/local/bin/herdr"));
+        assert_eq!(
+            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            "exec \"$HOME/.local/bin/herdr-port-forward\" remote-client-bridge"
+        );
+        assert!(remote_shell_resolves_managed_install(
+            "/home/tester/.local/bin/herdr-port-forward\n",
+            "herdr-port-forward"
+        ));
+        assert!(!remote_shell_resolves_managed_install(
+            "/home/tester/.local/bin/herdr\n",
+            "herdr-port-forward"
+        ));
+    }
+
+    #[test]
     fn remote_path_discovery_uses_path_binary() {
         let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
             os: "linux",
@@ -2805,10 +2851,11 @@ mod tests {
 
     #[test]
     fn known_remote_binary_candidate_script_includes_mise_and_nix_paths() {
-        let script = known_remote_binary_candidate_script(&RemotePlatform {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
             os: "linux",
             arch: "x86_64",
         });
+        let script = known_remote_binary_candidate_script(&remote_herdr);
 
         assert!(script.contains("emit \"$home/.local/bin/herdr\""));
         assert!(!script.contains("mise/shims/herdr"));
@@ -2828,10 +2875,11 @@ mod tests {
 
     #[test]
     fn known_remote_binary_candidate_script_includes_macos_homebrew_paths() {
-        let script = known_remote_binary_candidate_script(&RemotePlatform {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
             os: "macos",
             arch: "aarch64",
         });
+        let script = known_remote_binary_candidate_script(&remote_herdr);
 
         assert!(script.contains("emit \"/opt/homebrew/bin/herdr\""));
         assert!(script.contains("emit \"/usr/local/bin/herdr\""));
@@ -2879,15 +2927,18 @@ mod tests {
     #[test]
     fn remote_shell_path_warning_accepts_managed_install() {
         assert!(remote_shell_resolves_managed_install(
-            "/home/can/.local/bin/herdr\n"
+            "/home/can/.local/bin/herdr\n",
+            "herdr"
         ));
         assert!(remote_shell_resolves_managed_install(
-            "/Users/can/.local/bin/herdr\n"
+            "/Users/can/.local/bin/herdr\n",
+            "herdr"
         ));
         assert!(!remote_shell_resolves_managed_install(
-            "/usr/local/bin/herdr\n"
+            "/usr/local/bin/herdr\n",
+            "herdr"
         ));
-        assert!(!remote_shell_resolves_managed_install(""));
+        assert!(!remote_shell_resolves_managed_install("", "herdr"));
     }
 
     #[test]
