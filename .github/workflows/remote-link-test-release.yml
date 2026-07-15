@@ -131,7 +131,7 @@ jobs:
           file "${{ matrix.artifact }}" | tee FILE_INFO.txt
           strings "${{ matrix.artifact }}" | grep -F herdr-port-forward >/dev/null
           if [ "${{ runner.os }}" = Linux ]; then
-            grep -F "statically linked" FILE_INFO.txt >/dev/null
+            grep -E 'static(-pie|ally) linked' FILE_INFO.txt >/dev/null
             sha256sum "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
           else
             shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"

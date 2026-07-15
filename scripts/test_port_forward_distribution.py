@@ -184,7 +184,10 @@ class PortForwardInstallerCliTests(unittest.TestCase):
         self.assertIn("install-port-forward-test.sh", workflow)
         self.assertIn("--notes-file .github/remote-link-test-guide.md", workflow)
         self.assertIn(".sha256", workflow)
-        self.assertIn('grep -F "statically linked" FILE_INFO.txt', workflow)
+        self.assertIn(
+            "grep -E 'static(-pie|ally) linked' FILE_INFO.txt", workflow
+        )
+        self.assertNotIn('grep -F "statically linked" FILE_INFO.txt', workflow)
         self.assertNotIn('ldd "${{ matrix.artifact }}"', workflow)
         self.assertNotIn("desktop", workflow.lower())
 
